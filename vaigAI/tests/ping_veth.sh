@@ -51,11 +51,11 @@ PING_INTERVAL_MS=1000
 DPDK_LCORES="0-1"
 VAIGAI_BIN="$(cd "$(dirname "$0")/.." && pwd)/build/vaigai"
 
-# In flood mode use zero interval and a very large packet count; the vaigai
-# process is wrapped with `timeout` so it stops after FLOOD_SECONDS.
+# In flood mode the CLI 'flood' command handles timing internally;
+# no external 'timeout' wrapper needed.
 if [[ $FLOOD_MODE -eq 1 ]]; then
     PING_INTERVAL_MS=0
-    PING_COUNT=999999999
+    PING_COUNT=0  # unused in flood mode
 fi
 
 # ── colours ───────────────────────────────────────────────────────────────────
@@ -126,13 +126,12 @@ EOF
 
 # ── run ───────────────────────────────────────────────────────────────────────
 if [[ $FLOOD_MODE -eq 1 ]]; then
-    info "Flood-pinging $PEER_IP for ${FLOOD_SECONDS}s (interval=0ms)"
-    OUTPUT=$(printf 'ping %s %d %d %d\nquit\n' \
-                 "$PEER_IP" "$PING_COUNT" "$PING_SIZE" "$PING_INTERVAL_MS" \
-             | timeout "$FLOOD_SECONDS" \
-                   env VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
-                       -l "$DPDK_LCORES" -n 1 --no-pci \
-                       --vdev "net_af_packet0,iface=$HOST_IF" -- 2>&1) || true
+    info "Flood ICMP -> $PEER_IP for ${FLOOD_SECONDS}s (workers generate at line rate)"
+    OUTPUT=$(printf 'flood icmp %s %d 0 %d\nquit\n' \
+                 "$PEER_IP" "$FLOOD_SECONDS" "$PING_SIZE" \
+             | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
+                   -l "$DPDK_LCORES" -n 1 --no-pci \
+                   --vdev "net_af_packet0,iface=$HOST_IF" -- 2>&1) || true
 else
     info "Pinging $PEER_IP ($PING_COUNT packets, interval=${PING_INTERVAL_MS}ms)"
     OUTPUT=$(printf 'ping %s %d %d %d\nquit\n' \
@@ -144,12 +143,13 @@ fi
 
 # ── assert ────────────────────────────────────────────────────────────────────
 if [[ $FLOOD_MODE -eq 1 ]]; then
-    # In flood mode just verify we received at least one reply with 0% loss
-    if echo "$OUTPUT" | grep -qF '0% packet loss'; then
-        pass "Flood ping to $PEER_IP for ${FLOOD_SECONDS}s completed with 0% packet loss"
+    # The CLI prints "<N> packets transmitted".  Verify N > 0.
+    TX_COUNT=$(echo "$OUTPUT" | grep -oP '^\d+(?= packets transmitted)' || echo "0")
+    if [[ "$TX_COUNT" -gt 0 ]]; then
+        pass "Flood ICMP to $PEER_IP for ${FLOOD_SECONDS}s: ${TX_COUNT} packets transmitted"
     else
         echo "$OUTPUT" >&2
-        fail "Expected 0% packet loss not found in flood-ping output"
+        fail "Expected '> 0 packets transmitted' in flood output"
     fi
 else
     EXPECTED="${PING_COUNT} packets transmitted, ${PING_COUNT} received, 0% packet loss"

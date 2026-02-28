@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <rte_atomic.h>
 #include "../common/types.h"
+#include "tx_gen.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,6 +31,8 @@ typedef struct {
     uint32_t num_ports;
     /* Mempool */
     struct rte_mempool *mempool;
+    /* TX generator state */
+    tx_gen_state_t tx_gen;
 } worker_ctx_t;
 
 /** Array of worker contexts, indexed by worker index. */

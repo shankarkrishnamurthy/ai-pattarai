@@ -82,6 +82,7 @@ core_src = files(
   'src/core/mempool.c',
   'src/core/worker_loop.c',
   'src/core/ipc.c',
+  'src/core/tx_gen.c',
 )
 
 port_src = files(

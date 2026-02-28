@@ -5,6 +5,7 @@
 #include "core_assign.h"
 #include "mempool.h"
 #include "ipc.h"
+#include "tx_gen.h"
 
 #include <string.h>
 
@@ -151,7 +152,26 @@ int tgen_worker_loop(void *arg)
                 __atomic_store_n(&g_run, 0, __ATOMIC_RELAXED);
                 goto done;
             }
-            /* TODO: dispatch other commands to appropriate handlers */
+            if (cmd.cmd == CFG_CMD_START) {
+                tx_gen_config_t *gcfg = (tx_gen_config_t *)cmd.payload;
+                /* Resolve TX queue for the target port */
+                uint16_t tx_q = 0;
+                for (uint32_t pp = 0; pp < ctx->num_ports; pp++) {
+                    if (ctx->ports[pp] == gcfg->port_id) {
+                        tx_q = ctx->tx_queues[pp];
+                        break;
+                    }
+                }
+                tx_gen_configure(&ctx->tx_gen, gcfg, tx_q);
+                tx_gen_start(&ctx->tx_gen);
+                tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
+                continue;
+            }
+            if (cmd.cmd == CFG_CMD_STOP) {
+                tx_gen_stop(&ctx->tx_gen);
+                tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
+                continue;
+            }
             tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
         }
 
@@ -174,7 +194,12 @@ int tgen_worker_loop(void *arg)
             }
         }
 
-        /* ── 3. TX burst ─────────────────────────────────────────────────── */
+        /* ── 2½. TX generation (flood / sustained traffic) ────────────── */
+        if (ctx->tx_gen.active) {
+            tx_gen_burst(&ctx->tx_gen, ctx->mempool, ctx->worker_idx);
+        }
+
+        /* ── 3. TX burst (RX-triggered responses) ────────────────────────── */
         if (n_tx > 0) {
             for (uint32_t p = 0; p < ctx->num_ports; p++) {
                 uint16_t sent = rte_eth_tx_burst(ctx->ports[p],
