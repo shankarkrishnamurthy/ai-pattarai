@@ -151,6 +151,8 @@ if [[ $FLOOD_MODE -eq 1 ]]; then
         echo "$OUTPUT" >&2
         fail "Expected '> 0 packets transmitted' in flood output"
     fi
+    # Show telemetry section
+    echo "$OUTPUT" | sed -n '/--- flood statistics ---/,$ p'
 else
     EXPECTED="${PING_COUNT} packets transmitted, ${PING_COUNT} received, 0% packet loss"
     if echo "$OUTPUT" | grep -qF "$EXPECTED"; then

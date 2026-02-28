@@ -258,6 +258,10 @@ cmd_flood(int argc, char **argv)
         double pps = (double)snap.total.tx_pkts / (double)duration_s;
         printf("Throughput: %.1f pps\n", pps);
     }
+
+    /* Dump full telemetry JSON */
+    printf("\n--- telemetry ---\n");
+    cli_print_stats();
 }
 
 static void
