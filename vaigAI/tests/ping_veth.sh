@@ -75,7 +75,7 @@ done
 CFG=$(mktemp /tmp/vaigai_ping_XXXXXX.json)
 teardown() {
     info "Tearing down"
-    rm -f "$CFG"
+    rm -f "$CFG" "${STATS_LOG:-}"
     ip link del "$HOST_IF" &>/dev/null || true
     podman stop "$CONTAINER_NAME" &>/dev/null || true
     podman rm   "$CONTAINER_NAME" &>/dev/null || true
@@ -125,6 +125,25 @@ cat > "$CFG" <<EOF
 EOF
 
 # ── run ───────────────────────────────────────────────────────────────────────
+# In flood mode, capture container CPU/MEM stats via podman stats
+STATS_LOG=""
+STATS_PID=""
+if [[ $FLOOD_MODE -eq 1 ]]; then
+    STATS_LOG=$(mktemp /tmp/vaigai_stats_XXXXXX.log)
+    # Sample container stats every 1s in the background
+    podman stats "$CONTAINER_NAME" --no-stream --format \
+        '{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}' \
+        > /dev/null 2>&1 || true  # warm up
+    (
+        while true; do
+            podman stats "$CONTAINER_NAME" --no-stream --format \
+                '{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}' >> "$STATS_LOG" 2>/dev/null
+            sleep 1
+        done
+    ) &
+    STATS_PID=$!
+fi
+
 if [[ $FLOOD_MODE -eq 1 ]]; then
     info "Flood ICMP -> $PEER_IP for ${FLOOD_SECONDS}s (workers generate at line rate)"
     OUTPUT=$(printf 'flood icmp %s %d 0 %d\nquit\n' \
@@ -141,6 +160,12 @@ else
                    --vdev "net_af_packet0,iface=$HOST_IF" -- 2>&1) || true
 fi
 
+# Stop stats collection
+if [[ -n "$STATS_PID" ]]; then
+    kill "$STATS_PID" 2>/dev/null || true
+    wait "$STATS_PID" 2>/dev/null || true
+fi
+
 # ── assert ────────────────────────────────────────────────────────────────────
 if [[ $FLOOD_MODE -eq 1 ]]; then
     # The CLI prints "<N> packets transmitted".  Verify N > 0.
@@ -153,6 +178,14 @@ if [[ $FLOOD_MODE -eq 1 ]]; then
     fi
     # Show telemetry section
     echo "$OUTPUT" | sed -n '/--- flood statistics ---/,$ p'
+    # Show container CPU/MEM stats
+    if [[ -s "$STATS_LOG" ]]; then
+        info "Container resource usage (sampled every 1s):"
+        printf "  %-12s  %-20s  %s\n" "CPU%" "MEM USAGE" "NET I/O"
+        while IFS=$'\t' read -r cpu mem net; do
+            printf "  %-12s  %-20s  %s\n" "$cpu" "$mem" "$net"
+        done < "$STATS_LOG"
+    fi
 else
     EXPECTED="${PING_COUNT} packets transmitted, ${PING_COUNT} received, 0% packet loss"
     if echo "$OUTPUT" | grep -qF "$EXPECTED"; then
