@@ -5,9 +5,38 @@
 # Must run as root.
 #
 # Usage:
-#   bash tests/ping_veth.sh
+#   bash tests/ping_veth.sh [OPTIONS]
+#
+# Options:
+#   -f, --flood <seconds>   Flood ping mode: send packets as fast as possible
+#                           for the given number of seconds (overrides default
+#                           count/interval behaviour).
+#   -h, --help              Show this help message and exit.
 
 set -euo pipefail
+
+# ── parse arguments ───────────────────────────────────────────────────────────
+FLOOD_MODE=0
+FLOOD_SECONDS=0
+
+usage() {
+    grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,2\}//'
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -f|--flood)
+            [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]] \
+                || { echo "Error: --flood requires a positive integer (seconds)" >&2; exit 1; }
+            FLOOD_MODE=1
+            FLOOD_SECONDS="$2"
+            shift 2
+            ;;
+        -h|--help) usage ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
 
 # ── config ────────────────────────────────────────────────────────────────────
 CONTAINER_NAME="vaigai-test-ping"
@@ -21,6 +50,13 @@ PING_SIZE=56
 PING_INTERVAL_MS=1000
 DPDK_LCORES="0-1"
 VAIGAI_BIN="$(cd "$(dirname "$0")/.." && pwd)/build/vaigai"
+
+# In flood mode use zero interval and a very large packet count; the vaigai
+# process is wrapped with `timeout` so it stops after FLOOD_SECONDS.
+if [[ $FLOOD_MODE -eq 1 ]]; then
+    PING_INTERVAL_MS=0
+    PING_COUNT=999999999
+fi
 
 # ── colours ───────────────────────────────────────────────────────────────────
 GRN='\033[0;32m'; RED='\033[0;31m'; CYN='\033[0;36m'; NC='\033[0m'
@@ -89,18 +125,38 @@ cat > "$CFG" <<EOF
 EOF
 
 # ── run ───────────────────────────────────────────────────────────────────────
-info "Pinging $PEER_IP ($PING_COUNT packets)"
-OUTPUT=$(printf 'ping %s %d %d %d\nquit\n' \
-             "$PEER_IP" "$PING_COUNT" "$PING_SIZE" "$PING_INTERVAL_MS" \
-         | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
-               -l "$DPDK_LCORES" -n 1 --no-pci \
-               --vdev "net_af_packet0,iface=$HOST_IF" -- 2>&1) || true
+if [[ $FLOOD_MODE -eq 1 ]]; then
+    info "Flood-pinging $PEER_IP for ${FLOOD_SECONDS}s (interval=0ms)"
+    OUTPUT=$(printf 'ping %s %d %d %d\nquit\n' \
+                 "$PEER_IP" "$PING_COUNT" "$PING_SIZE" "$PING_INTERVAL_MS" \
+             | timeout "$FLOOD_SECONDS" \
+                   env VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
+                       -l "$DPDK_LCORES" -n 1 --no-pci \
+                       --vdev "net_af_packet0,iface=$HOST_IF" -- 2>&1) || true
+else
+    info "Pinging $PEER_IP ($PING_COUNT packets, interval=${PING_INTERVAL_MS}ms)"
+    OUTPUT=$(printf 'ping %s %d %d %d\nquit\n' \
+                 "$PEER_IP" "$PING_COUNT" "$PING_SIZE" "$PING_INTERVAL_MS" \
+             | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
+                   -l "$DPDK_LCORES" -n 1 --no-pci \
+                   --vdev "net_af_packet0,iface=$HOST_IF" -- 2>&1) || true
+fi
 
 # ── assert ────────────────────────────────────────────────────────────────────
-EXPECTED="${PING_COUNT} packets transmitted, ${PING_COUNT} received, 0% packet loss"
-if echo "$OUTPUT" | grep -qF "$EXPECTED"; then
-    pass "5/5 ICMP echo replies received from $PEER_IP (0% loss)"
+if [[ $FLOOD_MODE -eq 1 ]]; then
+    # In flood mode just verify we received at least one reply with 0% loss
+    if echo "$OUTPUT" | grep -qF '0% packet loss'; then
+        pass "Flood ping to $PEER_IP for ${FLOOD_SECONDS}s completed with 0% packet loss"
+    else
+        echo "$OUTPUT" >&2
+        fail "Expected 0% packet loss not found in flood-ping output"
+    fi
 else
-    echo "$OUTPUT" >&2
-    fail "Expected \"$EXPECTED\" not found in output"
+    EXPECTED="${PING_COUNT} packets transmitted, ${PING_COUNT} received, 0% packet loss"
+    if echo "$OUTPUT" | grep -qF "$EXPECTED"; then
+        pass "5/5 ICMP echo replies received from $PEER_IP (0% loss)"
+    else
+        echo "$OUTPUT" >&2
+        fail "Expected \"$EXPECTED\" not found in output"
+    fi
 fi
