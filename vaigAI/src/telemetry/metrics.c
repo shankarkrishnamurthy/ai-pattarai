@@ -27,6 +27,7 @@ metrics_snapshot(metrics_snapshot_t *snap, uint32_t n_workers)
         ACC(ip_bad_cksum);   ACC(ip_frag_dropped); ACC(ip_not_for_us);
         ACC(arp_reply_tx);   ACC(arp_request_tx);  ACC(arp_miss);
         ACC(icmp_echo_tx);   ACC(icmp_bad_cksum);  ACC(icmp_unreachable_tx);
+        ACC(udp_tx);         ACC(udp_rx);           ACC(udp_bad_cksum);
         ACC(tcp_conn_open);  ACC(tcp_conn_close);
         ACC(tcp_syn_sent);   ACC(tcp_retransmit);
         ACC(tcp_reset_rx);   ACC(tcp_reset_sent);

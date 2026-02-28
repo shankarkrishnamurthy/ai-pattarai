@@ -22,6 +22,8 @@ export_json(const metrics_snapshot_t *snap, char *buf, size_t len)
         "  \"arp_miss\": %"PRIu64",\n"
         "  \"icmp_echo_tx\": %"PRIu64", \"icmp_bad_cksum\": %"PRIu64",\n"
         "  \"icmp_unreachable_tx\": %"PRIu64",\n"
+        "  \"udp_tx\": %"PRIu64", \"udp_rx\": %"PRIu64",\n"
+        "  \"udp_bad_cksum\": %"PRIu64",\n"
         "  \"ip_bad_cksum\": %"PRIu64", \"ip_frag_dropped\": %"PRIu64",\n"
         "  \"ip_not_for_us\": %"PRIu64",\n"
         "  \"tcp_conn_open\": %"PRIu64", \"tcp_conn_close\": %"PRIu64",\n"
@@ -39,6 +41,8 @@ export_json(const metrics_snapshot_t *snap, char *buf, size_t len)
         t->arp_miss,
         t->icmp_echo_tx, t->icmp_bad_cksum,
         t->icmp_unreachable_tx,
+        t->udp_tx, t->udp_rx,
+        t->udp_bad_cksum,
         t->ip_bad_cksum, t->ip_frag_dropped,
         t->ip_not_for_us,
         t->tcp_conn_open, t->tcp_conn_close,
@@ -71,6 +75,9 @@ export_prometheus(const metrics_snapshot_t *snap, char *buf, size_t len)
     PROM_GAUGE(buf, len, pos, "tx_bytes",         t->tx_bytes);
     PROM_GAUGE(buf, len, pos, "rx_pkts",          t->rx_pkts);
     PROM_GAUGE(buf, len, pos, "rx_bytes",         t->rx_bytes);
+    PROM_GAUGE(buf, len, pos, "udp_tx",           t->udp_tx);
+    PROM_GAUGE(buf, len, pos, "udp_rx",           t->udp_rx);
+    PROM_GAUGE(buf, len, pos, "udp_bad_cksum",    t->udp_bad_cksum);
     PROM_GAUGE(buf, len, pos, "tcp_conn_open",    t->tcp_conn_open);
     PROM_GAUGE(buf, len, pos, "tcp_conn_close",   t->tcp_conn_close);
     PROM_GAUGE(buf, len, pos, "tcp_syn_sent",     t->tcp_syn_sent);

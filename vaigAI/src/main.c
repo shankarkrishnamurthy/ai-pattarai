@@ -42,6 +42,7 @@
 #include "net/tcp_port_pool.h"
 #include "net/arp.h"
 #include "net/icmp.h"
+#include "net/udp.h"
 #include "tls/cert_mgr.h"
 #include "tls/tls_session.h"
 #include "tls/cryptodev.h"
@@ -101,6 +102,7 @@ tgen_cleanup(void)
     tls_session_store_fini();
     cryptodev_fini();
     icmp_destroy();
+    udp_destroy();
     arp_destroy();
     cert_mgr_fini(&g_tls_client, &g_tls_server);
 
@@ -171,6 +173,11 @@ main(int argc, char **argv)
     rc = icmp_init();
     if (rc < 0) {
         RTE_LOG(ERR, USER1, "ICMP init failed\n");
+        goto fail_ports;
+    }
+    rc = udp_init();
+    if (rc < 0) {
+        RTE_LOG(ERR, USER1, "UDP init failed\n");
         goto fail_ports;
     }
     rc = pktrace_init();

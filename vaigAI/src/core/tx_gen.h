@@ -24,7 +24,7 @@ extern "C" {
 /* ── Protocol selector ────────────────────────────────────────────────────── */
 typedef enum {
     TX_GEN_PROTO_ICMP    = 0,   /* ICMP Echo Request flood              */
-    TX_GEN_PROTO_UDP,           /* UDP flood (future)                   */
+    TX_GEN_PROTO_UDP,           /* UDP datagram flood                   */
     TX_GEN_PROTO_TCP_SYN,       /* TCP SYN flood (future)               */
     TX_GEN_PROTO_HTTP,          /* HTTP request flood (future)          */
     TX_GEN_PROTO_MAX,
@@ -39,9 +39,9 @@ typedef struct {
     struct rte_ether_addr dst_mac;
     struct rte_ether_addr src_mac;
     uint16_t              dst_port;     /* host byte order (UDP/TCP)     */
+    uint16_t              src_port;     /* host byte order (UDP/TCP)     */
     uint16_t              pkt_size;     /* protocol payload size (bytes) */
     uint16_t              port_id;      /* DPDK port to transmit on      */
-    uint16_t              _pad;
     uint64_t              rate_pps;     /* 0 = unlimited (line rate)     */
     uint32_t              duration_s;   /* 0 = run until stopped         */
 } tx_gen_config_t;

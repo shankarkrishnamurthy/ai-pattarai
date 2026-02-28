@@ -3,6 +3,7 @@
  */
 #include "ipv4.h"
 #include "icmp.h"
+#include "udp.h"
 #include "lpm.h"
 #include "arp.h"
 #include "tcp_fsm.h"
@@ -124,6 +125,9 @@ struct rte_mbuf *ipv4_input(uint32_t worker_idx, struct rte_mbuf *m)
     switch (proto) {
     case IPPROTO_ICMP:
         icmp_input(worker_idx, m);
+        return NULL;
+    case IPPROTO_UDP:
+        udp_input(worker_idx, m);
         return NULL;
     case IPPROTO_TCP:
         /* TCP handled by FSM */

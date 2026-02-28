@@ -4,6 +4,7 @@
 #include "cli.h"
 #include "config_mgr.h"
 #include "../net/icmp.h"
+#include "../net/udp.h"
 #include "../net/arp.h"
 #include "../telemetry/pktrace.h"
 #include "../common/util.h"
@@ -150,7 +151,7 @@ cmd_flood(int argc, char **argv)
     extern volatile int g_run;
     if (argc < 4) {
         printf("Usage: flood <icmp|udp|tcp> <dst_ip> <duration_s>"
-               " [rate_pps=0] [size=56]\n");
+               " [rate_pps=0] [size=56] [port=9]\n");
         return;
     }
 
@@ -176,9 +177,10 @@ cmd_flood(int argc, char **argv)
         printf("flood: duration must be > 0\n");
         return;
     }
-    uint64_t rate_pps = (argc >= 5) ? strtoull(argv[4], NULL, 10) : 0;
-    uint16_t pkt_size = (argc >= 6) ? (uint16_t)strtoul(argv[5], NULL, 10) : 56;
-    uint16_t port_id  = 0;
+    uint64_t rate_pps  = (argc >= 5) ? strtoull(argv[4], NULL, 10) : 0;
+    uint16_t pkt_size  = (argc >= 6) ? (uint16_t)strtoul(argv[5], NULL, 10) : 56;
+    uint16_t dst_port  = (argc >= 7) ? (uint16_t)strtoul(argv[6], NULL, 10) : 9;
+    uint16_t port_id   = 0;
 
     /* ── ARP-resolve destination ────────────────────────────────────── */
     struct rte_ether_addr dst_mac;
@@ -204,7 +206,8 @@ cmd_flood(int argc, char **argv)
     gcfg.src_ip     = g_arp[port_id].local_ip;
     gcfg.dst_mac    = dst_mac;
     gcfg.src_mac    = g_arp[port_id].local_mac;
-    gcfg.dst_port   = 0;        /* UDP/TCP: parsed from argv in the future */
+    gcfg.dst_port   = dst_port;
+    gcfg.src_port   = 12345;     /* ephemeral source port */
     gcfg.pkt_size   = pkt_size;
     gcfg.port_id    = port_id;
     gcfg.rate_pps   = rate_pps;

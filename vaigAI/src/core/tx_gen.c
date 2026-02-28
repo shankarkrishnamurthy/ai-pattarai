@@ -18,6 +18,7 @@
 #include <rte_ethdev.h>
 #include <rte_ip.h>
 #include <rte_icmp.h>
+#include <rte_udp.h>
 #include <rte_log.h>
 
 #include "../common/types.h"
@@ -87,6 +88,62 @@ build_icmp_echo(tx_gen_state_t *state, struct rte_mempool *mp)
     return m;
 }
 
+/* ── UDP Datagram ─────────────────────────────────────────────────────────── */
+static struct rte_mbuf *
+build_udp_datagram(tx_gen_state_t *state, struct rte_mempool *mp)
+{
+    uint16_t payload_len = state->cfg.pkt_size;
+    uint16_t udp_total   = (uint16_t)(sizeof(struct rte_udp_hdr) + payload_len);
+    size_t   total       = sizeof(struct rte_ether_hdr)
+                         + sizeof(struct rte_ipv4_hdr)
+                         + udp_total;
+
+    struct rte_mbuf *m = rte_pktmbuf_alloc(mp);
+    if (unlikely(!m)) return NULL;
+
+    char *buf = rte_pktmbuf_append(m, (uint16_t)total);
+    if (unlikely(!buf)) { rte_pktmbuf_free(m); return NULL; }
+
+    /* Ethernet */
+    struct rte_ether_hdr *eth = (struct rte_ether_hdr *)buf;
+    rte_ether_addr_copy(&state->cfg.src_mac, &eth->src_addr);
+    rte_ether_addr_copy(&state->cfg.dst_mac, &eth->dst_addr);
+    eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+    /* IPv4 */
+    struct rte_ipv4_hdr *ip =
+        (struct rte_ipv4_hdr *)(buf + sizeof(struct rte_ether_hdr));
+    ip->version_ihl     = RTE_IPV4_VHL_DEF;
+    ip->type_of_service = 0;
+    ip->total_length    = rte_cpu_to_be_16(
+        (uint16_t)(sizeof(*ip) + udp_total));
+    ip->packet_id       = rte_cpu_to_be_16(state->seq);
+    ip->fragment_offset = rte_cpu_to_be_16(RTE_IPV4_HDR_DF_FLAG);
+    ip->time_to_live    = 64;
+    ip->next_proto_id   = IPPROTO_UDP;
+    ip->hdr_checksum    = 0;
+    ip->src_addr        = state->cfg.src_ip;
+    ip->dst_addr        = state->cfg.dst_ip;
+    ip->hdr_checksum    = rte_ipv4_cksum(ip);
+
+    /* UDP */
+    struct rte_udp_hdr *udp =
+        (struct rte_udp_hdr *)((uint8_t *)ip + sizeof(*ip));
+    udp->src_port    = rte_cpu_to_be_16(state->cfg.src_port);
+    udp->dst_port    = rte_cpu_to_be_16(state->cfg.dst_port);
+    udp->dgram_len   = rte_cpu_to_be_16(udp_total);
+    udp->dgram_cksum = 0;
+
+    /* Fill payload */
+    memset((uint8_t *)udp + sizeof(*udp), 0xBE, payload_len);
+
+    /* UDP checksum (optional per RFC 768 for IPv4, but good practice) */
+    udp->dgram_cksum = rte_ipv4_udptcp_cksum(ip, udp);
+
+    state->seq++;
+    return m;
+}
+
 /* ── Builder dispatch ─────────────────────────────────────────────────────── */
 static inline struct rte_mbuf *
 build_packet(tx_gen_state_t *state, struct rte_mempool *mp)
@@ -94,8 +151,9 @@ build_packet(tx_gen_state_t *state, struct rte_mempool *mp)
     switch (state->cfg.proto) {
     case TX_GEN_PROTO_ICMP:
         return build_icmp_echo(state, mp);
-    /* Future protocols go here: */
     case TX_GEN_PROTO_UDP:
+        return build_udp_datagram(state, mp);
+    /* Future protocols go here: */
     case TX_GEN_PROTO_TCP_SYN:
     case TX_GEN_PROTO_HTTP:
     default:
@@ -207,6 +265,9 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
     if (state->cfg.proto == TX_GEN_PROTO_ICMP) {
         for (uint16_t i = 0; i < sent; i++)
             worker_metrics_add_icmp_echo_tx(worker_idx);
+    } else if (state->cfg.proto == TX_GEN_PROTO_UDP) {
+        for (uint16_t i = 0; i < sent; i++)
+            worker_metrics_add_udp_tx(worker_idx);
     }
 
     return sent;

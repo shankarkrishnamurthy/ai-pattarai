@@ -41,6 +41,11 @@ typedef struct {
     uint64_t icmp_bad_cksum;
     uint64_t icmp_unreachable_tx;
 
+    /* UDP */
+    uint64_t udp_tx;
+    uint64_t udp_rx;
+    uint64_t udp_bad_cksum;
+
     /* TCP */
     uint64_t tcp_conn_open;
     uint64_t tcp_conn_close;
@@ -71,7 +76,7 @@ typedef struct {
 
     /* Padding to a full cache line */
     uint8_t  _pad[RTE_CACHE_LINE_SIZE -
-                  (40 * sizeof(uint64_t)) % RTE_CACHE_LINE_SIZE];
+                  (38 * sizeof(uint64_t)) % RTE_CACHE_LINE_SIZE];
 } __rte_cache_aligned worker_metrics_t;
 
 /* ------------------------------------------------------------------ */
@@ -102,6 +107,10 @@ extern worker_metrics_t g_metrics[TGEN_MAX_WORKERS];
 
 #define worker_metrics_add_icmp_echo_tx(widx)    (g_metrics[(widx)].icmp_echo_tx++)
 #define worker_metrics_add_icmp_bad_cksum(widx)  (g_metrics[(widx)].icmp_bad_cksum++)
+
+#define worker_metrics_add_udp_tx(widx)          (g_metrics[(widx)].udp_tx++)
+#define worker_metrics_add_udp_rx(widx)          (g_metrics[(widx)].udp_rx++)
+#define worker_metrics_add_udp_bad_cksum(widx)   (g_metrics[(widx)].udp_bad_cksum++)
 
 #define worker_metrics_add_tcp_conn_open(widx)    (g_metrics[(widx)].tcp_conn_open++)
 #define worker_metrics_add_tcp_conn_close(widx)   (g_metrics[(widx)].tcp_conn_close++)

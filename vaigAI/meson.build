@@ -96,6 +96,7 @@ net_src = files(
   'src/net/ipv4.c',
   'src/net/lpm.c',
   'src/net/icmp.c',
+  'src/net/udp.c',
   'src/net/tcp_tcb.c',
   'src/net/tcp_fsm.c',
   'src/net/tcp_options.c',
