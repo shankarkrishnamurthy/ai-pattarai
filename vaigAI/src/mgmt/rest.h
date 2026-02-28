@@ -7,7 +7,6 @@
  *   PUT  /api/v1/config         — replace config (JSON body)
  *   POST /api/v1/start          — start traffic
  *   POST /api/v1/stop           — stop traffic
- *   GET  /api/v1/metrics        — Prometheus exposition format
  */
 #ifndef TGEN_REST_H
 #define TGEN_REST_H

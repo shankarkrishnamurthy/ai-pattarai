@@ -175,7 +175,7 @@ int tgen_worker_loop(void *arg)
             tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
         }
 
-        /* ── 2. RX + classify ────────────────────────────────────────────── */
+        /* ── 2. RX + classify + flush replies ────────────────────────── */
         n_tx = 0;
         for (uint32_t p = 0; p < ctx->num_ports; p++) {
             uint16_t nb_rx = rte_eth_rx_burst(ctx->ports[p],
@@ -193,13 +193,6 @@ int tgen_worker_loop(void *arg)
                     rte_pktmbuf_free(reply);
             }
         }
-
-        /* ── 2½. TX generation (flood / sustained traffic) ────────────── */
-        if (ctx->tx_gen.active) {
-            tx_gen_burst(&ctx->tx_gen, ctx->mempool, ctx->worker_idx);
-        }
-
-        /* ── 3. TX burst (RX-triggered responses) ────────────────────────── */
         if (n_tx > 0) {
             for (uint32_t p = 0; p < ctx->num_ports; p++) {
                 uint16_t sent = rte_eth_tx_burst(ctx->ports[p],
@@ -210,6 +203,11 @@ int tgen_worker_loop(void *arg)
                 worker_metrics_add_tx(ctx->worker_idx, sent, 0);
             }
             n_tx = 0;
+        }
+
+        /* ── 3. TX generation (flood / sustained traffic) ─────────────── */
+        if (ctx->tx_gen.active) {
+            tx_gen_burst(&ctx->tx_gen, ctx->mempool, ctx->worker_idx);
         }
 
         /* ── 4. Timer wheel tick ─────────────────────────────────────────── */

@@ -76,16 +76,6 @@ handle_request(void *cls,
                          n > 0 ? (size_t)n : 0);
     }
 
-    if (strcmp(url, "/api/v1/metrics") == 0 && strcmp(method, "GET") == 0) {
-        metrics_snapshot_t snap;
-        uint32_t nw = g_core_map.num_workers ? g_core_map.num_workers : 1;
-        metrics_snapshot(&snap, nw);
-        n = export_prometheus(&snap, buf, sizeof(buf));
-        return send_text(connection, MHD_HTTP_OK,
-                         "text/plain; version=0.0.4", buf,
-                         n > 0 ? (size_t)n : 0);
-    }
-
     if (strcmp(url, "/api/v1/config") == 0 && strcmp(method, "GET") == 0) {
 #ifdef HAVE_JANSSON
         /* Quick-dump the current config as JSON */

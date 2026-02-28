@@ -12,7 +12,7 @@ High-performance traffic generator for IPv4 TCP/HTTP/TLS workloads built on DPDK
 | L5/6  | TLS 1.2/1.3 (OpenSSL BIO-pair, optional hardware Cryptodev offload) |
 | L7    | HTTP/1.1 client (keep-alive, pipelining, chunked transfer) |
 | Mgmt  | CLI (readline), REST API (libmicrohttpd + jansson) |
-| Telem | Per-worker lock-free counters, latency histograms, JSON/Prometheus export |
+| Telem | Per-worker lock-free counters, latency histograms, JSON export |
 
 ## Quick Start
 
@@ -112,7 +112,6 @@ Minimal HTTP flow config:
 
 ```
 GET  /api/v1/stats     → JSON snapshot of all worker counters
-GET  /api/v1/metrics   → Prometheus text exposition
 GET  /api/v1/config    → currently loaded configuration (JSON)
 PUT  /api/v1/config    → apply a partial config patch (JSON body)
 POST /api/v1/start     → signal all workers to begin generating traffic
@@ -193,7 +192,7 @@ vaigAI speaks **HTTP/1.1 only**, **TLS 1.2/1.3** only, and buffers up to **1 MB*
 | Config loading / validation | ⚠️ Pending | To be added |
 | REST API (all 6 endpoints) | ⚠️ Pending | To be added |
 | CLI commands | ⚠️ Pending | To be added |
-| Metrics / Prometheus export | ⚠️ Pending | To be added |
+| Metrics JSON export | ⚠️ Pending | To be added |
 | TX pipeline / SYN generation | ⚠️ Pending | To be added |
 | Physical NIC link (mlx5 + i40e) | ✅ Link verified | Phase 1 ping tests passed on all 4 cable pairs |
 | TCP 3-way handshake | ⚠️ Not yet tested | Requires real server target |

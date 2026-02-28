@@ -100,12 +100,12 @@ src/
 │
 ├── mgmt/                      ── Management plane ──
 │   ├── cli.h/c                # readline-based interactive CLI
-│   ├── rest.h/c               # libmicrohttpd REST API (JSON + Prometheus)
+│   ├── rest.h/c               # libmicrohttpd REST API (JSON)
 │   └── config_mgr.h/c         # JSON config load/save/validate/push
 │
 └── telemetry/                 ── Observability ──
     ├── metrics.h/c            # Per-worker lock-free counter slabs
-    ├── export.h/c             # JSON and Prometheus text export
+    ├── export.h/c             # JSON export
     ├── histogram.h/c          # HDR-style latency histogram (log₂ buckets)
     ├── pktrace.h/c            # Per-packet capture trace buffer
     └── log.h/c                # Structured log macros (wraps rte_log)
@@ -349,22 +349,19 @@ Every worker lcore runs a tight, non-blocking loop:
       │    tgen_ipc_ack(worker_idx, msg.seq, rc)        │
       └─────────────────────────────────────────────────┘
                             │
-      ┌─ Step 2 ─── RX + Classify ─────────────────────┐
+      ┌─ Step 2 ─── RX + Classify + Flush ─────────────┐
       │  for each (port, queue):                        │
       │    nb = rte_eth_rx_burst(port, queue, bufs, 32) │
       │    for each mbuf:                               │
       │      reply = classify_and_process(mbuf)         │
       │      if reply → add to tx_buf                   │
-      └─────────────────────────────────────────────────┘
-                            │
-      ┌─ Step 2½ ── TX Generation ──────────────────────┐
-      │  if (ctx->tx_gen.active):                       │
-      │    tx_gen_burst(&ctx->tx_gen, mempool, port)    │
-      └─────────────────────────────────────────────────┘
-                            │
-      ┌─ Step 3 ─── TX Drain ──────────────────────────┐
       │  rte_eth_tx_burst(port, queue, tx_buf, nb_tx)   │
       │  free unsent mbufs                              │
+      └─────────────────────────────────────────────────┘
+                            │
+      ┌─ Step 3 ─── TX Generation ──────────────────────┐
+      │  if (ctx->tx_gen.active):                       │
+      │    tx_gen_burst(&ctx->tx_gen, mempool, port)    │
       └─────────────────────────────────────────────────┘
                             │
       ┌─ Step 4 ─── Timer Tick ─────────────────────────┐
@@ -405,130 +402,118 @@ Every worker lcore runs a tight, non-blocking loop:
 
 ## 3. Telemetry System
 
-### 3.1 Architecture Overview
+### 3.1 Ownership & Data Flow
+
+**Source of truth: each worker core owns its slab.  Management core only reads.**
+
+There is no push, no periodic timer, no background log-file writer.
+The management core **pulls on demand** — only when a human or HTTP client asks.
 
 ```
-  Worker 0           Worker 1           Worker N
-  ┌──────────┐       ┌──────────┐       ┌──────────┐
-  │ metrics  │       │ metrics  │       │ metrics  │
-  │ slab[0]  │       │ slab[1]  │       │ slab[N]  │
-  │          │       │          │       │          │
-  │ tx_pkts  │       │ tx_pkts  │       │ tx_pkts  │
-  │ rx_pkts  │       │ rx_pkts  │       │ rx_pkts  │
-  │ udp_tx   │       │ udp_tx   │       │ udp_tx   │
-  │ tcp_*    │       │ tcp_*    │       │ tcp_*    │
-  │ tls_*    │       │ tls_*    │       │ tls_*    │
-  │ http_*   │       │ http_*   │       │ http_*   │
-  │ ...      │       │ ...      │       │ ...      │
-  └────┬─────┘       └────┬─────┘       └────┬─────┘
-       │                   │                   │
-       │           single writer per slab      │
-       │           (no atomics needed)         │
-       │                   │                   │
-       └───────────────────┼───────────────────┘
-                           │  memcpy (racy reads — tolerable for monitoring)
-                           ▼
-                  ┌────────────────────┐
-                  │  metrics_snapshot  │  ← management core
-                  │                    │
-                  │  per_worker[0..N]  │
-                  │  total (aggregate) │
-                  └────────┬───────────┘
-                           │
-              ┌────────────┼────────────┐
-              │            │            │
-       ┌──────▼──────┐ ┌──▼──────────┐ ┌▼──────────────┐
-       │export_json()│ │export_prom()│ │cli_print_stats│
-       │  flat JSON  │ │ text format │ │  table view   │
-       └──────┬──────┘ └──┬──────────┘ └┬──────────────┘
-              │            │             │
-       ┌──────▼──────┐ ┌──▼──────────┐  │
-       │ REST API    │ │ REST API    │  stdout
-       │ /stats JSON │ │ /metrics   │
-       └─────────────┘ └─────────────┘
+                    WHO WRITES              WHO READS / WHEN
+                    ──────────              ────────────────
+  Worker 0 ─────► g_metrics[0]  ◄──┐
+                   (++ only)        │
+  Worker 1 ─────► g_metrics[1]  ◄──┤
+                   (++ only)        ├── memcpy ── metrics_snapshot()
+  Worker N ─────► g_metrics[N]  ◄──┘       │
+                                           │  on-demand pull
+                                           │  (never pushed)
+                                           ▼
+                               ┌───────────────────────┐
+                               │  Management Core      │
+                               │                       │
+                               │  Trigger      Action  │
+                               │  ─────────────────────│
+                               │  CLI "stats"  snapshot │
+                               │  GET /stats   snapshot │
+                               │  flood loop   1 Hz    │
+                               └───────┬───────────────┘
+                                       │ render
+                          ┌────────────┴────────────┐
+                          ▼                         ▼
+                   export_json                 cli table
+                   /api/v1/stats                 stdout
 ```
 
-### 3.2 Counter Slabs — Zero-Overhead Recording
+**Key rule**: workers never call `metrics_snapshot()`.
+Management never writes to `g_metrics[]`. Ownership is strict and one-directional.
 
-Each worker owns a dedicated `worker_metrics_t` struct, cache-line aligned to
-avoid false sharing. The global array:
+### 3.2 When Does the Pull Happen?
+
+| Trigger | Who runs it | Frequency |
+|---------|-------------|-----------|
+| CLI `stats` command | mgmt core (readline thread) | once per keystroke |
+| REST `GET /api/v1/stats` | libmicrohttpd thread on mgmt core | once per HTTP request |
+| `flood` live progress | mgmt core in sleep loop | 1 Hz for the flood duration |
+
+There is **no periodic background scrape** and **no metric log file**.
+If nobody asks, nobody reads — worker slabs accumulate silently.
+
+### 3.3 Counter Slabs — Zero-Overhead Recording
 
 ```c
 worker_metrics_t g_metrics[TGEN_MAX_WORKERS] __rte_cache_aligned;
 ```
 
-**38 counters per worker** covering every protocol layer:
+Each worker owns one cache-line-aligned slab. **38 counters** per worker:
 
-| Category | Counters                                                              |
-|----------|-----------------------------------------------------------------------|
-| L2/L3    | `tx_pkts`, `tx_bytes`, `rx_pkts`, `rx_bytes`                         |
-| IP       | `ip_bad_cksum`, `ip_frag_dropped`, `ip_not_for_us`                   |
-| ARP      | `arp_reply_tx`, `arp_request_tx`, `arp_miss`                         |
-| ICMP     | `icmp_echo_tx`, `icmp_bad_cksum`, `icmp_unreachable_tx`              |
-| UDP      | `udp_tx`, `udp_rx`, `udp_bad_cksum`                                 |
-| TCP      | `tcp_conn_open/close`, `tcp_syn_sent`, `tcp_retransmit`,             |
-|          | `tcp_reset_rx/sent`, `tcp_bad_cksum`, `tcp_syn_queue_drops`,         |
-|          | `tcp_ooo_pkts`, `tcp_duplicate_acks`                                 |
-| TLS      | `tls_handshake_ok/fail`, `tls_records_tx/rx`                         |
-| HTTP     | `http_req_tx`, `http_rsp_rx`, `http_rsp_1xx/../5xx`, `http_parse_err`|
+| Layer | Counters |
+|-------|----------|
+| L2/L3 | `tx_pkts`, `tx_bytes`, `rx_pkts`, `rx_bytes` |
+| IP | `ip_bad_cksum`, `ip_frag_dropped`, `ip_not_for_us` |
+| ARP | `arp_reply_tx`, `arp_request_tx`, `arp_miss` |
+| ICMP | `icmp_echo_tx`, `icmp_bad_cksum`, `icmp_unreachable_tx` |
+| UDP | `udp_tx`, `udp_rx`, `udp_bad_cksum` |
+| TCP | `tcp_conn_open/close`, `tcp_syn_sent`, `tcp_retransmit`, `tcp_reset_rx/sent`, `tcp_bad_cksum`, `tcp_syn_queue_drops`, `tcp_ooo_pkts`, `tcp_duplicate_acks` |
+| TLS | `tls_handshake_ok/fail`, `tls_records_tx/rx` |
+| HTTP | `http_req_tx`, `http_rsp_rx`, `http_rsp_1xx/../5xx`, `http_parse_err` |
 
-**Recording is a single `++` — no atomics, no locks, no function call overhead.**
-Each increment compiles to one `INC` or `ADD` instruction. This is safe because
-each worker exclusively writes to its own slab; no other core ever writes to it.
+Recording compiles to one `INC` instruction — no atomics, no locks.
+Safe because each slab has exactly one writer (its worker) and never crosses cache lines.
 
-### 3.3 Snapshot Aggregation
+### 3.4 Snapshot Aggregation
 
-When the management plane needs a read (CLI `stats`, REST `/api/v1/stats`), it calls
-`metrics_snapshot()`:
+`metrics_snapshot()` runs on the management core:
 
-1. `memcpy` each worker's slab into `snapshot.per_worker[i]`
-2. Accumulate all 38 fields into `snapshot.total` with the `ACC(field)` macro
-3. Return the snapshot (stack-allocated, ~25 KB)
+1. `memcpy` each `g_metrics[i]` → `snapshot.per_worker[i]`
+2. `ACC(field)` macro sums all N slabs into `snapshot.total`
+3. Returns stack-allocated snapshot (~25 KB)
 
-The reads are deliberately **racy** — a worker might be mid-increment during the
-copy. This is acceptable for monitoring data; the error is bounded to one burst
-(≤ 32 packets).
+Reads are **racy** — a worker may be mid-increment during the copy.
+Max error: one burst (≤ 32 packets). Acceptable for monitoring.
 
-### 3.4 HDR Histogram
+### 3.5 HDR Histogram
 
-Latency measurements use a lock-free histogram with 64 power-of-2 buckets:
+Latency uses a lock-free histogram with 64 power-of-2 buckets:
 
 ```
-Bucket 0:  [0,   2)  µs        Bucket index = 63 - clzll(us | 1)
-Bucket 1:  [2,   4)  µs        Single writer (worker core)
-Bucket 2:  [4,   8)  µs        Single reader via hist_copy() snapshot
-...                             Percentiles: walk buckets until
-Bucket 63: [2⁶³, 2⁶⁴) µs        seen ≥ target = p% × total_count
+Bucket 0: [0, 2) µs     index = 63 - clzll(us | 1)
+Bucket 1: [2, 4) µs     single writer (worker core)
+Bucket 2: [4, 8) µs     single reader via snapshot
+…
+Bucket 63: [2⁶³, ∞) µs  percentile: walk until seen ≥ p% × count
 ```
 
-### 3.5 Export Formats
+### 3.6 Export Format
 
-**JSON** (`/api/v1/stats`): Flat object with all aggregate counters:
-```json
-{"tx_pkts": 1000000, "rx_pkts": 500000, "udp_tx": 1000000, ...}
-```
+Single endpoint: **`/api/v1/stats`** — flat JSON with all 28 aggregate counters.
+CLI `stats` calls the same `export_json()` path → identical output to stdout.
 
-**Prometheus** (`/api/v1/metrics`): One gauge per counter with `vaigai_` prefix:
-```
-# HELP vaigai_tx_pkts Total packets transmitted
-# TYPE vaigai_tx_pkts gauge
-vaigai_tx_pkts 1000000
-```
-
-### 3.6 Structured Logging
+### 3.7 Structured Logging
 
 Eight log domains mapped to `RTE_LOGTYPE_USER1..8`:
 
-| Domain           | Covers                          |
-|------------------|---------------------------------|
-| `TGEN_LOG_MAIN`  | Startup, shutdown, lifecycle    |
-| `TGEN_LOG_PORT`  | Port init, driver hooks         |
-| `TGEN_LOG_CC`    | Congestion control events       |
-| `TGEN_LOG_PP`    | Packet processing               |
-| `TGEN_LOG_SYN`   | TCP connection setup            |
-| `TGEN_LOG_HTTP`  | HTTP request/response           |
-| `TGEN_LOG_TLS`   | TLS handshake, record layer     |
-| `TGEN_LOG_MGMT`  | CLI, REST, config               |
+| Domain | Covers |
+|--------|--------|
+| `TGEN_LOG_MAIN` | Startup, shutdown, lifecycle |
+| `TGEN_LOG_PORT` | Port init, driver hooks |
+| `TGEN_LOG_CC` | Congestion control events |
+| `TGEN_LOG_PP` | Packet processing |
+| `TGEN_LOG_SYN` | TCP connection setup |
+| `TGEN_LOG_HTTP` | HTTP request/response |
+| `TGEN_LOG_TLS` | TLS handshake, record layer |
+| `TGEN_LOG_MGMT` | CLI, REST, config |
 
 Each macro adds `[function:line]` prefix automatically.
 
