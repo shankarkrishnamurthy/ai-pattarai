@@ -1,0 +1,4 @@
+option('tls',    type : 'feature', value : 'auto', description : 'Enable TLS via OpenSSL')
+option('cli',    type : 'feature', value : 'auto', description : 'Enable CLI via readline')
+option('af_xdp', type : 'feature', value : 'auto', description : 'Enable AF_XDP via libbpf')
+option('rest',   type : 'feature', value : 'auto', description : 'Enable REST API via jansson + libmicrohttpd')
