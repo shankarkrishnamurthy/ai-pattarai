@@ -33,6 +33,7 @@ metrics_snapshot(metrics_snapshot_t *snap, uint32_t n_workers)
         ACC(tcp_reset_rx);   ACC(tcp_reset_sent);
         ACC(tcp_bad_cksum);  ACC(tcp_syn_queue_drops);
         ACC(tcp_ooo_pkts);   ACC(tcp_duplicate_acks);
+        ACC(tcp_payload_tx); ACC(tcp_payload_rx);
         ACC(tls_handshake_ok);   ACC(tls_handshake_fail);
         ACC(tls_records_tx); ACC(tls_records_rx);
         ACC(http_req_tx);    ACC(http_rsp_rx);

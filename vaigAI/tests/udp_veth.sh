@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Test: UDP flood from vaigAI (net_af_packet / veth) to an Alpine container.
+# Test: UDP from vaigAI (net_af_packet or net_af_xdp / veth) to an
+#       Alpine container.
 #
-# Two sub-tests:
-#   1. Rate-limited:  1000 pps for 1 second  → expect ~1031 packets (1000 + token bucket seed)
-#   2. Unlimited flood: line-rate for N seconds → expect > 0 packets
+# Modes:
+#   Rate-limited (default):  1000 pps for 1 second.
+#   Flood (--flood-seconds): line-rate for N seconds.
 #
 # Cross-validates vaigai telemetry (udp_tx) against the container's
-# kernel counters (/proc/net/snmp NoPorts, /proc/net/dev RX packets).
+# kernel counter (/proc/net/snmp NoPorts).
 #
 # Self-contained — no external library needed.
 # Must run as root.
@@ -15,13 +16,19 @@
 #   bash tests/udp_veth.sh [OPTIONS]
 #
 # Options:
-#   -s, --flood-seconds <N>  Duration for the unlimited flood sub-test (default: 3).
+#   -f, --flood-seconds <N>  Run unlimited flood for N seconds instead of
+#                            the default rate-limited test.
+#   -x, --xdp                Use AF_XDP (net_af_xdp) instead of the default
+#                            net_af_packet.  Requires kernel >= 5.4, libbpf,
+#                            and CAP_NET_ADMIN + CAP_BPF (or root).
 #   -h, --help               Show this help message and exit.
 
 set -euo pipefail
 
 # ── parse arguments ───────────────────────────────────────────────────────────
-FLOOD_SECONDS=3
+FLOOD_MODE=0
+FLOOD_SECONDS=0
+XDP_MODE=0
 
 usage() {
     grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,2\}//'
@@ -30,11 +37,16 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -s|--flood-seconds)
+        -f|--flood-seconds)
             [[ -n "${2:-}" && "$2" =~ ^[0-9]+$ ]] \
                 || { echo "Error: --flood-seconds requires a positive integer" >&2; exit 1; }
+            FLOOD_MODE=1
             FLOOD_SECONDS="$2"
             shift 2
+            ;;
+        -x|--xdp)
+            XDP_MODE=1
+            shift
             ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -55,6 +67,17 @@ VAIGAI_BIN="$(cd "$(dirname "$0")/.." && pwd)/build/vaigai"
 PASS_COUNT=0
 FAIL_COUNT=0
 
+# Select DPDK vdev based on mode
+if [[ $XDP_MODE -eq 1 ]]; then
+    HOST_IF="veth-udpxdp"
+    PEER_IF="veth-udpxdppeer"
+    VDEV_ARG="net_af_xdp0,iface=$HOST_IF"
+    MODE_LABEL="AF_XDP"
+else
+    VDEV_ARG="net_af_packet0,iface=$HOST_IF"
+    MODE_LABEL="AF_PACKET"
+fi
+
 # ── colours ───────────────────────────────────────────────────────────────────
 GRN='\033[0;32m'; RED='\033[0;31m'; CYN='\033[0;36m'; YLW='\033[0;33m'; NC='\033[0m'
 info()  { echo -e "${CYN}[INFO]${NC}  $*"; }
@@ -68,6 +91,25 @@ die()   { echo -e "${RED}[FATAL]${NC} udp_veth: $*" >&2; exit 1; }
 for cmd in podman ip nsenter; do
     command -v "$cmd" &>/dev/null || die "Required command not found: $cmd"
 done
+
+if [[ $XDP_MODE -eq 1 ]]; then
+    info "AF_XDP mode selected — running extra pre-flight checks"
+
+    KVER=$(uname -r)
+    KMAJOR=${KVER%%.*}
+    KREST=${KVER#*.}
+    KMINOR=${KREST%%.*}
+    if [[ $KMAJOR -lt 5 || ( $KMAJOR -eq 5 && $KMINOR -lt 4 ) ]]; then
+        die "AF_XDP requires kernel >= 5.4 (running $KVER)"
+    fi
+
+    if ! pkg-config --exists libbpf 2>/dev/null \
+       && ! compgen -G '/usr/lib*/libbpf.so*' >/dev/null 2>&1; then
+        die "libbpf not found — install libbpf-dev / libbpf-devel"
+    fi
+
+    info "Kernel $KVER OK, libbpf found"
+fi
 
 # ── teardown (always runs on exit) ────────────────────────────────────────────
 CFG=$(mktemp /tmp/vaigai_udp_XXXXXX.json)
@@ -96,11 +138,18 @@ done
 [[ -n "$CPID" && "$CPID" != "0" ]] || die "Container did not start"
 info "Container PID=$CPID"
 
-info "Setting up veth pair $HOST_IF <-> $PEER_IF"
+info "Setting up veth pair $HOST_IF <-> $PEER_IF ($MODE_LABEL)"
 ip link del "$HOST_IF" &>/dev/null || true
 ip link add "$HOST_IF" type veth peer name "$PEER_IF"
 ip link set "$HOST_IF" promisc on
 ip link set "$HOST_IF" up
+
+if [[ $XDP_MODE -eq 1 ]]; then
+    ethtool -L "$HOST_IF" combined 1 2>/dev/null || true
+    ip link set "$HOST_IF" mtu 3498 2>/dev/null || true
+    info "AF_XDP: $HOST_IF queue/mtu configured"
+fi
+
 ip link set "$PEER_IF" netns "$CPID"
 nsenter -t "$CPID" -n ip link set "$PEER_IF" up
 nsenter -t "$CPID" -n ip addr add "$PEER_CIDR" dev "$PEER_IF"
@@ -135,24 +184,32 @@ container_rx_pkts() {
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SUB-TEST 1: Rate-limited (1000 pps, 1 second)
+#  Run test
 # ══════════════════════════════════════════════════════════════════════════════
-info "─── Sub-test 1: rate-limited 1000 pps × 1s ───"
-
 BEFORE_NP=$(container_noports)
 info "Container NoPorts before: $BEFORE_NP"
+info "Using DPDK vdev: $VDEV_ARG"
 
-OUTPUT_RATE=$(printf 'flood udp %s 1 1000 %d %d\nquit\n' \
+if [[ $FLOOD_MODE -eq 1 ]]; then
+    info "Flood UDP -> $PEER_IP:$DST_PORT for ${FLOOD_SECONDS}s (line rate)"
+    OUTPUT=$(printf 'flood udp %s %d 0 %d %d\nquit\n' \
+                 "$PEER_IP" "$FLOOD_SECONDS" "$PKT_SIZE" "$DST_PORT" \
+             | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
+                   -l "$DPDK_LCORES" -n 1 --no-pci \
+                   --vdev "$VDEV_ARG" -- 2>&1) || true
+else
+    info "Rate-limited UDP -> $PEER_IP:$DST_PORT (1000 pps × 1s)"
+    OUTPUT=$(printf 'flood udp %s 1 1000 %d %d\nquit\n' \
                  "$PEER_IP" "$PKT_SIZE" "$DST_PORT" \
              | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "net_af_packet0,iface=$HOST_IF" -- 2>&1) || true
+                   --vdev "$VDEV_ARG" -- 2>&1) || true
+fi
 
 # Extract vaigai counters
-VAIGAI_TX=$(echo "$OUTPUT_RATE" | grep -oP '"udp_tx": \K[0-9]+' || echo "0")
-VAIGAI_PKTS=$(echo "$OUTPUT_RATE" | grep -oP '^\d+(?= packets transmitted)' || echo "0")
+VAIGAI_TX=$(echo "$OUTPUT" | grep -oP '"udp_tx": \K[0-9]+' || echo "0")
+VAIGAI_PKTS=$(echo "$OUTPUT" | grep -oP '^\d+(?= packets transmitted)' || echo "0")
 
-# Container counters after
 sleep 0.2  # kernel may lag slightly
 AFTER_NP=$(container_noports)
 DELTA_NP=$((AFTER_NP - BEFORE_NP))
@@ -160,61 +217,29 @@ DELTA_NP=$((AFTER_NP - BEFORE_NP))
 info "vaigai: udp_tx=$VAIGAI_TX, packets_transmitted=$VAIGAI_PKTS"
 info "container: NoPorts delta=$DELTA_NP ($BEFORE_NP -> $AFTER_NP)"
 
-# Assert: vaigai sent ~1000 packets (token bucket adds up to 32 extra)
-if [[ "$VAIGAI_TX" -ge 900 && "$VAIGAI_TX" -le 1100 ]]; then
-    pass "rate-limited: vaigai sent $VAIGAI_TX packets (~1000 expected)"
+# ── assert ───────────────────────────────────────────────────────────────────
+if [[ $FLOOD_MODE -eq 1 ]]; then
+    if [[ "$VAIGAI_TX" -gt 0 ]]; then
+        pass "flood: vaigai sent $VAIGAI_TX packets in ${FLOOD_SECONDS}s"
+    else
+        fail "flood: vaigai sent 0 packets"
+    fi
 else
-    fail "rate-limited: expected ~1000, got $VAIGAI_TX"
+    if [[ "$VAIGAI_TX" -ge 900 && "$VAIGAI_TX" -le 1100 ]]; then
+        pass "rate-limited: vaigai sent $VAIGAI_TX packets (~1000 expected)"
+    else
+        fail "rate-limited: expected ~1000, got $VAIGAI_TX"
+    fi
 fi
 
-# Assert: container received the same count
+# Cross-validate against container kernel counter
 if [[ "$DELTA_NP" -eq "$VAIGAI_TX" ]]; then
-    pass "rate-limited: container NoPorts delta ($DELTA_NP) == vaigai udp_tx ($VAIGAI_TX)"
+    pass "container NoPorts delta ($DELTA_NP) == vaigai udp_tx ($VAIGAI_TX)"
 else
-    fail "rate-limited: container NoPorts delta ($DELTA_NP) != vaigai udp_tx ($VAIGAI_TX)"
+    fail "container NoPorts delta ($DELTA_NP) != vaigai udp_tx ($VAIGAI_TX)"
 fi
 
-echo "$OUTPUT_RATE" | sed -n '/--- flood statistics ---/,/^}$/p'
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SUB-TEST 2: Unlimited flood (line-rate for N seconds)
-# ══════════════════════════════════════════════════════════════════════════════
-info "─── Sub-test 2: unlimited flood × ${FLOOD_SECONDS}s ───"
-
-BEFORE_NP=$(container_noports)
-info "Container NoPorts before: $BEFORE_NP"
-
-OUTPUT_FLOOD=$(printf 'flood udp %s %d 0 %d %d\nquit\n' \
-                 "$PEER_IP" "$FLOOD_SECONDS" "$PKT_SIZE" "$DST_PORT" \
-               | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
-                     -l "$DPDK_LCORES" -n 1 --no-pci \
-                     --vdev "net_af_packet0,iface=$HOST_IF" -- 2>&1) || true
-
-VAIGAI_TX=$(echo "$OUTPUT_FLOOD" | grep -oP '"udp_tx": \K[0-9]+' || echo "0")
-VAIGAI_PKTS=$(echo "$OUTPUT_FLOOD" | grep -oP '^\d+(?= packets transmitted)' || echo "0")
-
-sleep 0.2
-AFTER_NP=$(container_noports)
-DELTA_NP=$((AFTER_NP - BEFORE_NP))
-
-info "vaigai: udp_tx=$VAIGAI_TX, packets_transmitted=$VAIGAI_PKTS"
-info "container: NoPorts delta=$DELTA_NP ($BEFORE_NP -> $AFTER_NP)"
-
-# Assert: vaigai sent > 0 packets
-if [[ "$VAIGAI_TX" -gt 0 ]]; then
-    pass "flood: vaigai sent $VAIGAI_TX packets in ${FLOOD_SECONDS}s"
-else
-    fail "flood: vaigai sent 0 packets"
-fi
-
-# Assert: container received the same count
-if [[ "$DELTA_NP" -eq "$VAIGAI_TX" ]]; then
-    pass "flood: container NoPorts delta ($DELTA_NP) == vaigai udp_tx ($VAIGAI_TX)"
-else
-    fail "flood: container NoPorts delta ($DELTA_NP) != vaigai udp_tx ($VAIGAI_TX)"
-fi
-
-echo "$OUTPUT_FLOOD" | sed -n '/--- flood statistics ---/,/^}$/p'
+echo "$OUTPUT" | sed -n '/--- .* statistics ---/,/^}$/p'
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Summary

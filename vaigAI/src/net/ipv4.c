@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 
 #include <rte_ip.h>
+#include <rte_ether.h>
 #include <rte_mbuf.h>
 #include <rte_byteorder.h>
 #include <rte_log.h>
@@ -51,6 +52,7 @@ int ipv4_push_hdr(struct rte_mbuf *m,
     ip->src_addr      = cfg->src_ip;
     ip->dst_addr      = cfg->dst_ip;
 
+    m->l2_len = sizeof(struct rte_ether_hdr);
     if (!hw_cksum_offload) {
         ip->hdr_checksum = rte_ipv4_cksum(ip);
     } else {
@@ -117,6 +119,15 @@ struct rte_mbuf *ipv4_input(uint32_t worker_idx, struct rte_mbuf *m)
     uint16_t port_id = m->port;
     uint32_t local_ip = (port_id < TGEN_MAX_PORTS) ?
                         g_arp[port_id].local_ip : 0;
+
+    /* Save IP src/dst addresses in mbuf metadata BEFORE the header is
+     * stripped.  TCP FSM needs these for TCB lookup. */
+    if (m->data_len >= sizeof(struct rte_ipv4_hdr)) {
+        const struct rte_ipv4_hdr *ip =
+            rte_pktmbuf_mtod(m, const struct rte_ipv4_hdr *);
+        m->hash.usr     = ip->src_addr;   /* network byte order */
+        m->dynfield1[0] = ip->dst_addr;   /* network byte order */
+    }
 
     bool skip_cksum = g_port_caps[port_id].has_ipv4_cksum_offload;
     int  proto = ipv4_validate_and_strip(m, local_ip, skip_cksum);

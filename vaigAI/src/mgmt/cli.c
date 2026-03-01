@@ -6,6 +6,9 @@
 #include "../net/icmp.h"
 #include "../net/udp.h"
 #include "../net/arp.h"
+#include "../net/tcp_fsm.h"
+#include "../net/tcp_tcb.h"
+#include "../net/tcp_port_pool.h"
 #include "../telemetry/pktrace.h"
 #include "../common/util.h"
 #include "../telemetry/metrics.h"
@@ -22,6 +25,7 @@
 #include <time.h>
 #include <inttypes.h>
 #include <sys/stat.h>
+#include <poll.h>
 
 #ifdef HAVE_READLINE
 # include <readline/readline.h>
@@ -231,8 +235,15 @@ cmd_flood(int argc, char **argv)
     /* ── Wait for duration (live progress on TTY) ───────────────────── */
     bool is_tty = isatty(STDOUT_FILENO);
     for (uint32_t s = 0; s < duration_s; s++) {
-        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
-        nanosleep(&ts, NULL);
+        /* Sleep in 100 ms slices, calling arp_mgmt_tick() each time so
+         * ARP requests from the remote side (e.g. VM resolving our IP
+         * to send SYN-ACKs) are answered promptly. */
+        for (int tick = 0; tick < 10; tick++) {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
+            nanosleep(&ts, NULL);
+            arp_mgmt_tick();
+            if (!g_run) break;
+        }
         if (!g_run) break;
         if (is_tty) {
             metrics_snapshot_t snap;
@@ -267,6 +278,185 @@ cmd_flood(int argc, char **argv)
     cli_print_stats();
 }
 
+/* ------------------------------------------------------------------ */
+/* throughput — TCP data throughput measurement (iperf3-like)            */
+/* ------------------------------------------------------------------ */
+static uint8_t g_throughput_zero_buf[1460];
+
+static void
+cmd_throughput(int argc, char **argv)
+{
+    extern volatile int g_run;
+    if (argc < 4) {
+        printf("Usage: throughput tx <dst_ip> <port> <duration_s> [streams=1]\n"
+               "       throughput rx <port> <duration_s>\n");
+        return;
+    }
+
+    bool tx_mode = (strcmp(argv[1], "tx") == 0);
+    bool rx_mode = (strcmp(argv[1], "rx") == 0);
+    if (!tx_mode && !rx_mode) {
+        printf("throughput: mode must be 'tx' or 'rx'\n");
+        return;
+    }
+
+    uint32_t n_workers = g_core_map.num_workers;
+    uint16_t port_id = 0;
+
+    if (tx_mode) {
+        /* throughput tx <dst_ip> <port> <duration_s> [streams] */
+        if (argc < 5) {
+            printf("Usage: throughput tx <dst_ip> <port> <duration_s> [streams=1]\n");
+            return;
+        }
+        uint32_t dst_ip;
+        if (tgen_parse_ipv4(argv[2], &dst_ip) < 0) {
+            printf("throughput: invalid IP '%s'\n", argv[2]);
+            return;
+        }
+        uint16_t dst_port   = (uint16_t)strtoul(argv[3], NULL, 10);
+        uint32_t duration_s = (uint32_t)strtoul(argv[4], NULL, 10);
+        uint32_t streams    = (argc >= 6) ? (uint32_t)strtoul(argv[5], NULL, 10) : 1;
+        if (duration_s == 0 || streams == 0) {
+            printf("throughput: duration and streams must be > 0\n");
+            return;
+        }
+        if (streams > 16) streams = 16;
+
+        /* ARP resolve */
+        struct rte_ether_addr dst_mac;
+        if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
+            arp_request(port_id, dst_ip);
+            uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
+            while (rte_rdtsc() < deadline) {
+                arp_mgmt_tick();
+                if (arp_lookup(port_id, dst_ip, &dst_mac)) break;
+                rte_delay_ms(10);
+            }
+        }
+        if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
+            printf("throughput: ARP failed for %s\n", argv[2]);
+            return;
+        }
+
+        /* Reset metrics */
+        metrics_reset(n_workers);
+
+        /* Open connections */
+        uint32_t w = 0; /* round-robin across workers */
+        tcb_t *tcbs[16];
+        for (uint32_t i = 0; i < streams; i++) {
+            tcbs[i] = tcp_fsm_connect(w % n_workers,
+                          g_arp[port_id].local_ip, 0,
+                          dst_ip, dst_port, port_id);
+            if (!tcbs[i]) {
+                printf("throughput: connect failed for stream %u\n", i);
+                streams = i;
+                break;
+            }
+            w++;
+        }
+
+        /* Wait for ESTABLISHED (up to 3s) */
+        {
+            uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
+            bool all_up = false;
+            while (rte_rdtsc() < deadline && !all_up) {
+                arp_mgmt_tick();
+                all_up = true;
+                for (uint32_t i = 0; i < streams; i++) {
+                    if (tcbs[i] && tcbs[i]->state != TCP_ESTABLISHED)
+                        all_up = false;
+                }
+                if (!all_up) rte_delay_ms(1);
+            }
+        }
+
+        printf("TCP throughput TX → %s:%u  streams=%u  duration=%us\n",
+               argv[2], dst_port, streams, duration_s);
+        printf("[ ID]  Interval       Transfer     Throughput\n");
+
+        /* Pump data for duration */
+        uint64_t start_tsc = rte_rdtsc();
+        uint64_t end_tsc   = start_tsc + (uint64_t)duration_s * rte_get_tsc_hz();
+        while (rte_rdtsc() < end_tsc && g_run) {
+            for (uint32_t i = 0; i < streams; i++) {
+                if (tcbs[i] && tcbs[i]->state == TCP_ESTABLISHED)
+                    tcp_fsm_send(i % n_workers, tcbs[i],
+                                  g_throughput_zero_buf,
+                                  (uint32_t)sizeof(g_throughput_zero_buf));
+            }
+            /* Let the worker poll loop process ACKs */
+            rte_delay_us(10);
+            arp_mgmt_tick();
+        }
+
+        /* Close all */
+        for (uint32_t i = 0; i < streams; i++) {
+            if (tcbs[i] && tcbs[i]->state == TCP_ESTABLISHED)
+                tcp_fsm_close(i % n_workers, tcbs[i]);
+        }
+        /* Wait for FIN exchange — poll TCB state until TIME_WAIT or up to 5s */
+        for (int g = 0; g < 50; g++) {
+            rte_delay_ms(100);
+            arp_mgmt_tick();
+            bool all_done = true;
+            for (uint32_t i = 0; i < streams; i++) {
+                if (tcbs[i] && tcbs[i]->state != TCP_TIME_WAIT
+                            && tcbs[i]->state != TCP_CLOSED
+                            && tcbs[i]->in_use)
+                    all_done = false;
+            }
+            if (all_done) break;
+        }
+
+        /* Report */
+        metrics_snapshot_t snap;
+        metrics_snapshot(&snap, n_workers);
+        uint64_t total_bytes = snap.total.tcp_payload_tx;
+        double   mbps = (double)total_bytes * 8.0 / ((double)duration_s * 1e6);
+        double   mb   = (double)total_bytes / (1024.0 * 1024.0);
+        printf("[SUM]  0.00-%.2fs    %.0f MB       %.1f Mbps\n",
+               (double)duration_s, mb, mbps);
+
+    } else {
+        /* throughput rx <port> <duration_s> */
+        uint16_t listen_port = (uint16_t)strtoul(argv[2], NULL, 10);
+        uint32_t duration_s  = (uint32_t)strtoul(argv[3], NULL, 10);
+        if (duration_s == 0) {
+            printf("throughput: duration must be > 0\n");
+            return;
+        }
+
+        /* Reset metrics and start listening */
+        metrics_reset(n_workers);
+        for (uint32_t i = 0; i < n_workers; i++)
+            tcp_fsm_listen(i, listen_port);
+
+        printf("TCP throughput RX ← *:%u  duration=%us  (waiting for sender)\n",
+               listen_port, duration_s);
+
+        /* Wait for duration */
+        for (uint32_t s = 0; s < duration_s && g_run; s++) {
+            for (int tick = 0; tick < 10; tick++) {
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
+                nanosleep(&ts, NULL);
+                arp_mgmt_tick();
+                if (!g_run) break;
+            }
+        }
+
+        /* Report */
+        metrics_snapshot_t snap;
+        metrics_snapshot(&snap, n_workers);
+        uint64_t total_bytes = snap.total.tcp_payload_rx;
+        double   mbps = (double)total_bytes * 8.0 / ((double)duration_s * 1e6);
+        double   mb   = (double)total_bytes / (1024.0 * 1024.0);
+        printf("[SUM]  0.00-%.2fs    %.0f MB       %.1f Mbps\n",
+               (double)duration_s, mb, mbps);
+    }
+}
+
 static void
 cmd_stop_gen(int argc, char **argv)
 {
@@ -277,6 +467,46 @@ cmd_stop_gen(int argc, char **argv)
     cmd.seq = 2;
     tgen_ipc_broadcast(&cmd);
     printf("Traffic generation stopped.\n");
+}
+
+/* ── Reset all TCP state ─────────────────────────────────────────────────── */
+static void
+cmd_reset(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    /* Stop any active traffic generation first */
+    config_update_t stopcmd;
+    memset(&stopcmd, 0, sizeof(stopcmd));
+    stopcmd.cmd = CFG_CMD_STOP;
+    stopcmd.seq = 2;
+    tgen_ipc_broadcast(&stopcmd);
+
+    /* Brief pause so workers drain TX */
+    rte_delay_ms(50);
+
+    /* Send RST for all active TCBs so the remote side also cleans up */
+    uint32_t n_workers = g_core_map.num_workers;
+    for (uint32_t w = 0; w < n_workers; w++) {
+        tcb_store_t *store = &g_tcb_stores[w];
+        for (uint32_t i = 0; i < store->capacity; i++) {
+            tcb_t *tcb = &store->tcbs[i];
+            if (tcb->in_use)
+                tcp_fsm_reset(w, tcb);
+        }
+    }
+
+    /* Brief pause for RSTs to be transmitted */
+    rte_delay_ms(50);
+
+    /* Reset port pools (but preserve cursor so we don't reuse recent ports) */
+    for (uint32_t w = 0; w < n_workers; w++)
+        tcp_port_pool_reset(w);
+
+    /* Reset metrics */
+    metrics_reset(n_workers);
+
+    printf("TCP state reset: all connections closed, ports freed, metrics cleared.\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -337,7 +567,9 @@ cli_run(void)
     cli_register("set-cps",  "Set target connections/s", cmd_set_cps);
     cli_register("ping",     "ICMP ping: ping <ip> [count] [size] [ms]", cmd_ping);
     cli_register("flood",    "TX flood: flood <icmp|udp|tcp> <ip> <secs> [pps] [sz]", cmd_flood);
+    cli_register("throughput", "TCP throughput: throughput tx/rx <args>",  cmd_throughput);
     cli_register("stop",     "Stop active traffic generation",          cmd_stop_gen);
+    cli_register("reset",   "Reset all TCP state (connections, ports)", cmd_reset);
     cli_register("trace",    "Packet capture: trace start/stop/save",    cmd_trace);
 
     /* Detect daemon mode: stdin is /dev/null (char device, non-tty).
@@ -350,8 +582,7 @@ cli_run(void)
         TGEN_INFO(TGEN_LOG_MGMT,
                   "stdin is /dev/null — running in headless mode "
                   "(send SIGTERM to stop)\n");
-        while (g_run) {
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100 ms */
+        while (g_run) {            arp_mgmt_tick();            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100 ms */
             nanosleep(&ts, NULL);
         }
         return;
@@ -363,6 +594,8 @@ cli_run(void)
 
 #ifdef HAVE_READLINE
     rl_bind_key('\t', rl_complete);
+    /* Process ARP while readline waits for input */
+    rl_event_hook = (rl_hook_func_t *)arp_mgmt_tick;
     char *line;
     while ((line = readline(prompt)) != NULL) {
         if (*line) add_history(line);
@@ -377,6 +610,12 @@ cli_run(void)
     for (;;) {
         printf("%s", prompt);
         fflush(stdout);
+        /* Poll stdin with short timeout, calling arp_mgmt_tick while idle.
+         * Without this, incoming ARP requests pile up unprocessed when
+         * no flood command is active. */
+        struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+        while (poll(&pfd, 1, 10 /* ms */) == 0)
+            arp_mgmt_tick();
         if (!fgets(buf, sizeof(buf), stdin)) break;
         buf[strcspn(buf, "\n")] = '\0';
         if (strcmp(buf, "quit") == 0 || strcmp(buf, "exit") == 0) break;

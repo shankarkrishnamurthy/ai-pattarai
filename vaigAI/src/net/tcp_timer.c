@@ -32,7 +32,7 @@ void tcp_timer_tick(uint32_t worker_idx)
                 /* Return ephemeral port */
                 tcp_port_free(worker_idx, tcb->src_ip, tcb->src_port);
                 tcb_free(store, tcb);
-                worker_metrics_add_tcp_conn_close(worker_idx);
+                /* conn_close already counted on FIN_WAIT→TIME_WAIT transition */
             }
             break;
 

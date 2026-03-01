@@ -188,6 +188,23 @@ tcp_port_pool_fini(void)
     }
 }
 
+void
+tcp_port_pool_reset(uint32_t worker_idx)
+{
+    worker_pool_t *wp = g_pools[worker_idx];
+    if (!wp) return;
+    /* Mark all ports available but preserve cursor to avoid port reuse */
+    memset(wp->shared.map, 0xff, sizeof(wp->shared.map));
+    /* Keep wp->shared.cursor and src_ip as-is */
+    for (uint32_t s = 0; s < N_IP_SLOTS; s++) {
+        memset(wp->ip_pools[s].map, 0xff, sizeof(wp->ip_pools[s].map));
+        /* Keep ip_pools[s].cursor and src_ip as-is */
+    }
+    /* Drain TIME_WAIT ring */
+    wp->tw_head = 0;
+    wp->tw_tail = 0;
+}
+
 int
 tcp_port_alloc(uint32_t worker_idx, uint32_t src_ip, uint16_t *port)
 {

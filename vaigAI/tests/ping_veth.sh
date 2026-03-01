@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Test: ICMP ping from vaigAI (net_af_packet / veth) to an Alpine container.
+# Test: ICMP ping from vaigAI (net_af_packet or net_af_xdp / veth) to an
+#       Alpine container.
 #
 # Self-contained — no external library needed.
 # Must run as root.
@@ -11,6 +12,9 @@
 #   -f, --flood <seconds>   Flood ping mode: send packets as fast as possible
 #                           for the given number of seconds (overrides default
 #                           count/interval behaviour).
+#   -x, --xdp               Use AF_XDP (net_af_xdp) instead of the default
+#                           net_af_packet.  Requires kernel >= 5.4, libbpf,
+#                           and CAP_NET_ADMIN + CAP_BPF (or root).
 #   -h, --help              Show this help message and exit.
 
 set -euo pipefail
@@ -18,6 +22,7 @@ set -euo pipefail
 # ── parse arguments ───────────────────────────────────────────────────────────
 FLOOD_MODE=0
 FLOOD_SECONDS=0
+XDP_MODE=0
 
 usage() {
     grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,2\}//'
@@ -32,6 +37,10 @@ while [[ $# -gt 0 ]]; do
             FLOOD_MODE=1
             FLOOD_SECONDS="$2"
             shift 2
+            ;;
+        -x|--xdp)
+            XDP_MODE=1
+            shift
             ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -50,6 +59,17 @@ PING_SIZE=56
 PING_INTERVAL_MS=1000
 DPDK_LCORES="0-1"
 VAIGAI_BIN="$(cd "$(dirname "$0")/.." && pwd)/build/vaigai"
+
+# Select DPDK vdev based on mode
+if [[ $XDP_MODE -eq 1 ]]; then
+    HOST_IF="veth-xdp"       # distinct name avoids interfering with af_packet runs
+    PEER_IF="veth-xdppeer"
+    VDEV_ARG="net_af_xdp0,iface=$HOST_IF"
+    MODE_LABEL="AF_XDP"
+else
+    VDEV_ARG="net_af_packet0,iface=$HOST_IF"
+    MODE_LABEL="AF_PACKET"
+fi
 
 # In flood mode the CLI 'flood' command handles timing internally;
 # no external 'timeout' wrapper needed.
@@ -70,6 +90,28 @@ fail()  { echo -e "${RED}[FAIL]${NC}  ping_veth: $*" >&2; exit 1; }
 for cmd in podman ip nsenter; do
     command -v "$cmd" &>/dev/null || fail "Required command not found: $cmd"
 done
+
+if [[ $XDP_MODE -eq 1 ]]; then
+    info "AF_XDP mode selected — running extra pre-flight checks"
+
+    # Kernel >= 5.4 required for AF_XDP
+    KVER=$(uname -r)
+    KMAJOR=${KVER%%.*}
+    KREST=${KVER#*.}
+    KMINOR=${KREST%%.*}
+    if [[ $KMAJOR -lt 5 || ( $KMAJOR -eq 5 && $KMINOR -lt 4 ) ]]; then
+        fail "AF_XDP requires kernel >= 5.4 (running $KVER)"
+    fi
+
+    # libbpf must be available (DPDK links against it for AF_XDP).
+    # Avoid ldconfig|grep -q which triggers SIGPIPE under pipefail.
+    if ! pkg-config --exists libbpf 2>/dev/null \
+       && ! compgen -G '/usr/lib*/libbpf.so*' >/dev/null 2>&1; then
+        fail "libbpf not found — install libbpf-dev / libbpf-devel"
+    fi
+
+    info "Kernel $KVER OK, libbpf found"
+fi
 
 # ── teardown (always runs on exit) ────────────────────────────────────────────
 CFG=$(mktemp /tmp/vaigai_ping_XXXXXX.json)
@@ -98,11 +140,20 @@ done
 [[ -n "$CPID" && "$CPID" != "0" ]] || fail "Container did not start"
 info "Container PID=$CPID"
 
-info "Setting up veth pair $HOST_IF <-> $PEER_IF"
+info "Setting up veth pair $HOST_IF <-> $PEER_IF ($MODE_LABEL)"
 ip link del "$HOST_IF" &>/dev/null || true
 ip link add "$HOST_IF" type veth peer name "$PEER_IF"
 ip link set "$HOST_IF" promisc on
 ip link set "$HOST_IF" up
+
+# AF_XDP needs a combined queue layout; set 1 queue pair so the single-queue
+# XDP socket can bind.  Also increase the RX/TX ring sizes for headroom.
+if [[ $XDP_MODE -eq 1 ]]; then
+    ethtool -L "$HOST_IF" combined 1 2>/dev/null || true
+    ip link set "$HOST_IF" mtu 3498 2>/dev/null || true   # avoid MTU mismatch issues
+    info "AF_XDP: $HOST_IF queue/mtu configured"
+fi
+
 ip link set "$PEER_IF" netns "$CPID"
 nsenter -t "$CPID" -n ip link set "$PEER_IF" up
 nsenter -t "$CPID" -n ip addr add "$PEER_CIDR" dev "$PEER_IF"
@@ -125,20 +176,21 @@ cat > "$CFG" <<EOF
 EOF
 
 # ── run ───────────────────────────────────────────────────────────────────────
+info "Using DPDK vdev: $VDEV_ARG"
 if [[ $FLOOD_MODE -eq 1 ]]; then
     info "Flood ICMP -> $PEER_IP for ${FLOOD_SECONDS}s (workers generate at line rate)"
     OUTPUT=$(printf 'flood icmp %s %d 0 %d\nquit\n' \
                  "$PEER_IP" "$FLOOD_SECONDS" "$PING_SIZE" \
              | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "net_af_packet0,iface=$HOST_IF" -- 2>&1) || true
+                   --vdev "$VDEV_ARG" -- 2>&1) || true
 else
     info "Pinging $PEER_IP ($PING_COUNT packets, interval=${PING_INTERVAL_MS}ms)"
     OUTPUT=$(printf 'ping %s %d %d %d\nquit\n' \
                  "$PEER_IP" "$PING_COUNT" "$PING_SIZE" "$PING_INTERVAL_MS" \
              | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "net_af_packet0,iface=$HOST_IF" -- 2>&1) || true
+                   --vdev "$VDEV_ARG" -- 2>&1) || true
 fi
 
 # ── assert ────────────────────────────────────────────────────────────────────

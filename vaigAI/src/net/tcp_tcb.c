@@ -140,6 +140,18 @@ void tcb_free(tcb_store_t *store, tcb_t *tcb)
     }
 }
 
+/* ── Reset all TCBs ───────────────────────────────────────────────────────── */
+void tcb_store_reset(tcb_store_t *store)
+{
+    if (!store->tcbs) return;
+    for (uint32_t i = 0; i < store->capacity; i++)
+        memset(&store->tcbs[i], 0, sizeof(store->tcbs[i]));
+    store->count = 0;
+    /* Clear hash table */
+    for (uint32_t i = 0; i < store->ht_size; i++)
+        store->ht[i] = -1;
+}
+
 /* ── Init all workers ─────────────────────────────────────────────────────── */
 int tcb_stores_init(uint32_t max_connections_per_core)
 {

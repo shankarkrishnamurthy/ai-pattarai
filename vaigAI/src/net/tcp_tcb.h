@@ -145,6 +145,9 @@ tcb_t *tcb_lookup(tcb_store_t *store,
 /** Free a TCB back to the store. */
 void tcb_free(tcb_store_t *store, tcb_t *tcb);
 
+/** Reset all TCBs in the store (free all connections). */
+void tcb_store_reset(tcb_store_t *store);
+
 /** Per-worker array of TCB stores (indexed by worker_idx). */
 extern tcb_store_t g_tcb_stores[TGEN_MAX_WORKERS];
 

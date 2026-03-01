@@ -46,6 +46,11 @@ void tcp_port_free(uint32_t worker_idx, uint32_t src_ip, uint16_t port);
  */
 void tcp_port_pool_tick(uint32_t worker_idx, uint64_t now_tsc);
 
+/**
+ * Reset all port allocations for a worker (free everything immediately).
+ */
+void tcp_port_pool_reset(uint32_t worker_idx);
+
 #ifdef __cplusplus
 }
 #endif

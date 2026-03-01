@@ -93,6 +93,7 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     ip->hdr_checksum  = 0;
     ip->src_addr      = tcb->src_ip;
     ip->dst_addr      = tcb->dst_ip;
+    m->l2_len = sizeof(struct rte_ether_hdr);
     bool hw_cksum = g_port_caps[port_id].has_ipv4_cksum_offload;
     if (!hw_cksum) ip->hdr_checksum = rte_ipv4_cksum(ip);
     else { m->ol_flags |= RTE_MBUF_F_TX_IPV4|RTE_MBUF_F_TX_IP_CKSUM; m->l3_len=20; }
@@ -130,9 +131,9 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     m->port = port_id;
 
     /* Transmit */
-    uint16_t sent = rte_eth_tx_burst(port_id,
-                        (uint16_t)worker_idx % g_port_caps[port_id].max_tx_queues,
-                        &m, 1);
+    uint16_t tx_q = (uint16_t)worker_idx % g_port_caps[port_id].max_tx_queues;
+    uint16_t sent = rte_eth_tx_burst(port_id, tx_q, &m, 1);
+
     if (sent == 0) { rte_pktmbuf_free(m); return -1; }
     worker_metrics_add_tx(worker_idx, 1, (uint32_t)seg_len);
     return 0;
@@ -168,16 +169,11 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
 {
     if (m->data_len < sizeof(struct rte_tcp_hdr)) goto bad;
 
-    /* Peek IP header that's now stripped — we need src/dst from context.
-     * The mbuf data pointer is AT the TCP header; we need the IP src/dst
-     * from the saved IPv4 metadata.  We use mbuf userdata for this. */
-    /* TODO: save src/dst IP in mbuf userdata during ipv4_input */
-
     const struct rte_tcp_hdr *tcp =
         rte_pktmbuf_mtod(m, const struct rte_tcp_hdr *);
 
-    uint32_t src_ip   = m->hash.usr;   /* set by ipv4_input */
-    uint32_t dst_ip   = 0;             /* TODO: worker local IP */
+    uint32_t src_ip   = m->hash.usr;      /* saved by ipv4_input (network order) */
+    uint32_t dst_ip   = m->dynfield1[0];  /* saved by ipv4_input (network order) */
     uint16_t src_port = rte_be_to_cpu_16(tcp->src_port);
     uint16_t dst_port = rte_be_to_cpu_16(tcp->dst_port);
 
@@ -246,6 +242,10 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->snd_wnd       = rte_be_to_cpu_16(tcp->rx_win)
                                   << tcb->wscale_remote;
             tcb->state = TCP_ESTABLISHED;
+            tcb->retransmit_count = 0;
+            tcb->rto_us = TCP_INITIAL_RTO_US;
+            tcb->rto_deadline_tsc = 0;  /* disarm SYN RTO */
+            worker_metrics_add_tcp_conn_open(worker_idx);
             /* Send ACK */
             tcp_send_segment(worker_idx, tcb,
                               RTE_TCP_ACK_FLAG,
@@ -270,6 +270,15 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                 tcb->snd_una   = ack;
                 tcb->dup_ack_count = 0;
                 congestion_on_ack(tcb, acked);
+                /* RFC 6298: on new ACK */
+                tcb->retransmit_count = 0;
+                if (tcb->snd_una == tcb->snd_nxt) {
+                    /* All data acknowledged — disarm RTO */
+                    tcb->rto_deadline_tsc = 0;
+                } else {
+                    /* Still unacked data — restart RTO from now */
+                    arm_rto(tcb);
+                }
                 /* RTT measurement from timestamps */
                 if (opts.has_timestamps && tcb->ts_enabled) {
                     uint32_t ts_now = (uint32_t)(rte_rdtsc() / (g_tsc_hz/1000000));
@@ -298,6 +307,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                 tcb->pending_ack     = true;
                 tcb->delayed_ack_tsc = rte_rdtsc() +
                     TCP_DELAYED_ACK_US * g_tsc_hz / 1000000ULL;
+                worker_metrics_add_tcp_payload_rx(worker_idx, data_len);
                 /* TODO: pass data to L7 */
             }
         }
@@ -312,8 +322,19 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
         break;
     }
 
-    case TCP_FIN_WAIT_1:
+    case TCP_FIN_WAIT_1: {
         if (flags & RTE_TCP_ACK_FLAG) tcb->state = TCP_FIN_WAIT_2;
+        /* Accept incoming data (half-open: remote can still send) */
+        uint8_t fw1_doff   = (tcp->data_off >> 4) & 0x0F;
+        uint16_t fw1_tlen  = (uint16_t)m->data_len;
+        uint16_t fw1_hlen  = (uint16_t)(fw1_doff * 4);
+        if (fw1_tlen > fw1_hlen) {
+            uint32_t dlen = fw1_tlen - fw1_hlen;
+            if (seq == tcb->rcv_nxt) {
+                tcb->rcv_nxt += dlen;
+                worker_metrics_add_tcp_payload_rx(worker_idx, dlen);
+            }
+        }
         if (flags & RTE_TCP_FIN_FLAG) {
             tcb->rcv_nxt++;
             tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
@@ -321,10 +342,27 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->state = TCP_TIME_WAIT;
             tcb->timewait_deadline_tsc = rte_rdtsc() +
                 (uint64_t)TGEN_TIMEWAIT_DEFAULT_MS * g_tsc_hz / 1000ULL;
+            worker_metrics_add_tcp_conn_close(worker_idx);
+        } else if (fw1_tlen > fw1_hlen) {
+            /* ACK the data even if no FIN yet */
+            tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
+                              NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
         }
         break;
+    }
 
-    case TCP_FIN_WAIT_2:
+    case TCP_FIN_WAIT_2: {
+        /* Accept incoming data (half-open: remote can still send) */
+        uint8_t fw2_doff   = (tcp->data_off >> 4) & 0x0F;
+        uint16_t fw2_tlen  = (uint16_t)m->data_len;
+        uint16_t fw2_hlen  = (uint16_t)(fw2_doff * 4);
+        if (fw2_tlen > fw2_hlen) {
+            uint32_t dlen = fw2_tlen - fw2_hlen;
+            if (seq == tcb->rcv_nxt) {
+                tcb->rcv_nxt += dlen;
+                worker_metrics_add_tcp_payload_rx(worker_idx, dlen);
+            }
+        }
         if (flags & RTE_TCP_FIN_FLAG) {
             tcb->rcv_nxt++;
             tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
@@ -332,8 +370,14 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->state = TCP_TIME_WAIT;
             tcb->timewait_deadline_tsc = rte_rdtsc() +
                 (uint64_t)TGEN_TIMEWAIT_DEFAULT_MS * g_tsc_hz / 1000ULL;
+            worker_metrics_add_tcp_conn_close(worker_idx);
+        } else if (fw2_tlen > fw2_hlen) {
+            /* ACK the data even if no FIN yet */
+            tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
+                              NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
         }
         break;
+    }
 
     case TCP_LAST_ACK:
         if (flags & RTE_TCP_ACK_FLAG) {
@@ -350,8 +394,9 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
         break;
     }
 
-    /* RST processing */
-    if (flags & RTE_TCP_RST_FLAG) {
+    /* RST processing — only for active connections (not TIME_WAIT or already freed) */
+    if ((flags & RTE_TCP_RST_FLAG) && tcb->in_use &&
+        tcb->state != TCP_TIME_WAIT) {
         tcb_free(&g_tcb_stores[worker_idx], tcb);
         worker_metrics_add_tcp_reset_rx(worker_idx);
     }
@@ -370,6 +415,13 @@ tcb_t *tcp_fsm_connect(uint32_t worker_idx,
                          uint16_t port_id)
 {
     (void)port_id;
+
+    /* Auto-allocate ephemeral port if caller passes 0 */
+    if (src_port == 0) {
+        if (tcp_port_alloc(worker_idx, src_ip, &src_port) < 0)
+            return NULL;
+    }
+
     tcb_store_t *store = &g_tcb_stores[worker_idx];
     tcb_t *tcb = tcb_alloc(store, src_ip, src_port, dst_ip, dst_port);
     if (!tcb) return NULL;
@@ -380,7 +432,7 @@ tcb_t *tcp_fsm_connect(uint32_t worker_idx,
     tcb->rcv_wnd      = 65535 << 7;
     tcb->mss_local    = 1460;
     tcb->wscale_local = 7;
-    tcb->cwnd         = tcb->mss_local;
+    tcb->cwnd         = 10 * tcb->mss_local;
     tcb->ssthresh     = UINT32_MAX;
     tcb->nagle_enabled = true;
     tcb->rto_us       = TCP_INITIAL_RTO_US;
@@ -467,14 +519,28 @@ int tcp_fsm_send(uint32_t worker_idx, tcb_t *tcb,
                   const uint8_t *data, uint32_t len)
 {
     if (tcb->state != TCP_ESTABLISHED) return -1;
-    uint32_t send_len = TGEN_MIN(len,
-                         TGEN_MIN(tcb->cwnd, tcb->snd_wnd));
-    if (send_len == 0) return 0;
-    send_len = TGEN_MIN(send_len, tcb->mss_remote);
 
-    tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG,
+    /* Flow control: limit by window minus in-flight data */
+    uint32_t in_flight = tcb->snd_nxt - tcb->snd_una;
+    uint32_t wnd = TGEN_MIN(tcb->cwnd, tcb->snd_wnd);
+    uint32_t avail = (wnd > in_flight) ? wnd - in_flight : 0;
+    uint32_t send_len = TGEN_MIN(len, avail);
+    if (send_len == 0) return 0;
+
+    /* Cap payload by effective MSS (account for TCP options that reduce MTU space) */
+    uint32_t opts_overhead = tcb->ts_enabled ? 12 : 0;
+    uint32_t effective_mss = (tcb->mss_remote > opts_overhead)
+                             ? tcb->mss_remote - opts_overhead : 1;
+    send_len = TGEN_MIN(send_len, effective_mss);
+
+    int rc = tcp_send_segment(worker_idx, tcb,
+                      RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG,
                       data, send_len, tcb->snd_nxt, tcb->rcv_nxt);
+    if (rc < 0) return 0;  /* TX failed — don't advance snd_nxt */
     tcb->snd_nxt += send_len;
-    arm_rto(tcb);
+    /* RFC 6298: only start RTO timer when not already running */
+    if (tcb->rto_deadline_tsc == 0)
+        arm_rto(tcb);
+    worker_metrics_add_tcp_payload_tx(worker_idx, send_len);
     return (int)send_len;
 }

@@ -171,6 +171,8 @@ void arp_mgmt_process(uint16_t port_id, struct rte_mbuf *m)
             rte_eth_tx_burst(port_id, 0, &reply, 1);
             worker_metrics_add_arp_reply_tx(0);
         }
+    } else if (op == RTE_ARP_OP_REQUEST) {
+        /* ARP request not for us — ignored */
     } else if (op == RTE_ARP_OP_REPLY) {
         /* Update cache — entry was pre-inserted as PENDING by arp_request() */
         rte_rwlock_write_lock(&a->lock);
@@ -267,6 +269,7 @@ int arp_request(uint16_t port_id, uint32_t ip_net)
     if (!m) return -1;
     int nb = rte_eth_tx_burst(port_id, 0, &m, 1);
     if (!nb) rte_pktmbuf_free(m);
+    else     worker_metrics_add_arp_request_tx(0);
     return 0;
 }
 

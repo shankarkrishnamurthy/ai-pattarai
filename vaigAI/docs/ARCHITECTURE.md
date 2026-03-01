@@ -82,11 +82,13 @@ src/
 │   ├── icmp.h/c               # ICMP echo reply, ping, unreachable
 │   ├── udp.h/c                # UDP RX rings, checksum validation
 │   ├── tcp_tcb.h/c            # TCB store (pre-alloc flat array + hash table)
-│   ├── tcp_fsm.h/c            # Full TCP state machine (RFC 793 / 7323)
+│   ├── tcp_fsm.h/c            # Full TCP state machine (RFC 793/7323/6298/6928)
+│   │                          #   IW10, effective MSS, half-open receive,
+│   │                          #   TAP PMD l2_len offload, flow-controlled send
 │   ├── tcp_options.h/c        # MSS, WScale, SACK-Permitted, Timestamps
-│   ├── tcp_timer.h/c          # RTO retransmit, TIME_WAIT expiry, delayed ACK
-│   ├── tcp_congestion.h/c     # New Reno congestion control (RFC 5681)
-│   ├── tcp_port_pool.h/c      # Ephemeral port bitmap [10000–59999]
+│   ├── tcp_timer.h/c          # RTO retransmit (RFC 6298), TIME_WAIT expiry, delayed ACK
+│   ├── tcp_congestion.h/c     # New Reno congestion control (RFC 5681; no TX retransmit)
+│   ├── tcp_port_pool.h/c      # Ephemeral port bitmap [10000–59999] + reset API
 │   └── tcp_checksum.h         # HW/SW checksum inline helpers
 │
 ├── tls/                       ── Encryption ──
@@ -127,8 +129,8 @@ main()
   │     config_push_to_workers()     Push flow profiles to ARP subsystem
   ├─8── cert_mgr_init()              TLS client/server SSL contexts
   │     tls_session_store_init()
-  ├─9── tcb_stores_init()            Per-worker TCB stores
-  │     tcp_port_pool_init()         Ephemeral port bitmaps
+  ├─9── tcb_stores_init()            Per-worker TCB stores (+ tcb_store_reset())
+  │     tcp_port_pool_init()         Ephemeral port bitmaps (+ tcp_port_pool_reset())
   ├─10─ cryptodev_init()             HW crypto (non-fatal; falls back to SW)
   ├─11─ rte_eal_remote_launch()      Launch all worker lcores
   ├─12─ rest_server_start()          Start REST API (libmicrohttpd thread)
@@ -159,7 +161,7 @@ on the same NUMA socket. Each worker gets one RX queue and one TX queue per port
 | **Mempools**      | Per-worker  | `next_pow2((rx_desc + tx_desc + pipeline) × 2 × queues)` mbufs; min 512 |
 | **TCB stores**    | Per-worker  | Pre-allocated flat array + open-addressing hash table        |
 | **ARP cache**     | Per-port    | `rte_hash` (1024 entries) + `rte_rwlock` (workers read, mgmt writes) |
-| **Port pools**    | Per-worker  | Bitmap over [10000, 59999] + TIME_WAIT FIFO ring             |
+| **Port pools**    | Per-worker  | Bitmap over [10000, 59999] + TIME_WAIT FIFO ring; reset preserves cursor |
 | **Metric slabs**  | Per-worker  | Cache-line aligned; no cross-core writes                     |
 | **IPC rings**     | Per-worker  | SPSC `rte_ring`, `max(64, next_pow2(pipeline_depth × 2))` entries |
 
@@ -251,7 +253,13 @@ Mempool allocation uses a 3-tier NUMA fallback: worker's socket with 1 GB pages 
 | 5    | TCB lookup by 4-tuple        | `tcp_tcb.c`         | Worker   |
 | 6    | State machine transition     | `tcp_fsm.c`         | Worker   |
 | 7    | `tcp_send_segment()` (ACK)   | `tcp_fsm.c`         | Worker   |
+|      | sets `m->l2_len` for TAP PMD TX checksum offload              |          |
 | 8    | `rte_eth_tx_burst()`         | *(DPDK)*            | Worker   |
+
+**Notes:**
+- `tcp_send_segment()` sets `m->l2_len = sizeof(struct rte_ether_hdr)` so the TAP PMD can compute L4 checksums via `RTE_MBUF_F_TX_TCP_CKSUM`.
+- FIN_WAIT_1 and FIN_WAIT_2 accept incoming data (half-open receive) — required for echo servers that flush buffered data after receiving FIN.
+- RST processing is skipped for TIME_WAIT and already-freed TCBs to avoid spurious `reset_rx` counts.
 
 ### 2.2 Transmit Path — TX Generation Engine
 
@@ -295,9 +303,13 @@ management plane via IPC.
   │     for i in 0..to_send:                   │
   │       build_packet() → protocol dispatch   │
   │         ├─ ICMP → build_icmp_echo()        │
-  │         ├─ UDP  → build_udp_datagram()     │
-  │         ├─ TCP  → (future)                 │
-  │         └─ HTTP → (future)                 │
+  │         └─ UDP  → build_udp_datagram()     │
+  │                                            │
+  │  NOTE: TCP data is NOT sent via tx_gen.    │
+  │  TCP connections are FSM-driven:           │
+  │    tcp_fsm_connect() → tcp_fsm_send()      │
+  │  with flow control and error handling      │
+  │  (see §2.5 TCP Flow Control below).        │
   │                                            │
   │  4. rte_eth_tx_burst(port, queue, burst)   │
   │                                            │
@@ -366,8 +378,10 @@ Every worker lcore runs a tight, non-blocking loop:
                             │
       ┌─ Step 4 ─── Timer Tick ─────────────────────────┐
       │  tcp_timer_tick(worker_idx)                     │
-      │    • RTO retransmit (exponential backoff)       │
-      │    • TIME_WAIT expiry                           │
+      │    • RTO retransmit (RFC 6298 backoff)          │
+      │      — arm on first unACKed; restart on ACK    │
+      │      — disarm when snd_una == snd_nxt          │
+      │    • TIME_WAIT expiry (conn_close counted once) │
       │    • Delayed ACK flush                          │
       └─────────────────────────────────────────────────┘
   }
@@ -376,27 +390,76 @@ Every worker lcore runs a tight, non-blocking loop:
 ### 2.4 Protocol Stack Summary
 
 ```
-  ┌────────────────────────────────┐
-  │       Application Layer        │
-  │   HTTP/1.1  (http11.c)        │
-  ├────────────────────────────────┤
-  │       Security Layer           │
-  │   TLS 1.2/1.3 (tls_engine.c) │
-  ├───────────┬────────────────────┤
-  │   TCP     │   UDP              │
-  │  tcp_fsm  │  udp.c / tx_gen.c │
-  ├───────────┴────────────────────┤
-  │       ICMP  (icmp.c)          │
-  ├────────────────────────────────┤
-  │       IPv4  (ipv4.c)          │
-  ├────────────────────────────────┤
-  │     ARP     (arp.c)           │
-  ├────────────────────────────────┤
-  │   Ethernet  (ethernet.c)      │
-  ├────────────────────────────────┤
-  │   DPDK PMD  (port_init.c)     │
-  └────────────────────────────────┘
+  Demux key:  ether_type          ip.protocol
+              ─────────           ───────────
+              0x0800 → IPv4       1  → ICMP
+              0x0806 → ARP        6  → TCP
+                                  17 → UDP
+
+  ┌───────────────┐
+  │  HTTP/1.1     │
+  │  (http11.c)   │
+  ├───────────────┤
+  │  TLS 1.2/1.3  │
+  │ (tls_engine.c)│
+  ├───────┬───────┴───────┬───────────┐
+  │  TCP  │      UDP      │   ICMP    │
+  │tcp_fsm│    udp.c /    │  icmp.c   │
+  │  .c   │   tx_gen.c    │           │
+  ├───────┴───────────────┴───────────┤
+  │          IPv4  (ipv4.c)           │        ARP  (arp.c)
+  │          ether_type 0x0800        │        ether_type 0x0806
+  ├───────────────────────────────────┴──────────────────────┐
+  │                   Ethernet  (ethernet.c)                 │
+  │           classify_and_process() demux on ether_type     │
+  ├──────────────────────────────────────────────────────────┤
+  │                   DPDK PMD  (port_init.c)                │
+  └──────────────────────────────────────────────────────────┘
 ```
+
+**Reading the diagram:**
+- Ethernet dispatches by `ether_type`: IPv4 (`0x0800`) and ARP (`0x0806`) are **siblings** — independent L3 protocols.
+- IPv4 dispatches by `protocol` field: TCP (6), UDP (17), and ICMP (1) are **siblings** — all encapsulated in IP.
+- TLS and HTTP stack only on top of TCP, not UDP or ICMP.
+
+### 2.5 TCP Flow Control & Data Transmission
+
+TCP data transfer is driven by the FSM, not `tx_gen_burst()`. The mgmt core
+calls `tcp_fsm_connect()` + `tcp_fsm_send()` on behalf of CLI commands like
+`throughput`.
+
+```
+  tcp_fsm_send(worker_idx, tcb, data, len)
+  │
+  ├── Window calculation:
+  │     wnd        = min(cwnd, snd_wnd)       // receiver + congestion window
+  │     in_flight  = snd_nxt - snd_una        // bytes unACKed
+  │     avail      = wnd - in_flight          // bytes allowed to send
+  │
+  ├── Effective MSS:
+  │     eff_mss = mss_remote - (timestamps ? 12 : 0)
+  │     // 12-byte timestamp option overhead subtracted to stay within MTU
+  │     // Without this, frames exceed TAP MTU=1500 → silently dropped
+  │
+  ├── Segmentation loop:
+  │     while (sent < len && avail > 0):
+  │       seg_len = min(eff_mss, remaining, avail)
+  │       rc = tcp_send_segment(...)
+  │       if (rc != 0) break     // TX failure → stop, don't advance snd_nxt
+  │       snd_nxt += seg_len
+  │       avail   -= seg_len
+  │
+  └── RTO arming (RFC 6298):
+        if (rto_deadline_tsc == 0)   // only when timer not running
+          arm_rto(initial_rto)
+```
+
+**Key design decisions:**
+- `snd_nxt` only advances on successful `rte_eth_tx_burst()` return.
+- Initial cwnd = 10 × MSS (RFC 6928 IW10), matching `tcp_fsm_connect()`.
+- RTO armed once per flight; restarted on ACK with unacked data; disarmed on full ACK.
+- No TX buffer — lost segments cannot be retransmitted. Fast retransmit adjusts congestion state only.
+- FIN_WAIT_1/2 states accept incoming data (half-open receive) for compatibility with echo servers.
 
 ---
 
@@ -589,6 +652,12 @@ Commands flow from management to workers via `config_update_t` messages (256 byt
 | `CFG_CMD_SET_PROFILE` | `flow_cfg_t`        | Update flow profile                       |
 | `CFG_CMD_SHUTDOWN` | *(none)*               | Exit worker loop                          |
 
+**Management-local commands** (not sent via IPC):
+
+| CLI Command | Effect |
+|-------------|--------|
+| `reset` | RST all active TCBs, `tcb_store_reset()`, `tcp_port_pool_reset()` (cursor preserved), `metrics_reset()` |
+
 **Delivery guarantees:**
 - Sender spins up to 100 µs if ring is full; drops + logs on timeout
 - Heap-allocated messages (`rte_malloc`) — ring transports pointers
@@ -616,13 +685,15 @@ Commands flow from management to workers via `config_update_t` messages (256 byt
     → enqueue to ring[0] ─────────► ipc_recv()
     → enqueue to ring[1] ──────────────────────────► ipc_recv()
                                     tx_gen_start()   tx_gen_start()
-  sleep(3s) with progress           ┌─── poll loop ─┐ ┌─ poll loop ─┐
-                                    │tx_gen_burst()  │ │tx_gen_burst│
-                                    │1000 pps each   │ │1000 pps    │
-                                    │token bucket    │ │token bucket│
-                                    └────────────────┘ └────────────┘
-  [3s elapsed]                      deadline hit →     deadline hit →
-                                    self-disarm        self-disarm
+  poll(3s) with progress             ┌─── poll loop ─┐ ┌─ poll loop ─┐
+    + arp_mgmt_tick() each iter      │tx_gen_burst()  │ │tx_gen_burst│
+                                     │1000 pps each   │ │1000 pps    │
+                                     │token bucket    │ │token bucket│
+                                     └────────────────┘ └────────────┘
+  [3s elapsed]                       deadline hit →     deadline hit →
+                                     self-disarm        self-disarm
+  TCP close grace: poll TCB state
+    for TIME_WAIT up to 5 s
   metrics_snapshot()
   export_json() → print stats
 ```

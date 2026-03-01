@@ -30,6 +30,10 @@ export_json(const metrics_snapshot_t *snap, char *buf, size_t len)
         "  \"tcp_syn_sent\": %"PRIu64", \"tcp_retransmit\": %"PRIu64",\n"
         "  \"tcp_reset_rx\": %"PRIu64", \"tcp_reset_sent\": %"PRIu64",\n"
         "  \"tcp_bad_cksum\": %"PRIu64",\n"
+        "  \"tcp_syn_queue_drops\": %"PRIu64",\n"
+        "  \"tcp_duplicate_acks\": %"PRIu64",\n"
+        "  \"tcp_ooo_pkts\": %"PRIu64",\n"
+        "  \"tcp_payload_tx\": %"PRIu64", \"tcp_payload_rx\": %"PRIu64",\n"
         "  \"http_req_tx\": %"PRIu64", \"http_rsp_rx\": %"PRIu64",\n"
         "  \"http_2xx\": %"PRIu64", \"http_4xx\": %"PRIu64",\n"
         "  \"tls_ok\": %"PRIu64", \"tls_fail\": %"PRIu64"\n"
@@ -49,6 +53,10 @@ export_json(const metrics_snapshot_t *snap, char *buf, size_t len)
         t->tcp_syn_sent,  t->tcp_retransmit,
         t->tcp_reset_rx,  t->tcp_reset_sent,
         t->tcp_bad_cksum,
+        t->tcp_syn_queue_drops,
+        t->tcp_duplicate_acks,
+        t->tcp_ooo_pkts,
+        t->tcp_payload_tx, t->tcp_payload_rx,
         t->http_req_tx,   t->http_rsp_rx,
         t->http_rsp_2xx,  t->http_rsp_4xx,
         t->tls_handshake_ok, t->tls_handshake_fail);

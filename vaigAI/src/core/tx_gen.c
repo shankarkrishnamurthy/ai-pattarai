@@ -23,6 +23,8 @@
 
 #include "../common/types.h"
 #include "../telemetry/metrics.h"
+#include "../net/tcp_fsm.h"
+#include "../net/tcp_port_pool.h"
 
 #define TX_GEN_MAX_BURST   32
 #define ICMP_HDR_LEN        8
@@ -232,7 +234,32 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
             return 0;
     }
 
-    /* ── Build packet burst ─────────────────────────────────────────── */
+    /* ── TCP SYN flood: use tcp_fsm_connect() instead of raw packets ── */
+    if (state->cfg.proto == TX_GEN_PROTO_TCP_SYN) {
+        uint32_t initiated = 0;
+        for (uint32_t i = 0; i < to_send; i++) {
+            uint16_t src_port;
+            if (tcp_port_alloc(worker_idx, state->cfg.src_ip,
+                               &src_port) < 0)
+                break;   /* port pool exhausted */
+            tcb_t *tcb = tcp_fsm_connect(worker_idx,
+                             state->cfg.src_ip, src_port,
+                             state->cfg.dst_ip, state->cfg.dst_port,
+                             state->cfg.port_id);
+            if (!tcb) {
+                tcp_port_free(worker_idx, state->cfg.src_ip, src_port);
+                break;   /* TCB store full */
+            }
+            initiated++;
+        }
+        state->pkts_sent += initiated;
+        if (state->cfg.rate_pps > 0 && initiated <= state->tokens)
+            state->tokens -= initiated;
+        /* tcp_fsm_connect already updates tcp_syn_sent & tx metrics */
+        return initiated;
+    }
+
+    /* ── Build packet burst (ICMP / UDP) ────────────────────────────── */
     struct rte_mbuf *pkts[TX_GEN_MAX_BURST];
     uint32_t built = 0;
     for (uint32_t i = 0; i < to_send; i++) {

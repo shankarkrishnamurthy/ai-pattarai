@@ -57,6 +57,8 @@ typedef struct {
     uint64_t tcp_syn_queue_drops;
     uint64_t tcp_ooo_pkts;
     uint64_t tcp_duplicate_acks;
+    uint64_t tcp_payload_tx;
+    uint64_t tcp_payload_rx;
 
     /* TLS */
     uint64_t tls_handshake_ok;
@@ -76,7 +78,7 @@ typedef struct {
 
     /* Padding to a full cache line */
     uint8_t  _pad[RTE_CACHE_LINE_SIZE -
-                  (38 * sizeof(uint64_t)) % RTE_CACHE_LINE_SIZE];
+                  (40 * sizeof(uint64_t)) % RTE_CACHE_LINE_SIZE];
 } __rte_cache_aligned worker_metrics_t;
 
 /* ------------------------------------------------------------------ */
@@ -122,6 +124,8 @@ extern worker_metrics_t g_metrics[TGEN_MAX_WORKERS];
 #define worker_metrics_add_syn_queue_drops(widx)  (g_metrics[(widx)].tcp_syn_queue_drops++)
 #define worker_metrics_add_tcp_ooo(widx)          (g_metrics[(widx)].tcp_ooo_pkts++)
 #define worker_metrics_add_tcp_dup_ack(widx)      (g_metrics[(widx)].tcp_duplicate_acks++)
+#define worker_metrics_add_tcp_payload_tx(widx, b) (g_metrics[(widx)].tcp_payload_tx += (b))
+#define worker_metrics_add_tcp_payload_rx(widx, b) (g_metrics[(widx)].tcp_payload_rx += (b))
 
 #define worker_metrics_add_tls_ok(widx)           (g_metrics[(widx)].tls_handshake_ok++)
 #define worker_metrics_add_tls_fail(widx)         (g_metrics[(widx)].tls_handshake_fail++)

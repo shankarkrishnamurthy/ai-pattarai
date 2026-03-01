@@ -60,6 +60,7 @@ congestion_on_ack(tcb_t *tcb, uint32_t acked)
 void
 congestion_fast_retransmit(uint32_t worker_idx, tcb_t *tcb)
 {
+    (void)worker_idx;
     /* RFC 5681 §3.2: set ssthresh and enter Fast Recovery */
     uint32_t flight = tcb->snd_nxt - tcb->snd_una;
     tcb->ssthresh = cc_max(flight / 2, 2u * tcb->mss_remote);
@@ -70,8 +71,11 @@ congestion_fast_retransmit(uint32_t worker_idx, tcb_t *tcb)
             "Fast retransmit lcore=%u tcb=%p ssthresh=%u cwnd=%u\n",
             worker_idx, (void *)tcb, tcb->ssthresh, tcb->cwnd);
 
-    /* Retransmit the oldest unacknowledged segment. */
-    tcp_fsm_rto_expired(worker_idx, tcb);
+    /*
+     * TODO: retransmit the oldest unacknowledged segment from TX buffer.
+     * Without a TX buffer, we cannot actually retransmit here — just
+     * adjust congestion state and rely on new data sends.
+     */
 }
 
 /* ------------------------------------------------------------------ */
