@@ -93,10 +93,6 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     ip->hdr_checksum  = 0;
     ip->src_addr      = tcb->src_ip;
     ip->dst_addr      = tcb->dst_ip;
-    m->l2_len = sizeof(struct rte_ether_hdr);
-    bool hw_cksum = g_port_caps[port_id].has_ipv4_cksum_offload;
-    if (!hw_cksum) ip->hdr_checksum = rte_ipv4_cksum(ip);
-    else { m->ol_flags |= RTE_MBUF_F_TX_IPV4|RTE_MBUF_F_TX_IP_CKSUM; m->l3_len=20; }
 
     /* TCP header */
     struct rte_tcp_hdr *tcp_h =
@@ -119,14 +115,12 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     if (payload && payload_len > 0)
         memcpy((uint8_t *)tcp_h + tcp_hdr_sz, payload, payload_len);
 
-    /* TCP checksum */
-    bool hw_tcp_cksum = g_port_caps[port_id].has_tcp_cksum_offload;
-    if (!hw_tcp_cksum) {
-        tcp_h->cksum = rte_ipv4_udptcp_cksum(ip, tcp_h);
-    } else {
-        m->ol_flags |= RTE_MBUF_F_TX_TCP_CKSUM;
-        m->l4_len    = (uint8_t)tcp_hdr_sz;
-    }
+    /* Set L2/L3/L4 lengths and compute checksums (HW offload when available) */
+    m->l2_len = sizeof(struct rte_ether_hdr);
+    m->l3_len = sizeof(struct rte_ipv4_hdr);
+    m->l4_len = (uint16_t)tcp_hdr_sz;
+    tcp_checksum_set(m, ip, tcp_h,
+                     g_port_caps[port_id].has_tcp_cksum_offload);
 
     m->port = port_id;
 
@@ -484,8 +478,27 @@ void tcp_fsm_rto_expired(uint32_t worker_idx, tcb_t *tcb)
     /* Backoff */
     tcb->rto_us = TGEN_MIN(tcb->rto_us * 2, (uint32_t)TCP_MAX_RTO_US);
     congestion_on_rto(tcb);
-    /* Retransmit from snd_una */
-    /* TODO: retransmit segment from TX buffer */
+    /* Retransmit based on FSM state */
+    switch (tcb->state) {
+    case TCP_SYN_SENT:
+        tcp_send_segment(worker_idx, tcb, RTE_TCP_SYN_FLAG,
+                          NULL, 0, tcb->snd_una, 0);
+        break;
+    case TCP_SYN_RECEIVED:
+        tcp_send_segment(worker_idx, tcb,
+                          RTE_TCP_SYN_FLAG | RTE_TCP_ACK_FLAG,
+                          NULL, 0, tcb->snd_una, tcb->rcv_nxt);
+        break;
+    case TCP_FIN_WAIT_1:
+    case TCP_LAST_ACK:
+        tcp_send_segment(worker_idx, tcb,
+                          RTE_TCP_FIN_FLAG | RTE_TCP_ACK_FLAG,
+                          NULL, 0, tcb->snd_una, tcb->rcv_nxt);
+        break;
+    default:
+        /* ESTABLISHED: would need TX buffer replay — not yet supported */
+        break;
+    }
     arm_rto(tcb);
     worker_metrics_add_tcp_retransmit(worker_idx);
 }

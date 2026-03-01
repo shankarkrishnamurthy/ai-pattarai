@@ -499,6 +499,10 @@ cmd_reset(int argc, char **argv)
     /* Brief pause for RSTs to be transmitted */
     rte_delay_ms(50);
 
+    /* Full reset of TCB stores — clears tombstones left by tcb_free */
+    for (uint32_t w = 0; w < n_workers; w++)
+        tcb_store_reset(&g_tcb_stores[w]);
+
     /* Reset port pools (but preserve cursor so we don't reuse recent ports) */
     for (uint32_t w = 0; w < n_workers; w++)
         tcp_port_pool_reset(w);

@@ -64,21 +64,6 @@ static void probe_caps(uint16_t port_id, port_caps_t *caps)
     rte_eth_macaddr_get(port_id, &caps->mac_addr);
 }
 
-/* ── Clamp descriptor count to driver limits ─────────────────────────────── */
-static uint32_t clamp_descs(uint32_t requested, uint32_t dmin, uint32_t dmax,
-                              uint16_t port_id, const char *which)
-{
-    uint32_t clamped = TGEN_CLAMP(requested, dmin, dmax);
-    if (!tgen_is_pow2((uint64_t)clamped))
-        clamped = (uint32_t)tgen_next_pow2_u64(clamped);
-    clamped = TGEN_CLAMP(clamped, dmin, dmax);
-    if (clamped != requested)
-        RTE_LOG(WARNING, PORT,
-            "Port %u: %s descriptor count clamped %u → %u\n",
-            port_id, which, requested, clamped);
-    return clamped;
-}
-
 /* ── Configure and start a single port ─────────────────────────────────────── */
 static int port_setup(uint16_t port_id,
                        uint32_t n_rxq, uint32_t n_txq,
@@ -88,12 +73,9 @@ static int port_setup(uint16_t port_id,
     port_caps_t *caps = &g_port_caps[port_id];
     probe_caps(port_id, caps);
 
-    rx_desc = clamp_descs(rx_desc,
-                           caps->rx_desc_lim_min, caps->rx_desc_lim_max,
-                           port_id, "RX");
-    tx_desc = clamp_descs(tx_desc,
-                           caps->tx_desc_lim_min, caps->tx_desc_lim_max,
-                           port_id, "TX");
+    /* Use rte_eth_dev_adjust_nb_rx_tx_desc instead of manual clamping:
+     * this API properly handles PMDs (e.g. mlx5) that report min=0, max=0
+     * in their desc_lim but enforce limits internally.                    */
 
     /* Clamp queue counts */
     if (n_rxq > caps->max_rx_queues) {
@@ -142,6 +124,25 @@ static int port_setup(uint16_t port_id,
                 port_id, rc);
         return -1;
     }
+
+    /* Let the driver negotiate actual descriptor counts.
+     * This handles PMDs like mlx5 that may report bogus limits in
+     * dev_info but accept sane values through this API.             */
+    uint16_t nb_rxd = (uint16_t)rx_desc;
+    uint16_t nb_txd = (uint16_t)tx_desc;
+    rc = rte_eth_dev_adjust_nb_rx_tx_desc(port_id, &nb_rxd, &nb_txd);
+    if (rc < 0) {
+        RTE_LOG(ERR, PORT,
+                "Port %u: rte_eth_dev_adjust_nb_rx_tx_desc failed: %d\n",
+                port_id, rc);
+        return -1;
+    }
+    if (nb_rxd != rx_desc || nb_txd != tx_desc)
+        RTE_LOG(INFO, PORT,
+                "Port %u: descriptors adjusted RX %u→%u  TX %u→%u\n",
+                port_id, rx_desc, nb_rxd, tx_desc, nb_txd);
+    rx_desc = nb_rxd;
+    tx_desc = nb_txd;
 
     /* RX queues */
     struct rte_eth_rxconf rxconf;
