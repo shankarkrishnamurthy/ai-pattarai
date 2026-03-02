@@ -37,6 +37,16 @@
 #define SEQ_GT(a,b)   ((int32_t)((a)-(b)) >  0)
 #define SEQ_GE(a,b)   ((int32_t)((a)-(b)) >= 0)
 
+/* ── Check if current lcore is a worker (vs mgmt) ───────────────────────── */
+static inline bool is_worker_lcore(void)
+{
+    unsigned int lid = rte_lcore_id();
+    for (uint32_t i = 0; i < g_core_map.num_workers; i++)
+        if (g_core_map.worker_lcores[i] == lid)
+            return true;
+    return false;
+}
+
 /* ── Detach TLS session before freeing a TCB ─────────────────────────────── */
 static inline void
 tls_detach_if_needed(uint32_t worker_idx, tcb_t *tcb)
@@ -140,8 +150,12 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
 
     m->port = port_id;
 
-    /* Transmit */
-    uint16_t tx_q = (uint16_t)worker_idx % g_port_caps[port_id].max_tx_queues;
+    /* Transmit — use dedicated mgmt TX queue if called from mgmt lcore */
+    uint16_t tx_q;
+    if (is_worker_lcore())
+        tx_q = (uint16_t)worker_idx % g_port_caps[port_id].max_tx_queues;
+    else
+        tx_q = g_port_caps[port_id].mgmt_tx_q;
     uint16_t sent = rte_eth_tx_burst(port_id, tx_q, &m, 1);
 
     if (sent == 0) { rte_pktmbuf_free(m); return -1; }
@@ -281,13 +295,19 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                             uint64_t lat_us = (rte_rdtsc() - tcb->tls_hs_start_tsc)
                                               * 1000000ULL / rte_get_tsc_hz();
                             hist_record(&g_latency_hist[worker_idx], lat_us);
-                            /* If HTTPS: send HTTP request now that TLS is up */
-                            if (tcb->app_ctx) {
+                            /* If HTTPS: encrypt & send HTTP request now that TLS is up.
+                             * Throughput mode sets app_ctx=(void*)1 as marker — skip HTTP send. */
+                            if (tcb->app_ctx && (uintptr_t)tcb->app_ctx > 0x1000) {
                                 http_prebuilt_req_t *hp_req =
                                     (http_prebuilt_req_t *)tcb->app_ctx;
                                 if (hp_req->hdr_len > 0) {
-                                    tcp_fsm_send(worker_idx, tcb,
-                                                 hp_req->hdr, hp_req->hdr_len);
+                                    uint8_t ct_buf[4096];
+                                    int ct_len = tls_encrypt(sess,
+                                        hp_req->hdr, hp_req->hdr_len,
+                                        ct_buf, sizeof(ct_buf));
+                                    if (ct_len > 0)
+                                        tcp_fsm_send(worker_idx, tcb,
+                                                     ct_buf, (uint32_t)ct_len);
                                     worker_metrics_add_http_req(worker_idx);
                                     tcb->app_state = 5;
                                 }
@@ -304,7 +324,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                 }
             }
 
-            /* ── HTTP request initiation ──────────────────────────── */
+            /* ── HTTP request initiation (plain HTTP only) ────────── */
             if (tcb->app_state == 4) {
                 http_prebuilt_req_t *hp =
                     (http_prebuilt_req_t *)tcb->app_ctx;
@@ -375,7 +395,8 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                 worker_metrics_add_tcp_payload_rx(worker_idx, data_len);
 
                 /* ── L7: TLS handshake / decrypt ──────────────────── */
-                if (tcb->app_state == 2 || tcb->app_state == 3) {
+                if (tcb->app_state == 2 || tcb->app_state == 3 ||
+                    tcb->app_state == 5) {
                     uint32_t ci = (uint32_t)(tcb - g_tcb_stores[worker_idx].tcbs);
                     tls_session_t *ts = tls_session_get(worker_idx, ci);
                     if (ts) {
@@ -398,59 +419,88 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                 uint64_t lat_us = (rte_rdtsc() - tcb->tls_hs_start_tsc)
                                                   * 1000000ULL / rte_get_tsc_hz();
                                 hist_record(&g_latency_hist[worker_idx], lat_us);
-                                /* If HTTPS: send HTTP request now that TLS is up */
-                                if (tcb->app_ctx) {
+                                /* If HTTPS: encrypt & send HTTP request now that TLS is up.
+                                 * Throughput mode sets app_ctx=(void*)1 as marker — skip HTTP send. */
+                                if (tcb->app_ctx && (uintptr_t)tcb->app_ctx > 0x1000) {
                                     http_prebuilt_req_t *hp_req =
                                         (http_prebuilt_req_t *)tcb->app_ctx;
                                     if (hp_req->hdr_len > 0) {
-                                        tcp_fsm_send(worker_idx, tcb,
-                                                     hp_req->hdr, hp_req->hdr_len);
+                                        uint8_t ct_buf[4096];
+                                        int ct_len = tls_encrypt(ts,
+                                            hp_req->hdr, hp_req->hdr_len,
+                                            ct_buf, sizeof(ct_buf));
+                                        if (ct_len > 0)
+                                            tcp_fsm_send(worker_idx, tcb,
+                                                         ct_buf, (uint32_t)ct_len);
                                         worker_metrics_add_http_req(worker_idx);
                                         tcb->app_state = 5; /* HTTP response pending */
                                     }
-                                } else {
-                                    /* For tps/CPS mode: close after TLS done
-                                     * so server can accept next connection.
-                                     * Throughput mode will override app_ctx. */
+                                } else if (!tcb->app_ctx) {
+                                    /* No app context: close after TLS done
+                                     * (CPS mode with no HTTP to send). */
                                     tcp_fsm_close(worker_idx, tcb);
                                 }
+                                /* else: throughput mode marker — keep connection open,
+                                 * tx_gen_burst phase 1 will pump data */
                             } else if (hr < 0) {
                                 tcb->app_state = 0;
                                 worker_metrics_add_tls_fail(worker_idx);
                             }
                         } else {
-                            /* TLS established — decrypt */
+                            /* TLS established — decrypt incoming data */
                             uint8_t plain[4096];
                             int n = tls_decrypt(ts, payload_data, data_len,
                                                 plain, sizeof(plain));
-                            if (n > 0)
+                            if (n > 0) {
                                 worker_metrics_add_tls_rx(worker_idx);
+                                /* Parse decrypted HTTP response if waiting */
+                                if (tcb->app_state == 5 && n >= 12 &&
+                                    memcmp(plain, "HTTP/1.", 7) == 0) {
+                                    uint16_t status =
+                                        (uint16_t)atoi((const char *)plain + 9);
+                                    worker_metrics_add_http_rsp(worker_idx, status);
+                                    http_prebuilt_req_t *hpb =
+                                        (http_prebuilt_req_t *)tcb->app_ctx;
+                                    if (hpb && hpb->keep_alive) {
+                                        tcb->app_state = 4;
+                                    } else {
+                                        tcb->app_state = 0;
+                                        tcp_fsm_close(worker_idx, tcb);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
-                /* ── L7: HTTP response parsing ────────────────────── */
+                /* ── L7: HTTP response parsing (plain HTTP only) ──── */
                 if (tcb->app_state == 5) {
-                    const uint8_t *hp =
-                        (const uint8_t *)tcp + hdr_len;
-                    if (data_len >= 12 &&
-                        memcmp(hp, "HTTP/1.", 7) == 0) {
-                        uint16_t status =
-                            (uint16_t)atoi((const char *)hp + 9);
-                        worker_metrics_add_http_rsp(worker_idx,
-                                                    status);
-                    } else {
-                        worker_metrics_add_http_parse_err(
-                            worker_idx);
+                    uint32_t ci2 = (uint32_t)(tcb - g_tcb_stores[worker_idx].tcbs);
+                    tls_session_t *ts2 = tls_session_get(worker_idx, ci2);
+                    if (!ts2) {
+                        /* Plain HTTP — parse from raw TCP payload */
+                        const uint8_t *hp =
+                            (const uint8_t *)tcp + hdr_len;
+                        if (data_len >= 12 &&
+                            memcmp(hp, "HTTP/1.", 7) == 0) {
+                            uint16_t status =
+                                (uint16_t)atoi((const char *)hp + 9);
+                            worker_metrics_add_http_rsp(worker_idx,
+                                                        status);
+                        } else {
+                            worker_metrics_add_http_parse_err(
+                                worker_idx);
+                        }
+                        http_prebuilt_req_t *hpb =
+                            (http_prebuilt_req_t *)tcb->app_ctx;
+                        if (hpb && hpb->keep_alive) {
+                            tcb->app_state = 4; /* re-send next request */
+                        } else {
+                            tcb->app_state = 0;
+                            tcp_fsm_close(worker_idx, tcb);
+                        }
                     }
-                    http_prebuilt_req_t *hpb =
-                        (http_prebuilt_req_t *)tcb->app_ctx;
-                    if (hpb && hpb->keep_alive) {
-                        tcb->app_state = 4; /* re-send next request */
-                    } else {
-                        tcb->app_state = 0;
-                        tcp_fsm_close(worker_idx, tcb);
-                    }
+                    /* TLS HTTP responses handled above in decrypt path */
                 }
             }
         }

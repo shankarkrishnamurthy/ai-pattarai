@@ -27,6 +27,7 @@ typedef enum {
     TX_GEN_PROTO_UDP,           /* UDP datagram TPS                     */
     TX_GEN_PROTO_TCP_SYN,       /* TCP SYN TPS                          */
     TX_GEN_PROTO_HTTP,          /* HTTP request TPS                     */
+    TX_GEN_PROTO_THROUGHPUT,    /* TCP bulk data throughput              */
     TX_GEN_PROTO_MAX,
 } tx_gen_proto_t;
 
@@ -46,7 +47,8 @@ typedef struct {
     uint32_t              duration_s;   /* 0 = run until stopped         */
     bool                  enable_tls;   /* initiate TLS after TCP 3WHS   */
     uint8_t               http_method;  /* http_method_t (0=GET,1=POST…) */
-    uint8_t               _pad[2];      /* alignment padding             */
+    uint8_t               throughput_streams; /* streams for THROUGHPUT (1-16) */
+    uint8_t               _pad[1];      /* alignment padding             */
     char                  http_url[64]; /* URL path for HTTP TPS         */
     char                  http_host[64];/* Host: header for HTTP TPS    */
 } tx_gen_config_t;
@@ -55,6 +57,7 @@ _Static_assert(sizeof(tx_gen_config_t) <= 248,
                "tx_gen_config_t must fit in IPC payload");
 
 /* ── Per-worker generation state ──────────────────────────────────────────── */
+
 typedef struct {
     volatile bool   active;
     tx_gen_config_t cfg;
@@ -76,6 +79,11 @@ typedef struct {
     uint16_t        ident;              /* ICMP identifier              */
     uint16_t        tx_queue_id;        /* resolved at configure time   */
     uint16_t        _pad;
+
+    /* Throughput mode state */
+    void           *tp_tcbs[16];        /* active throughput TCBs       */
+    uint32_t        tp_n_streams;       /* number of streams allocated  */
+    uint8_t         tp_phase;           /* 0=connect, 1=pump, 2=done   */
 } tx_gen_state_t;
 
 /* ── Pre-built HTTP request (one per worker, reused across connections) ──── */

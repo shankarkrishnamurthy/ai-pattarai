@@ -33,6 +33,7 @@ typedef struct {
     uint32_t      tx_desc_lim_min;
     uint32_t      tx_desc_lim_max;
     uint32_t      socket_id;
+    uint16_t      mgmt_tx_q;      /* dedicated TX queue for mgmt lcore */
     struct rte_ether_addr mac_addr;
 } port_caps_t;
 

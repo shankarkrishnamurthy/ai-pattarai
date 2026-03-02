@@ -338,7 +338,6 @@ cmd_tps(int argc, char **argv)
 /* ------------------------------------------------------------------ */
 /* throughput — TCP data throughput measurement (iperf3-like)            */
 /* ------------------------------------------------------------------ */
-static uint8_t g_throughput_zero_buf[1460];
 
 static void
 cmd_throughput(int argc, char **argv)
@@ -399,116 +398,43 @@ cmd_throughput(int argc, char **argv)
         /* Reset metrics */
         metrics_reset(n_workers);
 
-        /* Open connections */
-        bool tls = g_config.tls_enabled;
-        uint32_t w = 0; /* round-robin across workers */
-        tcb_t *tcbs[16];
-        for (uint32_t i = 0; i < streams; i++) {
-            tcbs[i] = tcp_fsm_connect(w % n_workers,
-                          g_arp[port_id].local_ip, 0,
-                          dst_ip, dst_port, port_id);
-            if (!tcbs[i]) {
-                printf("throughput: connect failed for stream %u\n", i);
-                streams = i;
-                break;
-            }
-            if (tls) {
-                tcbs[i]->app_state = 1; /* request TLS on ESTABLISHED */
-                /* Mark as throughput mode so FSM doesn't auto-close
-                 * after TLS handshake completes (tps mode uses NULL). */
-                tcbs[i]->app_ctx = (void *)1;
-            }
-            w++;
-        }
+        /* Build TX-gen config and dispatch to worker via IPC */
+        tx_gen_config_t gcfg;
+        memset(&gcfg, 0, sizeof(gcfg));
+        gcfg.proto              = TX_GEN_PROTO_THROUGHPUT;
+        gcfg.dst_ip             = dst_ip;
+        gcfg.src_ip             = g_arp[port_id].local_ip;
+        gcfg.dst_mac            = dst_mac;
+        gcfg.src_mac            = g_arp[port_id].local_mac;
+        gcfg.dst_port           = dst_port;
+        gcfg.port_id            = port_id;
+        gcfg.duration_s         = duration_s;
+        gcfg.enable_tls         = g_config.tls_enabled;
+        gcfg.throughput_streams  = (uint8_t)streams;
 
-        /* Wait for ESTABLISHED (up to 3s) */
-        {
-            uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
-            bool all_up = false;
-            while (rte_rdtsc() < deadline && !all_up) {
-                arp_mgmt_tick();
-                all_up = true;
-                for (uint32_t i = 0; i < streams; i++) {
-                    if (tcbs[i] && tcbs[i]->state != TCP_ESTABLISHED)
-                        all_up = false;
-                }
-                if (!all_up) rte_delay_ms(1);
-            }
-        }
-
-        /* If TLS: wait for handshake completion (app_state == 3, up to 5s) */
-        if (tls) {
-            uint64_t deadline = rte_rdtsc() + 5ULL * rte_get_tsc_hz();
-            bool all_tls = false;
-            while (rte_rdtsc() < deadline && !all_tls) {
-                arp_mgmt_tick();
-                all_tls = true;
-                for (uint32_t i = 0; i < streams; i++) {
-                    if (tcbs[i] && tcbs[i]->app_state != 3 &&
-                        tcbs[i]->state == TCP_ESTABLISHED)
-                        all_tls = false;
-                }
-                if (!all_tls) rte_delay_ms(1);
-            }
-            if (!all_tls)
-                printf("throughput: TLS handshake did not complete for all streams\n");
-        }
+        config_update_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.cmd = CFG_CMD_START;
+        cmd.seq = 1;
+        memcpy(cmd.payload, &gcfg, sizeof(gcfg));
+        tgen_ipc_broadcast(&cmd);
 
         printf("TCP throughput TX → %s:%u  streams=%u  duration=%us\n",
                argv[2], dst_port, streams, duration_s);
         printf("[ ID]  Interval       Transfer     Throughput\n");
 
-        /* Pump data for duration */
-        uint8_t tls_ct_buf[2048];  /* ciphertext output buffer */
-        uint64_t start_tsc = rte_rdtsc();
-        uint64_t end_tsc   = start_tsc + (uint64_t)duration_s * rte_get_tsc_hz();
-        while (rte_rdtsc() < end_tsc && g_run) {
-            for (uint32_t i = 0; i < streams; i++) {
-                if (!tcbs[i] || tcbs[i]->state != TCP_ESTABLISHED)
-                    continue;
-                if (tls && tcbs[i]->app_state == 3) {
-                    /* Encrypt plaintext → send ciphertext */
-                    uint32_t wid = i % n_workers;
-                    uint32_t ci = (uint32_t)(tcbs[i] - g_tcb_stores[wid].tcbs);
-                    tls_session_t *sess = tls_session_get(wid, ci);
-                    if (sess) {
-                        int ct_len = tls_encrypt(sess,
-                                        g_throughput_zero_buf,
-                                        sizeof(g_throughput_zero_buf),
-                                        tls_ct_buf, sizeof(tls_ct_buf));
-                        if (ct_len > 0)
-                            tcp_fsm_send(wid, tcbs[i], tls_ct_buf, (uint32_t)ct_len);
-                    }
-                } else if (!tls) {
-                    tcp_fsm_send(i % n_workers, tcbs[i],
-                                  g_throughput_zero_buf,
-                                  (uint32_t)sizeof(g_throughput_zero_buf));
-                }
-                /* If tls but app_state != 3, skip — handshake not done yet */
+        /* Wait for duration, answering ARP */
+        for (uint32_t s = 0; s < duration_s && g_run; s++) {
+            for (int tick = 0; tick < 10; tick++) {
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
+                nanosleep(&ts, NULL);
+                arp_mgmt_tick();
+                if (!g_run) break;
             }
-            /* Let the worker poll loop process ACKs */
-            rte_delay_us(10);
-            arp_mgmt_tick();
         }
-
-        /* Close all */
-        for (uint32_t i = 0; i < streams; i++) {
-            if (tcbs[i] && tcbs[i]->state == TCP_ESTABLISHED)
-                tcp_fsm_close(i % n_workers, tcbs[i]);
-        }
-        /* Wait for FIN exchange — poll TCB state until TIME_WAIT or up to 5s */
-        for (int g = 0; g < 50; g++) {
-            rte_delay_ms(100);
-            arp_mgmt_tick();
-            bool all_done = true;
-            for (uint32_t i = 0; i < streams; i++) {
-                if (tcbs[i] && tcbs[i]->state != TCP_TIME_WAIT
-                            && tcbs[i]->state != TCP_CLOSED
-                            && tcbs[i]->in_use)
-                    all_done = false;
-            }
-            if (all_done) break;
-        }
+        /* Grace period for worker to close connections */
+        struct timespec grace = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&grace, NULL);
 
         /* Report */
         metrics_snapshot_t snap;
@@ -769,19 +695,25 @@ cmd_reset(int argc, char **argv)
     /* Brief pause so workers drain TX */
     rte_delay_ms(50);
 
-    /* Send RST for all active TCBs so the remote side also cleans up */
+    /* Send RST for all active TCBs so the remote side also cleans up.
+     * Batch RSTs to avoid TX ring overflow (ring size is typically 2048). */
     uint32_t n_workers = g_core_map.num_workers;
     for (uint32_t w = 0; w < n_workers; w++) {
         tcb_store_t *store = &g_tcb_stores[w];
+        uint32_t batch = 0;
         for (uint32_t i = 0; i < store->capacity; i++) {
             tcb_t *tcb = &store->tcbs[i];
-            if (tcb->in_use)
+            if (tcb->in_use) {
                 tcp_fsm_reset(w, tcb);
+                batch++;
+                if (batch % 1024 == 0)
+                    rte_delay_ms(5);
+            }
         }
     }
 
-    /* Brief pause for RSTs to be transmitted */
-    rte_delay_ms(50);
+    /* Wait for RSTs to be transmitted and remote side to process them */
+    rte_delay_ms(200);
 
     /* Full reset of TCB stores — clears tombstones left by tcb_free */
     for (uint32_t w = 0; w < n_workers; w++)

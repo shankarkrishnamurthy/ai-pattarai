@@ -130,7 +130,7 @@ int tcp_options_write_data(uint8_t *buf, size_t bufsz,
     uint8_t *p = buf;
     size_t   remaining = bufsz;
 
-#define NEED(n) if (remaining < (n)) goto done; remaining -= (n);
+#define NEED(n) if (remaining < (size_t)(n)) goto done; remaining -= (size_t)(n);
 
     if (timestamps) {
         NEED(12);

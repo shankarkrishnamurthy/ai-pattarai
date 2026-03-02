@@ -27,9 +27,16 @@
 #include "../net/tcp_port_pool.h"
 #include "../net/tcp_tcb.h"
 #include "../app/http11.h"
+#include "../tls/tls_session.h"
+#include "../tls/tls_engine.h"
 
 #define TX_GEN_MAX_BURST   32
 #define ICMP_HDR_LEN        8
+
+static uint8_t g_tp_zero_buf[1400]; /* zero-filled plaintext for throughput
+                                      * Keep small enough that TLS record
+                                      * (plaintext + ~29B overhead) fits in
+                                      * one MSS (1460). */
 
 /* ── Pre-built HTTP request (one per worker, reused across connections) ──── */
 http_prebuilt_req_t g_http_req[TGEN_MAX_WORKERS];
@@ -219,6 +226,17 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
 
     /* ── Deadline check ─────────────────────────────────────────────── */
     if (state->deadline_tsc > 0 && now >= state->deadline_tsc) {
+        /* Close throughput connections before stopping */
+        if (state->cfg.proto == TX_GEN_PROTO_THROUGHPUT) {
+            for (uint32_t i = 0; i < state->tp_n_streams; i++) {
+                tcb_t *t = (tcb_t *)state->tp_tcbs[i];
+                if (t && t->state == TCP_ESTABLISHED)
+                    tcp_fsm_close(worker_idx, t);
+                state->tp_tcbs[i] = NULL;
+            }
+            state->tp_n_streams = 0;
+            state->tp_phase = 0;
+        }
         __atomic_store_n(&state->active, false, __ATOMIC_RELEASE);
         return 0;
     }
@@ -297,6 +315,73 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
             state->tokens -= initiated;
         /* tcp_fsm_connect already updates tcp_syn_sent & tx metrics */
         return initiated;
+    }
+
+    /* ── Throughput mode: create connections once, pump data continuously ── */
+    if (state->cfg.proto == TX_GEN_PROTO_THROUGHPUT) {
+        bool tls = state->cfg.enable_tls;
+        uint32_t streams = state->cfg.throughput_streams;
+        if (streams == 0) streams = 1;
+        if (streams > 16) streams = 16;
+
+        /* Phase 0: Create connections (once) */
+        if (state->tp_phase == 0) {
+            state->tp_n_streams = 0;
+            for (uint32_t i = 0; i < streams; i++) {
+                uint16_t src_port;
+                if (tcp_port_alloc(worker_idx, state->cfg.src_ip,
+                                   &src_port) < 0)
+                    break;
+                tcb_t *tcb = tcp_fsm_connect(worker_idx,
+                                 state->cfg.src_ip, src_port,
+                                 state->cfg.dst_ip, state->cfg.dst_port,
+                                 state->cfg.port_id);
+                if (!tcb) {
+                    tcp_port_free(worker_idx, state->cfg.src_ip, src_port);
+                    break;
+                }
+                if (tls) {
+                    tcb->app_state = 1; /* request TLS handshake */
+                    tcb->app_ctx = (void *)1; /* mark as throughput */
+                }
+                state->tp_tcbs[i] = tcb;
+                state->tp_n_streams++;
+            }
+            state->tp_phase = 1; /* move to pump phase */
+            return state->tp_n_streams;
+        }
+
+        /* Phase 1: Pump data on established connections */
+        uint32_t sent_total = 0;
+        uint8_t ct_buf[2048];
+        for (uint32_t i = 0; i < state->tp_n_streams; i++) {
+            tcb_t *tcb = (tcb_t *)state->tp_tcbs[i];
+            if (!tcb || tcb->state != TCP_ESTABLISHED)
+                continue;
+            if (tls && tcb->app_state == 3) {
+                uint32_t ci = (uint32_t)(tcb - g_tcb_stores[worker_idx].tcbs);
+                tls_session_t *sess = tls_session_get(worker_idx, ci);
+                if (sess) {
+                    int ct_len = tls_encrypt(sess,
+                                    g_tp_zero_buf, sizeof(g_tp_zero_buf),
+                                    ct_buf, sizeof(ct_buf));
+                    if (ct_len > 0) {
+                        int rc = tcp_fsm_send(worker_idx, tcb,
+                                     ct_buf, (uint32_t)ct_len);
+                        if (rc > 0) {
+                            sent_total++;
+                            worker_metrics_add_tls_tx(worker_idx);
+                        }
+                    }
+                }
+            } else if (!tls) {
+                tcp_fsm_send(worker_idx, tcb,
+                             g_tp_zero_buf, (uint32_t)sizeof(g_tp_zero_buf));
+                sent_total++;
+            }
+        }
+        state->pkts_sent += sent_total;
+        return sent_total;
     }
 
     /* ── Build packet burst (ICMP / UDP) ────────────────────────────── */

@@ -234,9 +234,12 @@ int tgen_ports_init(uint32_t num_rx_desc, uint32_t num_tx_desc)
         if (!mp && g_core_map.num_workers > 0)
             mp = g_worker_mempools[0];
 
-        if (port_setup(port_id, n_queues, n_queues,
+        /* +1 TX queue for mgmt lcore (avoids race with worker TX) */
+        uint32_t n_txq = n_queues + 1;
+        if (port_setup(port_id, n_queues, n_txq,
                        num_rx_desc, num_tx_desc, mp) < 0)
             return -1;
+        g_port_caps[port_id].mgmt_tx_q = (uint16_t)n_queues;
 
         /* Run soft NIC post-init if needed */
         soft_nic_post_init(port_id, &g_port_caps[port_id]);

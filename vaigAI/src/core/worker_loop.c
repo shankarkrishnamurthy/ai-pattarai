@@ -16,6 +16,7 @@
 
 #include "../common/util.h"
 #include "../common/types.h"
+#include "../port/port_init.h"
 #include "../net/ethernet.h"
 #include "../net/arp.h"
 #include "../net/ipv4.h"
