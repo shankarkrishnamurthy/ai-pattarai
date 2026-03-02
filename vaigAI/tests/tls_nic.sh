@@ -82,7 +82,7 @@ LATENCY_DUR="${LATENCY_DUR:-10}"
 VM_MEM="${VM_MEM:-1024}"
 VM_CPUS="${VM_CPUS:-2}"
 TLS_PORT="${TLS_PORT:-4433}"
-TLS_CIPHER="${TLS_CIPHER:-AES128-GCM-SHA256}"
+TLS_CIPHER="${TLS_CIPHER:-ECDHE-ECDSA-AES128-GCM-SHA256}"
 VAIGAI_CRYPTO="${VAIGAI_CRYPTO:-qat}"
 SERVER_CRYPTO="${SERVER_CRYPTO:-sw}"
 TLS_SERVER="${TLS_SERVER:-socat}"   # socat or nginx
@@ -259,13 +259,24 @@ EOCFG
     fi
 
     # Build DPDK args: NIC + optional QAT
-    local dpdk_args="-l $DPDK_LCORES -n 4 --socket-mem $socket_mem -a $NIC_PCI_VAIGAI"
+    local dpdk_args="-l $DPDK_LCORES -n 4 --socket-mem $socket_mem --file-prefix vaigai_tls -a $NIC_PCI_VAIGAI"
     if [[ "$crypto_mode" == "qat" ]] && [[ -n "$QAT_PCI_VAIGAI" ]]; then
         dpdk_args+=" -a $QAT_PCI_VAIGAI"
         info "vaigai crypto: QAT ($QAT_PCI_VAIGAI)"
     else
         info "vaigai crypto: software (OpenSSL)"
     fi
+
+    # Kill any stale vaigai processes that might hold VFIO groups
+    local stale_vaigai
+    stale_vaigai=$(pgrep -f "build/vaigai" 2>/dev/null || true)
+    if [[ -n "$stale_vaigai" ]]; then
+        warn "Killing stale vaigai PIDs: $stale_vaigai"
+        kill -9 $stale_vaigai 2>/dev/null || true
+        sleep 1
+    fi
+    # Clean stale DPDK runtime sockets
+    rm -rf /var/run/dpdk/vaigai_tls* 2>/dev/null || true
 
     VAIGAI_CONFIG="$VAIGAI_CFG" "$VAIGAI_BIN" \
         $dpdk_args -- \
@@ -427,7 +438,7 @@ vfio_bind() {
     modprobe vfio-pci disable_denylist=1 2>/dev/null || true
 
     local orig_drv
-    orig_drv=$(basename "$(readlink /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null)" 2>/dev/null || echo "")
+    orig_drv=$(basename "$(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null)" 2>/dev/null || echo "")
     eval "$orig_var=\"$orig_drv\""
 
     if [[ "$orig_drv" == "vfio-pci" ]]; then
@@ -453,7 +464,7 @@ vfio_bind() {
     sleep 0.5
 
     local cur_drv
-    cur_drv=$(basename "$(readlink /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null)" 2>/dev/null || echo "")
+    cur_drv=$(basename "$(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null)" 2>/dev/null || echo "")
     if [[ "$cur_drv" == "vfio-pci" ]]; then
         info "Bound $pci_addr to vfio-pci (was: $orig_drv)"
     else
@@ -519,12 +530,51 @@ IFACES
     # Create TLS server start script
     local tls_server="$TLS_SERVER"
 
-    # Pre-install certs for nginx (nginx system service starts before our scripts)
-    if [[ "$tls_server" == "nginx" ]]; then
-        mkdir -p "$mntdir/etc/nginx/ssl"
-        cp "$TLS_CERT" "$mntdir/etc/nginx/ssl/server.crt"
-        cp "$TLS_KEY"  "$mntdir/etc/nginx/ssl/server.key"
-    fi
+    # Pre-install certs for nginx
+    mkdir -p "$mntdir/etc/nginx/ssl"
+    cp "$TLS_CERT" "$mntdir/etc/nginx/ssl/server.crt"
+    cp "$TLS_KEY"  "$mntdir/etc/nginx/ssl/server.key"
+
+    # Write nginx TLS server block with current cipher and port
+    mkdir -p "$mntdir/etc/nginx/http.d"
+    cat > "$mntdir/etc/nginx/http.d/vaigai-tls.conf" <<NGINX
+server {
+    listen $TLS_PORT ssl reuseport;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/ssl/server.crt;
+    ssl_certificate_key /etc/nginx/ssl/server.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         $TLS_CIPHER;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache   shared:TLS:10m;
+    ssl_session_timeout 10s;
+
+    location / {
+        return 200 "OK\n";
+    }
+}
+
+server {
+    listen 5001 ssl reuseport;
+    server_name _;
+
+    ssl_certificate     /etc/nginx/ssl/server.crt;
+    ssl_certificate_key /etc/nginx/ssl/server.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         $TLS_CIPHER;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache   shared:BULK:10m;
+    ssl_session_timeout 10s;
+
+    location / {
+        return 200 "OK\n";
+    }
+}
+NGINX
+
+    # Remove conflicting nginx configs from other test scripts
+    rm -f "$mntdir/etc/nginx/http.d/vaigai-ssl.conf"
 
     cat > "$mntdir/etc/vaigai/start-tls.sh" <<TLSSCRIPT
 #!/bin/sh
@@ -551,16 +601,40 @@ sysctl -w net.core.netdev_max_backlog=10000 2>/dev/null || true
 
 if [ "$tls_server" = "nginx" ]; then
     # ── nginx TLS server ──
-    # Certs are pre-installed in rootfs at /etc/nginx/ssl/
-    # Refresh from /etc/vaigai/ in case they differ
-    cp /etc/vaigai/cert.pem /etc/nginx/ssl/server.crt
-    cp /etc/vaigai/key.pem  /etc/nginx/ssl/server.key
+    # Refresh certs for nginx
+    cp /etc/vaigai/cert.pem /etc/nginx/ssl/server.crt 2>/dev/null || true
+    cp /etc/vaigai/key.pem  /etc/nginx/ssl/server.key 2>/dev/null || true
+    chmod 644 /etc/nginx/ssl/server.crt 2>/dev/null || true
+    chmod 600 /etc/nginx/ssl/server.key 2>/dev/null || true
+
     # Add ssl_engine directive for QAT if engine is available
     if [ "$server_crypto" = "qat" ] && [ -f /usr/lib/engines-3/qatengine.so ]; then
-        sed -i '/^events/i ssl_engine qatengine;' /etc/nginx/nginx.conf
+        grep -q "ssl_engine" /etc/nginx/nginx.conf 2>/dev/null || \
+            sed -i '/^events/i ssl_engine qatengine;' /etc/nginx/nginx.conf
     fi
-    # Reload nginx to pick up any config changes (nginx service already running)
-    nginx -s reload 2>/dev/null || nginx
+
+    # Create required nginx temp dirs
+    mkdir -p /var/lib/nginx/tmp/client_body /var/lib/nginx/tmp/proxy \
+             /var/lib/nginx/tmp/fastcgi /var/lib/nginx/tmp/uwsgi \
+             /var/lib/nginx/tmp/scgi /run/nginx /var/log/nginx 2>/dev/null || true
+
+    # Stop nginx to reload with fresh config
+    nginx -s stop 2>/dev/null || true
+    sleep 0.5
+
+    # Test nginx config
+    echo "Testing nginx config..."
+    nginx -t 2>&1
+
+    # Start nginx with fresh config
+    nginx 2>&1
+    echo "nginx exit code: \$?"
+
+    # Verify listening ports
+    sleep 0.5
+    echo "=== Listening ports ==="
+    ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || true
+
     echo "nginx TLS server ready on ports $TLS_PORT and 5001"
 else
     # ── socat TLS server (default) ──
@@ -587,6 +661,9 @@ TLSSCRIPT
     if [[ -f "$mntdir/etc/init.d/local" ]] && [[ -d "$mntdir/etc/runlevels/default" ]]; then
         ln -sf /etc/init.d/local "$mntdir/etc/runlevels/default/local"
     fi
+
+    # Run depmod so kernel modules can be found by modprobe in VM
+    chroot "$mntdir" depmod -a "$(uname -r)" 2>/dev/null || true
 
     umount "$mntdir"
     rmdir "$mntdir"
@@ -702,7 +779,8 @@ command -v openssl &>/dev/null            || die "openssl not found"
 [[ -f "$ROOTFS" ]]        || die "rootfs not found: $ROOTFS"
 [[ -d "/sys/bus/pci/devices/$NIC_PCI_VAIGAI" ]] || die "PCI device $NIC_PCI_VAIGAI not found"
 [[ -d "/sys/bus/pci/devices/$NIC_PCI_VM" ]]     || die "PCI device $NIC_PCI_VM not found"
-modprobe vfio-pci 2>/dev/null || die "Cannot load vfio-pci module"
+if ! modprobe -r vfio-pci 2>/dev/null; then true; fi
+modprobe vfio-pci disable_denylist=1 2>/dev/null || die "Cannot load vfio-pci module"
 
 # QAT pre-flight
 if [[ "$VAIGAI_CRYPTO" == "qat" ]]; then
