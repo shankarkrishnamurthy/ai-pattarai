@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <unistd.h>
 
 #include <rte_eal.h>
 #include <rte_lcore.h>
@@ -80,10 +81,37 @@ int tgen_eal_init(int argc, char **argv, tgen_eal_args_t *out_args)
     tgen_eal_args_t args;
     memset(&args, 0, sizeof(args));
 
+    /* Auto-generate a unique --file-prefix so multiple vaigai instances
+     * can coexist.  Users may still override via the command line.      */
+    static char prefix_buf[64];
+    char *eal_argv[128];
+    int   eal_argc = argc;
+    bool  has_prefix = false;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--file-prefix") == 0) {
+            has_prefix = true;
+            break;
+        }
+    }
+
+    if (!has_prefix && argc + 2 < 128) {
+        snprintf(prefix_buf, sizeof(prefix_buf), "vaigai_%d", (int)getpid());
+        eal_argv[0] = argv[0];
+        eal_argv[1] = (char *)"--file-prefix";
+        eal_argv[2] = prefix_buf;
+        for (int i = 1; i < argc; i++)
+            eal_argv[i + 2] = argv[i];
+        eal_argc = argc + 2;
+    } else {
+        for (int i = 0; i < argc; i++)
+            eal_argv[i] = argv[i];
+    }
+
     /* Standard DPDK convention: EAL consumes everything up to '--',
      * then returns the count of args it consumed.  Application-specific
      * options (-W, -M, -r, -t …) must come AFTER the '--' separator.  */
-    int eal_consumed = rte_eal_init(argc, argv);
+    int eal_consumed = rte_eal_init(eal_argc, eal_argv);
     if (eal_consumed < 0) {
         fprintf(stderr, "[TGEN] rte_eal_init failed: %s\n",
                 rte_strerror(rte_errno));

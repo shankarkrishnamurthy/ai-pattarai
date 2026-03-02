@@ -71,7 +71,7 @@ else
     MODE_LABEL="AF_PACKET"
 fi
 
-# In flood mode the CLI 'flood' command handles timing internally;
+# In flood mode the CLI 'tps' command handles timing internally;
 # no external 'timeout' wrapper needed.
 if [[ $FLOOD_MODE -eq 1 ]]; then
     PING_INTERVAL_MS=0
@@ -162,6 +162,7 @@ info "Container $PEER_IF configured: $PEER_CIDR"
 # ── write ephemeral config ────────────────────────────────────────────────────
 cat > "$CFG" <<EOF
 {
+  "protocol": "icmp",
   "flows": [{
     "src_ip_lo": "$SRC_IP",
     "src_ip_hi": "$SRC_IP",
@@ -179,7 +180,7 @@ EOF
 info "Using DPDK vdev: $VDEV_ARG"
 if [[ $FLOOD_MODE -eq 1 ]]; then
     info "Flood ICMP -> $PEER_IP for ${FLOOD_SECONDS}s (workers generate at line rate)"
-    OUTPUT=$(printf 'flood icmp %s %d 0 %d\nquit\n' \
+    OUTPUT=$(printf 'tps %s %d 0 %d\nquit\n' \
                  "$PEER_IP" "$FLOOD_SECONDS" "$PING_SIZE" \
              | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \

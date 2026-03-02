@@ -131,7 +131,7 @@ src/
 
 | Command | Example | What it does |
 |---------|---------|-------------|
-| `flood` | `flood tcp 10.0.0.1 5 0 56 80` | Flood with ICMP/UDP/TCP SYN packets |
+| `tps` | `tps 10.0.0.1 5 0 56 80` | Send ICMP/UDP/TCP SYN packets (protocol from config `"protocol"` field) |
 | `throughput` | `throughput tx 10.0.0.1 5000 10 4` | TCP data throughput (iperf3-like) |
 | `stats` | `stats` | Print telemetry JSON snapshot |
 | `quit` | `quit` | Graceful shutdown |
@@ -261,12 +261,13 @@ sudo cp release-v1.14.2-x86_64/firecracker-v1.14.2-x86_64 /usr/local/bin/firecra
 # Build guest kernel (Linux 6.1.x, minimal config with virtio-net + ext4)
 # See /work/firecracker/linux-src/ for config reference
 
-# Build Alpine rootfs (128 MB ext4 with socat, iproute2, iperf3)
-# The rootfs must have an OpenRC init that starts socat listeners on :5000-5002
-# Place at /work/firecracker/alpine.ext4
+# Full environment setup (DPDK, guest kernel, rootfs, QAT, vaigai build):
+sudo bash scripts/test-env.sh
 
-# Verify KVM is available
-ls /dev/kvm
+# Or build individual components:
+sudo bash scripts/test-env.sh --step dpdk
+sudo bash scripts/test-env.sh --step rootfs
+sudo bash scripts/test-env.sh --step verify
 ```
 
 ## Coding Conventions

@@ -6,6 +6,7 @@
 #include "tcp_port_pool.h"
 #include "../core/core_assign.h"
 #include "../telemetry/metrics.h"
+#include "../tls/tls_session.h"
 
 #include <rte_cycles.h>
 #include <rte_log.h>
@@ -29,6 +30,11 @@ void tcp_timer_tick(uint32_t worker_idx)
         /* ── TIME_WAIT expiry ─────────────────────────────────────────────── */
         case TCP_TIME_WAIT:
             if (now >= tcb->timewait_deadline_tsc) {
+                /* Detach TLS session if present */
+                if (tcb->app_state >= 2) {
+                    tls_session_detach(worker_idx, i);
+                    tcb->app_state = 0;
+                }
                 /* Return ephemeral port */
                 tcp_port_free(worker_idx, tcb->src_ip, tcb->src_port);
                 tcb_free(store, tcb);
@@ -45,6 +51,19 @@ void tcp_timer_tick(uint32_t worker_idx)
             if (tcb->rto_deadline_tsc &&
                 now >= tcb->rto_deadline_tsc) {
                 tcp_fsm_rto_expired(worker_idx, tcb);
+            }
+            /* TLS handshake timeout: close connections stuck in TLS handshake.
+             * app_state 1 = TLS requested, 2 = handshaking.
+             * timewait_deadline_tsc = connection creation TSC. */
+            if (tcb->state == TCP_ESTABLISHED &&
+                (tcb->app_state == 1 || tcb->app_state == 2)) {
+                uint64_t age_s = (now - tcb->timewait_deadline_tsc) /
+                                 rte_get_tsc_hz();
+                if (age_s >= TCP_TLS_HS_TIMEOUT_S) {
+                    tls_session_detach(worker_idx, i);
+                    tcb->app_state = 0;
+                    tcp_fsm_reset(worker_idx, tcb);
+                }
             }
             break;
 

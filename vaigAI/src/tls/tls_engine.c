@@ -164,6 +164,7 @@ tls_handshake(tls_session_t *sess,
               const uint8_t *ciphertext_in,  size_t ct_in_len,
               uint8_t       *ciphertext_out, size_t *ct_out_len)
 {
+    size_t ct_buf_cap = *ct_out_len;   /* save caller's buffer capacity */
     *ct_out_len = 0;
 
     /* Feed incoming bytes into read BIO */
@@ -175,8 +176,9 @@ tls_handshake(tls_session_t *sess,
 
     /* Drain outgoing ciphertext regardless of outcome */
     int pending = BIO_pending(sess->wbio);
-    if (pending > 0 && ciphertext_out) {
-        int got = BIO_read(sess->wbio, ciphertext_out, (int)*ct_out_len);
+    if (pending > 0 && ciphertext_out && ct_buf_cap > 0) {
+        int to_read = (pending < (int)ct_buf_cap) ? pending : (int)ct_buf_cap;
+        int got = BIO_read(sess->wbio, ciphertext_out, to_read);
         *ct_out_len = got > 0 ? (size_t)got : 0;
     }
 

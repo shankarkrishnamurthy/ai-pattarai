@@ -158,6 +158,7 @@ info "Container $PEER_IF configured: $PEER_CIDR"
 # ── write ephemeral config ────────────────────────────────────────────────────
 cat > "$CFG" <<EOF
 {
+  "protocol": "udp",
   "flows": [{
     "src_ip_lo": "$SRC_IP",
     "src_ip_hi": "$SRC_IP",
@@ -192,14 +193,14 @@ info "Using DPDK vdev: $VDEV_ARG"
 
 if [[ $FLOOD_MODE -eq 1 ]]; then
     info "Flood UDP -> $PEER_IP:$DST_PORT for ${FLOOD_SECONDS}s (line rate)"
-    OUTPUT=$(printf 'flood udp %s %d 0 %d %d\nquit\n' \
+    OUTPUT=$(printf 'tps %s %d 0 %d %d\nquit\n' \
                  "$PEER_IP" "$FLOOD_SECONDS" "$PKT_SIZE" "$DST_PORT" \
              | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
                    --vdev "$VDEV_ARG" -- 2>&1) || true
 else
     info "Rate-limited UDP -> $PEER_IP:$DST_PORT (1000 pps × 1s)"
-    OUTPUT=$(printf 'flood udp %s 1 1000 %d %d\nquit\n' \
+    OUTPUT=$(printf 'tps %s 1 1000 %d %d\nquit\n' \
                  "$PEER_IP" "$PKT_SIZE" "$DST_PORT" \
              | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \

@@ -17,6 +17,7 @@ extern "C" {
 #define TCP_MAX_RETRANSMITS    15
 #define TCP_INITIAL_RTO_US     1000000 /* 1 s */
 #define TCP_MAX_RTO_US         60000000 /* 60 s */
+#define TCP_TLS_HS_TIMEOUT_S   5       /* TLS handshake timeout (seconds) */
 
 /** Worker: receive and dispatch an incoming TCP segment.
  *  m's data pointer should be at start of TCP header. */

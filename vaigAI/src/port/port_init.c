@@ -44,7 +44,7 @@ static void probe_caps(uint16_t port_id, port_caps_t *caps)
     uint64_t tx_ol = info.tx_offload_capa;
     uint64_t rx_ol = info.rx_offload_capa;
 
-    caps->has_ipv4_cksum_offload = !!(tx_ol & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM);
+    caps->has_ipv4_cksum_offload = !!(rx_ol & RTE_ETH_RX_OFFLOAD_IPV4_CKSUM);
     caps->has_tcp_cksum_offload  = !!(tx_ol & RTE_ETH_TX_OFFLOAD_TCP_CKSUM);
     caps->has_udp_cksum_offload  = !!(tx_ol & RTE_ETH_TX_OFFLOAD_UDP_CKSUM);
     caps->has_sctp_cksum_offload = !!(tx_ol & RTE_ETH_TX_OFFLOAD_SCTP_CKSUM);

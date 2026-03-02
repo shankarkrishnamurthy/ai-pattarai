@@ -8,7 +8,6 @@
 #include "tx_gen.h"
 
 #include <string.h>
-
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 #include <rte_cycles.h>
@@ -23,6 +22,7 @@
 #include "../net/icmp.h"
 #include "../net/tcp_fsm.h"
 #include "../net/tcp_timer.h"
+#include "../net/tcp_port_pool.h"
 #include "../telemetry/metrics.h"
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
@@ -121,8 +121,18 @@ int tgen_worker_ctx_init(void)
             if (found) {
                 uint32_t idx = ctx->num_ports++;
                 ctx->ports[idx]     = (uint16_t)p;
-                ctx->rx_queues[idx] = (uint16_t)w; /* queue index = worker index */
-                ctx->tx_queues[idx] = (uint16_t)w;
+                /* Clamp queue indices to actual configured queues.
+                 * Without RSS the port may have only 1 RX queue;
+                 * workers > 0 must share queue 0 (caller must
+                 * ensure no two workers poll the same queue
+                 * concurrently, or restrict generation to 1 worker
+                 * for non-RSS ports). */
+                uint32_t max_rxq = g_port_caps[p].max_rx_queues;
+                uint32_t max_txq = g_port_caps[p].max_tx_queues;
+                if (max_rxq == 0) max_rxq = 1;
+                if (max_txq == 0) max_txq = 1;
+                ctx->rx_queues[idx] = (uint16_t)(w % max_rxq);
+                ctx->tx_queues[idx] = (uint16_t)(w % max_txq);
                 if (ctx->num_ports >= TGEN_MAX_PORTS) break;
             }
         }
@@ -154,6 +164,9 @@ int tgen_worker_loop(void *arg)
             }
             if (cmd.cmd == CFG_CMD_START) {
                 tx_gen_config_t *gcfg = (tx_gen_config_t *)cmd.payload;
+                /* Clear pre-built HTTP request for this worker */
+                if (gcfg->proto == TX_GEN_PROTO_HTTP)
+                    g_http_req[ctx->worker_idx].hdr_len = 0;
                 /* Resolve TX queue for the target port */
                 uint16_t tx_q = 0;
                 for (uint32_t pp = 0; pp < ctx->num_ports; pp++) {
@@ -205,13 +218,16 @@ int tgen_worker_loop(void *arg)
             n_tx = 0;
         }
 
-        /* ── 3. TX generation (flood / sustained traffic) ─────────────── */
+        /* ── 3. TX generation (tps / sustained traffic) ─────────────── */
         if (ctx->tx_gen.active) {
             tx_gen_burst(&ctx->tx_gen, ctx->mempool, ctx->worker_idx);
         }
 
         /* ── 4. Timer wheel tick ─────────────────────────────────────────── */
         tcp_timer_tick(ctx->worker_idx);
+
+        /* ── 5. Port pool tick — drain TIME_WAIT ring ────────────────── */
+        tcp_port_pool_tick(ctx->worker_idx, rte_rdtsc());
     }
 
 done:

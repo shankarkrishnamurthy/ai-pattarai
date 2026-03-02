@@ -25,9 +25,14 @@
 #include "../telemetry/metrics.h"
 #include "../net/tcp_fsm.h"
 #include "../net/tcp_port_pool.h"
+#include "../net/tcp_tcb.h"
+#include "../app/http11.h"
 
 #define TX_GEN_MAX_BURST   32
 #define ICMP_HDR_LEN        8
+
+/* ── Pre-built HTTP request (one per worker, reused across connections) ──── */
+http_prebuilt_req_t g_http_req[TGEN_MAX_WORKERS];
 
 /* ══════════════════════════════════════════════════════════════════════════
  *  Protocol-specific builders
@@ -234,8 +239,27 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
             return 0;
     }
 
-    /* ── TCP SYN flood: use tcp_fsm_connect() instead of raw packets ── */
-    if (state->cfg.proto == TX_GEN_PROTO_TCP_SYN) {
+    /* ── TCP SYN TPS: use tcp_fsm_connect() instead of raw packets ── */
+    if (state->cfg.proto == TX_GEN_PROTO_TCP_SYN ||
+        state->cfg.proto == TX_GEN_PROTO_HTTP) {
+        /* Pre-build HTTP request headers on first burst */
+        if (state->cfg.proto == TX_GEN_PROTO_HTTP &&
+            g_http_req[worker_idx].hdr_len == 0) {
+            http_conn_t tmp;
+            http11_conn_init(&tmp);
+            http_request_t req = {
+                .method     = (http_method_t)state->cfg.http_method,
+                .url        = state->cfg.http_url[0] ? state->cfg.http_url : "/",
+                .host       = state->cfg.http_host[0] ? state->cfg.http_host : "localhost",
+                .keep_alive = false,
+            };
+            int n = http11_tx_request(&tmp, &req);
+            if (n > 0) {
+                memcpy(g_http_req[worker_idx].hdr, tmp.tx_hdr, (size_t)n);
+                g_http_req[worker_idx].hdr_len = (uint32_t)n;
+            }
+        }
+
         uint32_t initiated = 0;
         for (uint32_t i = 0; i < to_send; i++) {
             uint16_t src_port;
@@ -249,6 +273,22 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
             if (!tcb) {
                 tcp_port_free(worker_idx, state->cfg.src_ip, src_port);
                 break;   /* TCB store full */
+            }
+            /* Mark connection for HTTP request after ESTABLISHED */
+            if (state->cfg.proto == TX_GEN_PROTO_HTTP) {
+                tcb->app_ctx = &g_http_req[worker_idx];
+                if (state->cfg.enable_tls) {
+                    /* HTTPS: TLS handshake first, then HTTP after TLS done.
+                     * app_state 1 → TLS handshake → app_state 3 (TLS ok) →
+                     * then the ESTABLISHED data handler sends HTTP. */
+                    tcb->app_state = 1; /* 1 = TLS requested */
+                } else {
+                    /* Plain HTTP: send request immediately after TCP ESTABLISHED */
+                    tcb->app_state = 4; /* 4 = HTTP send request */
+                }
+            } else if (state->cfg.enable_tls) {
+                /* Raw TLS (no HTTP): just do TLS handshake */
+                tcb->app_state = 1; /* 1 = TLS requested */
             }
             initiated++;
         }

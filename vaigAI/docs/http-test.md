@@ -88,7 +88,7 @@ with nginx — for HTTP/1.0 connection-per-request patterns, **CPS ≈ RPS**.
 #### T1a — Unlimited Flood
 
 ```
-vaigai>  flood tcp 10.0.0.2 10 0 56 80
+vaigai>  tps 10.0.0.2 10 0 56 80
 ```
 
 | Metric | Pass |
@@ -99,7 +99,7 @@ vaigai>  flood tcp 10.0.0.2 10 0 56 80
 #### T1b — Rate-Limited
 
 ```
-vaigai>  flood tcp 10.0.0.2 10 5000 56 80
+vaigai>  tps 10.0.0.2 10 5000 56 80
 ```
 
 | Metric | Pass |
@@ -201,9 +201,9 @@ vaigai>  throughput tx 10.0.0.2 5001 10 4
 │  RUN                                                                 │
 │                                                                      │
 │  Connectivity ─► ping 10.0.0.2 (retry ×5)                           │
-│  T1a ──────────► flood tcp 10.0.0.2 10 0 56 80     (unlimited)      │
+│  T1a ──────────► tps 10.0.0.2 10 0 56 80           (unlimited)      │
 │  reset                                                               │
-│  T1b ──────────► flood tcp 10.0.0.2 10 5000 56 80  (rate-limited)   │
+│  T1b ──────────► tps 10.0.0.2 10 5000 56 80        (rate-limited)   │
 │  reset                                                               │
 │  T2 ───────────► throughput tx 10.0.0.2 5001 10 4                    │
 │                                                                      │

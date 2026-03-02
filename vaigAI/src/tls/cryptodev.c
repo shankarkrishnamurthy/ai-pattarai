@@ -32,10 +32,15 @@ cryptodev_init(void)
     TGEN_INFO(TGEN_LOG_TLS, "Crypto device 0: driver=%s max_qp=%u\n",
               dev_info.driver_name, dev_info.max_nb_queue_pairs);
 
+    /* Cap queue pairs to what the device supports */
+    uint16_t nb_qps = (uint16_t)TGEN_MAX_WORKERS;
+    if (nb_qps > dev_info.max_nb_queue_pairs)
+        nb_qps = dev_info.max_nb_queue_pairs;
+
     /* Create op mempool */
     g_cop_pool = rte_crypto_op_pool_create("tgen_cop_pool",
             RTE_CRYPTO_OP_TYPE_SYMMETRIC,
-            CRYPTODEV_QP_DEPTH * TGEN_MAX_WORKERS * 2,
+            CRYPTODEV_QP_DEPTH * nb_qps * 2,
             64, /* cache size */
             sizeof(struct rte_crypto_sym_xform) * 2,
             SOCKET_ID_ANY);
@@ -44,9 +49,9 @@ cryptodev_init(void)
         return -ENOMEM;
     }
 
-    /* Configure device: one QP per worker */
+    /* Configure device: one QP per worker (capped to device max) */
     struct rte_cryptodev_config cfg = {
-        .nb_queue_pairs = (uint16_t)TGEN_MAX_WORKERS,
+        .nb_queue_pairs = nb_qps,
         .socket_id      = SOCKET_ID_ANY,
     };
     if (rte_cryptodev_configure(g_cdev_id, &cfg) < 0) {
@@ -58,8 +63,8 @@ cryptodev_init(void)
         .nb_descriptors = CRYPTODEV_QP_DEPTH,
         .mp_session     = NULL,
     };
-    for (uint32_t w = 0; w < TGEN_MAX_WORKERS; w++) {
-        if (rte_cryptodev_queue_pair_setup(g_cdev_id, (uint16_t)w,
+    for (uint16_t w = 0; w < nb_qps; w++) {
+        if (rte_cryptodev_queue_pair_setup(g_cdev_id, w,
                                            &qp_cfg, SOCKET_ID_ANY) < 0) {
             TGEN_ERR(TGEN_LOG_TLS, "QP setup failed for worker %u\n", w);
             return -EIO;
@@ -71,8 +76,7 @@ cryptodev_init(void)
         return -EIO;
     }
 
-    TGEN_INFO(TGEN_LOG_TLS, "Crypto device 0 started (%u QPs)\n",
-              TGEN_MAX_WORKERS);
+    TGEN_INFO(TGEN_LOG_TLS, "Crypto device 0 started (%u QPs)\n", nb_qps);
     return (int)g_n_cdevs;
 }
 

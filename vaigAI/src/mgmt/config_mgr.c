@@ -16,6 +16,7 @@
 
 /* Global configuration */
 tgen_config_t g_config = {
+    .protocol       = "tcp",
     .n_flows        = 0,
     .tls_enabled    = false,
     .rest_port      = 8080,
@@ -179,6 +180,30 @@ config_load_json(const char *path)
                     CERT_PATH_MAX-1);
     }
 
+    /* Protocol field — single source of truth.
+     * Derives tls_enabled and flow defaults from the protocol name.
+     * If not specified, infer from tls{} and flow http_url presence. */
+    json_t *proto = json_object_get(root, "protocol");
+    if (proto && json_is_string(proto)) {
+        strncpy(g_config.protocol, json_string_value(proto),
+                sizeof(g_config.protocol) - 1);
+        if (strcmp(g_config.protocol, "tls") == 0 ||
+            strcmp(g_config.protocol, "https") == 0)
+            g_config.tls_enabled = true;
+    } else {
+        /* Infer protocol from other config fields for backward compat */
+        bool has_http = (g_config.n_flows > 0 &&
+                         g_config.flows[0].http_url[0] != '\0');
+        if (has_http && g_config.tls_enabled)
+            strncpy(g_config.protocol, "https", sizeof(g_config.protocol) - 1);
+        else if (has_http)
+            strncpy(g_config.protocol, "http", sizeof(g_config.protocol) - 1);
+        else if (g_config.tls_enabled)
+            strncpy(g_config.protocol, "tls", sizeof(g_config.protocol) - 1);
+        else
+            strncpy(g_config.protocol, "tcp", sizeof(g_config.protocol) - 1);
+    }
+
     json_decref(root);
     TGEN_INFO(TGEN_LOG_MGMT, "Config loaded from %s (%u flows)\n",
               path, g_config.n_flows);
@@ -189,6 +214,9 @@ int
 config_save_json(const char *path)
 {
     json_t *root  = json_object();
+
+    json_object_set_new(root, "protocol", json_string(g_config.protocol));
+
     json_t *flows = json_array();
 
     for (uint32_t i = 0; i < g_config.n_flows; i++) {

@@ -98,6 +98,13 @@ int ipv4_validate_and_strip(struct rte_mbuf *m,
     /* Destination match */
     if (local_ip_net && ip->dst_addr != local_ip_net) {
         worker_metrics_add_ip_not_for_us(rte_lcore_id());
+        /* Debug: print first 3 mismatches */
+        static int dbg_cnt = 0;
+        if (dbg_cnt < 3) {
+            printf("[DBG] ip_not_for_us: dst=0x%08x local=0x%08x proto=%u\n",
+                   ip->dst_addr, local_ip_net, ip->next_proto_id);
+            dbg_cnt++;
+        }
         goto bad;
     }
 

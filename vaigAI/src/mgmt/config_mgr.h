@@ -54,6 +54,9 @@ typedef struct {
 /* Global configuration                                                 */
 /* ------------------------------------------------------------------ */
 typedef struct {
+    /* Protocol: "tcp", "http", "tls", "https", "udp", "icmp" */
+    char        protocol[16];
+
     /* Network */
     flow_cfg_t  flows[TGEN_MAX_PORTS];
     uint32_t    n_flows;

@@ -18,6 +18,7 @@
 #include "../telemetry/histogram.h"
 #include "../tls/tls_session.h"
 #include "../tls/tls_engine.h"
+#include "../core/tx_gen.h"
 #include "../telemetry/log.h"
 
 #include <string.h>
@@ -280,6 +281,17 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                             uint64_t lat_us = (rte_rdtsc() - tcb->tls_hs_start_tsc)
                                               * 1000000ULL / rte_get_tsc_hz();
                             hist_record(&g_latency_hist[worker_idx], lat_us);
+                            /* If HTTPS: send HTTP request now that TLS is up */
+                            if (tcb->app_ctx) {
+                                http_prebuilt_req_t *hp_req =
+                                    (http_prebuilt_req_t *)tcb->app_ctx;
+                                if (hp_req->hdr_len > 0) {
+                                    tcp_fsm_send(worker_idx, tcb,
+                                                 hp_req->hdr, hp_req->hdr_len);
+                                    worker_metrics_add_http_req(worker_idx);
+                                    tcb->app_state = 5;
+                                }
+                            }
                         } else if (hr < 0) {
                             tcb->app_state = 0;
                             worker_metrics_add_tls_fail(worker_idx);
@@ -289,6 +301,18 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                     tcb->app_state = 0;
                     worker_metrics_add_tls_fail(worker_idx);
                     TGEN_ERR(TGEN_LOG_TLS, "tls_session_attach failed: %d\n", trc);
+                }
+            }
+
+            /* ── HTTP request initiation ──────────────────────────── */
+            if (tcb->app_state == 4) {
+                http_prebuilt_req_t *hp =
+                    (http_prebuilt_req_t *)tcb->app_ctx;
+                if (hp && hp->hdr_len > 0) {
+                    tcp_fsm_send(worker_idx, tcb,
+                                 hp->hdr, hp->hdr_len);
+                    worker_metrics_add_http_req(worker_idx);
+                    tcb->app_state = 5; /* HTTP response pending */
                 }
             }
         }
@@ -374,11 +398,22 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                 uint64_t lat_us = (rte_rdtsc() - tcb->tls_hs_start_tsc)
                                                   * 1000000ULL / rte_get_tsc_hz();
                                 hist_record(&g_latency_hist[worker_idx], lat_us);
-                                /* For flood/CPS mode: close after TLS done
-                                 * so server can accept next connection.
-                                 * Throughput mode will override app_ctx. */
-                                if (!tcb->app_ctx)
+                                /* If HTTPS: send HTTP request now that TLS is up */
+                                if (tcb->app_ctx) {
+                                    http_prebuilt_req_t *hp_req =
+                                        (http_prebuilt_req_t *)tcb->app_ctx;
+                                    if (hp_req->hdr_len > 0) {
+                                        tcp_fsm_send(worker_idx, tcb,
+                                                     hp_req->hdr, hp_req->hdr_len);
+                                        worker_metrics_add_http_req(worker_idx);
+                                        tcb->app_state = 5; /* HTTP response pending */
+                                    }
+                                } else {
+                                    /* For tps/CPS mode: close after TLS done
+                                     * so server can accept next connection.
+                                     * Throughput mode will override app_ctx. */
                                     tcp_fsm_close(worker_idx, tcb);
+                                }
                             } else if (hr < 0) {
                                 tcb->app_state = 0;
                                 worker_metrics_add_tls_fail(worker_idx);
@@ -391,6 +426,30 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                             if (n > 0)
                                 worker_metrics_add_tls_rx(worker_idx);
                         }
+                    }
+                }
+
+                /* ── L7: HTTP response parsing ────────────────────── */
+                if (tcb->app_state == 5) {
+                    const uint8_t *hp =
+                        (const uint8_t *)tcp + hdr_len;
+                    if (data_len >= 12 &&
+                        memcmp(hp, "HTTP/1.", 7) == 0) {
+                        uint16_t status =
+                            (uint16_t)atoi((const char *)hp + 9);
+                        worker_metrics_add_http_rsp(worker_idx,
+                                                    status);
+                    } else {
+                        worker_metrics_add_http_parse_err(
+                            worker_idx);
+                    }
+                    http_prebuilt_req_t *hpb =
+                        (http_prebuilt_req_t *)tcb->app_ctx;
+                    if (hpb && hpb->keep_alive) {
+                        tcb->app_state = 4; /* re-send next request */
+                    } else {
+                        tcb->app_state = 0;
+                        tcp_fsm_close(worker_idx, tcb);
                     }
                 }
             }
@@ -466,6 +525,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
     case TCP_LAST_ACK:
         if (flags & RTE_TCP_ACK_FLAG) {
             tls_detach_if_needed(worker_idx, tcb);
+            tcp_port_free(worker_idx, tcb->src_ip, tcb->src_port);
             tcb_free(&g_tcb_stores[worker_idx], tcb);
             worker_metrics_add_tcp_conn_close(worker_idx);
         }
@@ -483,6 +543,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
     if ((flags & RTE_TCP_RST_FLAG) && tcb->in_use &&
         tcb->state != TCP_TIME_WAIT) {
         tls_detach_if_needed(worker_idx, tcb);
+        tcp_port_free(worker_idx, tcb->src_ip, tcb->src_port);
         tcb_free(&g_tcb_stores[worker_idx], tcb);
         worker_metrics_add_tcp_reset_rx(worker_idx);
     }
@@ -559,6 +620,7 @@ void tcp_fsm_reset(uint32_t worker_idx, tcb_t *tcb)
     tcp_send_segment(worker_idx, tcb, RTE_TCP_RST_FLAG | RTE_TCP_ACK_FLAG,
                       NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
     tls_detach_if_needed(worker_idx, tcb);
+    tcp_port_free(worker_idx, tcb->src_ip, tcb->src_port);
     tcb_free(&g_tcb_stores[worker_idx], tcb);
     worker_metrics_add_tcp_reset_sent(worker_idx);
 }

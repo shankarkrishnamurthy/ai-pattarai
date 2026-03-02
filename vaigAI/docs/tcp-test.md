@@ -59,7 +59,7 @@ Init script starts three listeners:
 
 Benchmark connections per second.
 
-**CLI:** `flood tcp 192.168.204.2 10 0 56 5000`
+**CLI:** `tps 192.168.204.2 10 0 56 5000`
 
 **Exercises:** `tcp_fsm_connect` · SYN option encoding · SYN_SENT→ESTABLISHED ·
 `tcb_alloc` hash insert · `tcp_port_alloc` churn · ARP resolution

@@ -11,6 +11,7 @@
 2. [Life of a Packet](#2-life-of-a-packet)
 3. [Telemetry System](#3-telemetry-system)
 4. [Control Plane / Data Plane Segregation](#4-control-plane--data-plane-segregation)
+5. [Test Infrastructure](#5-test-infrastructure)
 
 ---
 
@@ -126,6 +127,7 @@ main()
   │     udp_init() / pktrace_init()
   ├─6── tgen_ipc_init()              Create SPSC rings (cmd + ACK)
   ├─7── config_load_json()           Load JSON config from $VAIGAI_CONFIG
+  │                                  Top-level `"protocol"` field selects TCP/UDP/ICMP/TLS/HTTP/HTTPS
   │     config_push_to_workers()     Push flow profiles to ARP subsystem
   ├─8── cert_mgr_init()              TLS client/server SSL contexts
   │     tls_session_store_init()
@@ -267,10 +269,10 @@ The TX generator produces synthetic traffic from worker cores, controlled by the
 management plane via IPC.
 
 ```
-  CLI: "flood udp 10.0.0.1 3 1000 64 9"
+  CLI: "tps 10.0.0.1 3 1000 64 9"
        │
        ▼
-  cmd_flood()                                         ── mgmt core ──
+  cmd_tps()                                           ── mgmt core ──
   ├── ARP-resolve destination MAC (3 s timeout)
   ├── Build tx_gen_config_t
   ├── metrics_reset()
@@ -490,7 +492,7 @@ The management core **pulls on demand** — only when a human or HTTP client ask
                                │  ─────────────────────│
                                │  CLI "stats"  snapshot │
                                │  GET /stats   snapshot │
-                               │  flood loop   1 Hz    │
+                               │  tps loop     1 Hz    │
                                └───────┬───────────────┘
                                        │ render
                           ┌────────────┴────────────┐
@@ -508,7 +510,7 @@ Management never writes to `g_metrics[]`. Ownership is strict and one-directiona
 |---------|-------------|-----------|
 | CLI `stats` command | mgmt core (readline thread) | once per keystroke |
 | REST `GET /api/v1/stats` | libmicrohttpd thread on mgmt core | once per HTTP request |
-| `flood` live progress | mgmt core in sleep loop | 1 Hz for the flood duration |
+| `tps` live progress | mgmt core in sleep loop | 1 Hz for the tps duration |
 
 There is **no periodic background scrape** and **no metric log file**.
 If nobody asks, nobody reads — worker slabs accumulate silently.
@@ -666,14 +668,14 @@ Commands flow from management to workers via `config_update_t` messages (256 byt
 
 ### 4.3 How They Work Together — Concrete Scenarios
 
-#### Scenario 1: `flood udp 10.0.0.1 3 1000 64 9`
+#### Scenario 1: `tps 10.0.0.1 3 1000 64 9`
 
 ```
   Time ──────────────────────────────────────────────────────────►
 
   Mgmt Core                         Worker 0        Worker 1
   ─────────                         ────────        ────────
-  cmd_flood() parses args
+  cmd_tps() parses args
   arp_request(10.0.0.1)
   arp_mgmt_tick() ← poll ARP ring
   [ARP reply arrives] →             arp_input()
@@ -749,6 +751,80 @@ expiry probing. Workers read the cache via `arp_lookup()` under a read-lock.
 | **Observability without overhead** | Workers do single `++`; mgmt does the heavy export |
 | **ARP without blocking**  | Workers enqueue, mgmt processes — no worker stall          |
 | **Graceful shutdown**      | `CFG_CMD_SHUTDOWN` via IPC + `g_run` flag; ordered teardown |
+
+---
+
+## 5. Test Infrastructure
+
+### 5.1 Test Script Overview
+
+```
+tests/
+├── ping_veth.sh        # ICMP over veth — smoke test (no VM)
+├── udp_veth.sh         # UDP over veth — datagram validation
+├── arp_test.sh         # ARP resolution + cache lifecycle
+├── tcp_tap.sh          # TCP SYN/data/FIN over TAP + Firecracker
+├── http_nic.sh         # HTTP RPS + throughput over NIC + QEMU
+├── tls_nic.sh          # TLS handshake/throughput over NIC + QEMU + QAT
+└── https_nic.sh        # HTTPS (nginx SSL) over NIC + QEMU + QAT
+```
+
+### 5.2 Topology Tiers
+
+| Tier | Transport | VM | NIC | Script(s) |
+|------|-----------|-----|------|----------|
+| **Kernel** | veth / TAP | None | Virtual | `ping_veth.sh`, `udp_veth.sh`, `arp_test.sh` |
+| **TAP + Firecracker** | TAP + bridge | Firecracker microVM | `net_tap` PMD | `tcp_tap.sh` |
+| **NIC + QEMU** | Physical loopback | QEMU/KVM + vfio-pci | HW PMD (mlx5/i40e) | `http_nic.sh`, `tls_nic.sh`, `https_nic.sh` |
+
+### 5.3 TLS / HTTPS Test Architecture
+
+The TLS and HTTPS tests add crypto acceleration testing to the NIC + QEMU tier:
+
+```
+┌─────── vaigAI (host) ─────────┐       ┌──────── QEMU VM ────────────┐
+│                                │       │                             │
+│  DPDK i40e PMD                │  NIC  │  Kernel NIC driver          │
+│       │                        │ ═════ │       │                     │
+│  TCP/IP stack (net/)          │       │  openssl s_server (TLS)     │
+│       │                        │       │  nginx + SSL    (HTTPS)    │
+│  TLS engine (tls/)            │       │       │                     │
+│       │                        │       │  OpenSSL / qatengine       │
+│  ┌────▼────────┐               │       │                             │
+│  │ cryptodev   │  QAT          │       │  QAT (vfio-pci passthru)   │
+│  │ crypto_qat  │◄─── PCI ──── │       │◄─── PCI passthru ──────── │
+│  └─────────────┘               │       │                             │
+└────────────────────────────────┘       └─────────────────────────────┘
+```
+
+**Crypto parameterization** — Both scripts accept `VAIGAI_CRYPTO=qat|sw` and
+`SERVER_CRYPTO=qat|sw` environment variables, enabling a 2×2 test matrix:
+
+| | Server: SW | Server: QAT |
+|---|---|---|
+| **vaigai: SW** | Baseline (pure software) | Server-side offload only |
+| **vaigai: QAT** | Client-side offload (typical) | Full hardware offload |
+
+**Intel QAT DH895XCC** devices are auto-detected and bound to `vfio-pci`.
+vaigai uses the DPDK `crypto_qat` PMD; the VM server uses OpenSSL `qatengine`
+with the QAT device passed through via vfio-pci.
+
+### 5.4 Common Test Infrastructure
+
+All NIC-tier scripts share a common pattern:
+
+| Component | Implementation |
+|-----------|---------------|
+| **FIFO lifecycle** | `mkfifo` → `vaigai < fifo > log`, async command dispatch |
+| **Stats collection** | `stats` command → JSON parse via `json_val()` grep |
+| **VFIO bind/unbind** | Save original driver, bind to `vfio-pci`, restore on teardown |
+| **VM lifecycle** | COW rootfs copy → patch config → QEMU boot → serial monitor |
+| **Teardown** | EXIT trap: quit vaigai, kill QEMU, restore PCI drivers, clean temp files |
+| **Pass/fail** | Per-assertion counters, non-zero exit on any failure |
+
+See [tls-test.md](tls-test.md), [https-test.md](https-test.md),
+[http-test.md](http-test.md), and [tcp-test.md](tcp-test.md) for
+detailed test plans and code coverage matrices.
 
 ### 4.5 Shared State Inventory
 

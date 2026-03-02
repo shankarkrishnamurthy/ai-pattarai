@@ -23,10 +23,10 @@ extern "C" {
 
 /* ── Protocol selector ────────────────────────────────────────────────────── */
 typedef enum {
-    TX_GEN_PROTO_ICMP    = 0,   /* ICMP Echo Request flood              */
-    TX_GEN_PROTO_UDP,           /* UDP datagram flood                   */
-    TX_GEN_PROTO_TCP_SYN,       /* TCP SYN flood (future)               */
-    TX_GEN_PROTO_HTTP,          /* HTTP request flood (future)          */
+    TX_GEN_PROTO_ICMP    = 0,   /* ICMP Echo Request TPS                */
+    TX_GEN_PROTO_UDP,           /* UDP datagram TPS                     */
+    TX_GEN_PROTO_TCP_SYN,       /* TCP SYN TPS                          */
+    TX_GEN_PROTO_HTTP,          /* HTTP request TPS                     */
     TX_GEN_PROTO_MAX,
 } tx_gen_proto_t;
 
@@ -44,6 +44,11 @@ typedef struct {
     uint16_t              port_id;      /* DPDK port to transmit on      */
     uint64_t              rate_pps;     /* 0 = unlimited (line rate)     */
     uint32_t              duration_s;   /* 0 = run until stopped         */
+    bool                  enable_tls;   /* initiate TLS after TCP 3WHS   */
+    uint8_t               http_method;  /* http_method_t (0=GET,1=POST…) */
+    uint8_t               _pad[2];      /* alignment padding             */
+    char                  http_url[64]; /* URL path for HTTP TPS         */
+    char                  http_host[64];/* Host: header for HTTP TPS    */
 } tx_gen_config_t;
 
 _Static_assert(sizeof(tx_gen_config_t) <= 248,
@@ -72,6 +77,15 @@ typedef struct {
     uint16_t        tx_queue_id;        /* resolved at configure time   */
     uint16_t        _pad;
 } tx_gen_state_t;
+
+/* ── Pre-built HTTP request (one per worker, reused across connections) ──── */
+typedef struct {
+    uint8_t  hdr[512];
+    uint32_t hdr_len;
+    bool     keep_alive;  /* recycle: state 4→5→4 loop */
+} http_prebuilt_req_t;
+
+extern http_prebuilt_req_t g_http_req[TGEN_MAX_WORKERS];
 
 /* ── API ──────────────────────────────────────────────────────────────────── */
 

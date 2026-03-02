@@ -106,8 +106,8 @@ int tcp_options_write_syn(uint8_t *buf, size_t bufsz,
         p += 10;
     }
 
-    /* Window Scale */
-    NEED(3);
+    /* Window Scale (NOP + 3-byte option = 4 bytes) */
+    NEED(4);
     p[0] = TCPOPT_NOP; p++;
     p[0] = TCPOPT_WINDOW_SCALE; p[1] = 3; p[2] = wscale;
     p += 3;
@@ -133,14 +133,12 @@ int tcp_options_write_data(uint8_t *buf, size_t bufsz,
 #define NEED(n) if (remaining < (n)) goto done; remaining -= (n);
 
     if (timestamps) {
-        NEED(10);
+        NEED(12);
         p[0] = TCPOPT_NOP; p[1] = TCPOPT_NOP;
         p[2] = TCPOPT_TIMESTAMP; p[3] = 10;
         p[4] = (uint8_t)(ts_val>>24); p[5] = (uint8_t)(ts_val>>16);
         p[6] = (uint8_t)(ts_val>>8);  p[7] = (uint8_t)ts_val;
         p[8] = (uint8_t)(ts_ecr>>24); p[9] = (uint8_t)(ts_ecr>>16);
-        /* overwrite p[10..11] with more ts_ecr bytes */
-        NEED(2);
         p[10] = (uint8_t)(ts_ecr>>8); p[11] = (uint8_t)ts_ecr;
         p += 12;
     }
@@ -148,7 +146,7 @@ int tcp_options_write_data(uint8_t *buf, size_t bufsz,
     if (sack && sack_count > 0) {
         uint8_t sb_count = sack_count > 4 ? 4 : sack_count;
         uint8_t opt_len  = (uint8_t)(2 + sb_count * 8);
-        NEED(opt_len);
+        NEED(2 + opt_len);  /* 2 NOPs + opt_len (kind+len+blocks) */
         p[0] = TCPOPT_NOP; p[1] = TCPOPT_NOP;
         p[2] = TCPOPT_SACK; p[3] = opt_len;
         uint8_t *s = p + 4;
@@ -160,7 +158,7 @@ int tcp_options_write_data(uint8_t *buf, size_t bufsz,
             s[6]=(uint8_t)(r>>8);  s[7]=(uint8_t)r;
             s += 8;
         }
-        p += opt_len;
+        p += 2 + opt_len;
     }
 
 done:

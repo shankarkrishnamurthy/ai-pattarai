@@ -17,6 +17,9 @@
 #include "../core/ipc.h"
 #include "../core/tx_gen.h"
 #include "../core/core_assign.h"
+#include "../tls/tls_session.h"
+#include "../tls/tls_engine.h"
+#include "../app/http11.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -145,45 +148,86 @@ cmd_ping(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
-/* flood / stop — timer-based TX generation on worker lcores            */
+/* tps / stop — timer-based TX generation on worker lcores              */
 /* ------------------------------------------------------------------ */
-static const char *g_proto_names[] = { "ICMP", "UDP", "TCP SYN", "HTTP" };
+
+/* Auto-detect protocol from config's "protocol" field. */
+static tx_gen_proto_t
+tps_detect_proto(void)
+{
+    if (strcmp(g_config.protocol, "http") == 0 ||
+        strcmp(g_config.protocol, "https") == 0)
+        return TX_GEN_PROTO_HTTP;
+    if (strcmp(g_config.protocol, "udp") == 0)
+        return TX_GEN_PROTO_UDP;
+    if (strcmp(g_config.protocol, "icmp") == 0)
+        return TX_GEN_PROTO_ICMP;
+    return TX_GEN_PROTO_TCP_SYN; /* tcp, tls */
+}
+
+static const char *
+tps_proto_label(void)
+{
+    return g_config.protocol;
+}
 
 static void
-cmd_flood(int argc, char **argv)
+cmd_tps(int argc, char **argv)
 {
     extern volatile int g_run;
-    if (argc < 4) {
-        printf("Usage: flood <icmp|udp|tcp> <dst_ip> <duration_s>"
-               " [rate_pps=0] [size=56] [port=9]\n");
+    if (argc < 3) {
+        printf("Usage: tps <dst_ip> <duration_s>"
+               " [rate=0] [size=56] [port=cfg]\n"
+               "  Protocol is set by \"protocol\" in config: "
+               "tcp, http, tls, https, udp, icmp\n");
         return;
     }
 
-    /* ── Parse protocol ─────────────────────────────────────────────── */
-    tx_gen_proto_t proto;
-    if      (strcmp(argv[1], "icmp") == 0) proto = TX_GEN_PROTO_ICMP;
-    else if (strcmp(argv[1], "udp")  == 0) proto = TX_GEN_PROTO_UDP;
-    else if (strcmp(argv[1], "tcp")  == 0) proto = TX_GEN_PROTO_TCP_SYN;
-    else {
-        printf("flood: unknown protocol '%s' (icmp|udp|tcp)\n", argv[1]);
-        return;
+    /* ── Backward compat: skip legacy protocol keyword if present ──── */
+    int ip_idx = 1;
+    if (strcmp(argv[1], "tcp")  == 0 || strcmp(argv[1], "http") == 0 ||
+        strcmp(argv[1], "udp")  == 0 || strcmp(argv[1], "icmp") == 0 ||
+        strcmp(argv[1], "tls")  == 0 || strcmp(argv[1], "https") == 0) {
+        ip_idx = 2;
+        if (argc < 4) {
+            printf("Usage: tps <dst_ip> <duration_s>"
+                   " [rate=0] [size=56] [port=cfg]\n");
+            return;
+        }
     }
+
+    tx_gen_proto_t proto = tps_detect_proto();
 
     /* ── Parse destination IP ───────────────────────────────────────── */
     uint32_t dst_ip;
-    if (tgen_parse_ipv4(argv[2], &dst_ip) < 0) {
-        printf("flood: invalid IP '%s'\n", argv[2]);
+    if (tgen_parse_ipv4(argv[ip_idx], &dst_ip) < 0) {
+        printf("tps: invalid IP '%s'\n", argv[ip_idx]);
         return;
     }
 
-    uint32_t duration_s = (uint32_t)strtoul(argv[3], NULL, 10);
+    uint32_t duration_s = (uint32_t)strtoul(argv[ip_idx + 1], NULL, 10);
     if (duration_s == 0) {
-        printf("flood: duration must be > 0\n");
+        printf("tps: duration must be > 0\n");
         return;
     }
-    uint64_t rate_pps  = (argc >= 5) ? strtoull(argv[4], NULL, 10) : 0;
-    uint16_t pkt_size  = (argc >= 6) ? (uint16_t)strtoul(argv[5], NULL, 10) : 56;
-    uint16_t dst_port  = (argc >= 7) ? (uint16_t)strtoul(argv[6], NULL, 10) : 9;
+    uint64_t rate_pps  = (ip_idx + 2 < argc) ? strtoull(argv[ip_idx + 2], NULL, 10) : 0;
+    uint16_t pkt_size  = (ip_idx + 3 < argc) ? (uint16_t)strtoul(argv[ip_idx + 3], NULL, 10) : 56;
+    uint16_t dst_port  = (ip_idx + 4 < argc) ? (uint16_t)strtoul(argv[ip_idx + 4], NULL, 10) : 9;
+
+    /* Pull defaults from the flow config */
+    char http_url[64]  = "/";
+    char http_host[64] = "";
+    if (g_config.n_flows > 0) {
+        const flow_cfg_t *f = &g_config.flows[0];
+        if (ip_idx + 4 >= argc && f->dst_port != 0)
+            dst_port = f->dst_port;
+        if (f->http_url[0] != '\0')
+            strncpy(http_url, f->http_url, sizeof(http_url) - 1);
+        if (f->http_host[0] != '\0')
+            strncpy(http_host, f->http_host, sizeof(http_host) - 1);
+        else
+            strncpy(http_host, argv[ip_idx], sizeof(http_host) - 1);
+    }
     uint16_t port_id   = 0;
 
     /* ── ARP-resolve destination ────────────────────────────────────── */
@@ -198,7 +242,7 @@ cmd_flood(int argc, char **argv)
         }
     }
     if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
-        printf("flood: ARP resolution failed for %s\n", argv[2]);
+        printf("tps: ARP resolution failed for %s\n", argv[ip_idx]);
         return;
     }
 
@@ -217,6 +261,19 @@ cmd_flood(int argc, char **argv)
     gcfg.rate_pps   = rate_pps;
     gcfg.duration_s = duration_s;
 
+    /* Enable TLS for TCP connections if globally configured */
+    if (proto == TX_GEN_PROTO_TCP_SYN && g_config.tls_enabled)
+        gcfg.enable_tls = true;
+
+    /* HTTP-specific config (auto-detected from config) */
+    if (proto == TX_GEN_PROTO_HTTP) {
+        gcfg.http_method = 0; /* GET */
+        strncpy(gcfg.http_url,  http_url,  sizeof(gcfg.http_url) - 1);
+        strncpy(gcfg.http_host, http_host, sizeof(gcfg.http_host) - 1);
+        if (g_config.tls_enabled)
+            gcfg.enable_tls = true;
+    }
+
     /* ── Reset counters & push to workers ───────────────────────────── */
     uint32_t n_workers = g_core_map.num_workers;
     metrics_reset(n_workers);
@@ -228,8 +285,8 @@ cmd_flood(int argc, char **argv)
     memcpy(cmd.payload, &gcfg, sizeof(gcfg));
     tgen_ipc_broadcast(&cmd);
 
-    printf("FLOOD %s -> %s: %u-byte payload, %s, %u seconds\n",
-           g_proto_names[proto], argv[2], pkt_size,
+    printf("TPS %s -> %s: %u-byte payload, %s, %u seconds\n",
+           tps_proto_label(), argv[ip_idx], pkt_size,
            rate_pps ? "rate-limited" : "unlimited", duration_s);
 
     /* ── Wait for duration (live progress on TTY) ───────────────────── */
@@ -262,10 +319,10 @@ cmd_flood(int argc, char **argv)
     metrics_snapshot_t snap;
     metrics_snapshot(&snap, n_workers);
 
-    printf("\n--- flood statistics ---\n"
+    printf("\n--- tps statistics ---\n"
            "Protocol: %s, Duration: %us, Rate: %s\n"
            "%" PRIu64 " packets transmitted\n",
-           g_proto_names[proto], duration_s,
+           tps_proto_label(), duration_s,
            rate_pps ? "limited" : "unlimited",
            snap.total.tx_pkts);
     if (duration_s > 0 && snap.total.tx_pkts > 0) {
@@ -343,6 +400,7 @@ cmd_throughput(int argc, char **argv)
         metrics_reset(n_workers);
 
         /* Open connections */
+        bool tls = g_config.tls_enabled;
         uint32_t w = 0; /* round-robin across workers */
         tcb_t *tcbs[16];
         for (uint32_t i = 0; i < streams; i++) {
@@ -353,6 +411,12 @@ cmd_throughput(int argc, char **argv)
                 printf("throughput: connect failed for stream %u\n", i);
                 streams = i;
                 break;
+            }
+            if (tls) {
+                tcbs[i]->app_state = 1; /* request TLS on ESTABLISHED */
+                /* Mark as throughput mode so FSM doesn't auto-close
+                 * after TLS handshake completes (tps mode uses NULL). */
+                tcbs[i]->app_ctx = (void *)1;
             }
             w++;
         }
@@ -372,19 +436,55 @@ cmd_throughput(int argc, char **argv)
             }
         }
 
+        /* If TLS: wait for handshake completion (app_state == 3, up to 5s) */
+        if (tls) {
+            uint64_t deadline = rte_rdtsc() + 5ULL * rte_get_tsc_hz();
+            bool all_tls = false;
+            while (rte_rdtsc() < deadline && !all_tls) {
+                arp_mgmt_tick();
+                all_tls = true;
+                for (uint32_t i = 0; i < streams; i++) {
+                    if (tcbs[i] && tcbs[i]->app_state != 3 &&
+                        tcbs[i]->state == TCP_ESTABLISHED)
+                        all_tls = false;
+                }
+                if (!all_tls) rte_delay_ms(1);
+            }
+            if (!all_tls)
+                printf("throughput: TLS handshake did not complete for all streams\n");
+        }
+
         printf("TCP throughput TX → %s:%u  streams=%u  duration=%us\n",
                argv[2], dst_port, streams, duration_s);
         printf("[ ID]  Interval       Transfer     Throughput\n");
 
         /* Pump data for duration */
+        uint8_t tls_ct_buf[2048];  /* ciphertext output buffer */
         uint64_t start_tsc = rte_rdtsc();
         uint64_t end_tsc   = start_tsc + (uint64_t)duration_s * rte_get_tsc_hz();
         while (rte_rdtsc() < end_tsc && g_run) {
             for (uint32_t i = 0; i < streams; i++) {
-                if (tcbs[i] && tcbs[i]->state == TCP_ESTABLISHED)
+                if (!tcbs[i] || tcbs[i]->state != TCP_ESTABLISHED)
+                    continue;
+                if (tls && tcbs[i]->app_state == 3) {
+                    /* Encrypt plaintext → send ciphertext */
+                    uint32_t wid = i % n_workers;
+                    uint32_t ci = (uint32_t)(tcbs[i] - g_tcb_stores[wid].tcbs);
+                    tls_session_t *sess = tls_session_get(wid, ci);
+                    if (sess) {
+                        int ct_len = tls_encrypt(sess,
+                                        g_throughput_zero_buf,
+                                        sizeof(g_throughput_zero_buf),
+                                        tls_ct_buf, sizeof(tls_ct_buf));
+                        if (ct_len > 0)
+                            tcp_fsm_send(wid, tcbs[i], tls_ct_buf, (uint32_t)ct_len);
+                    }
+                } else if (!tls) {
                     tcp_fsm_send(i % n_workers, tcbs[i],
                                   g_throughput_zero_buf,
                                   (uint32_t)sizeof(g_throughput_zero_buf));
+                }
+                /* If tls but app_state != 3, skip — handshake not done yet */
             }
             /* Let the worker poll loop process ACKs */
             rte_delay_us(10);
@@ -455,6 +555,190 @@ cmd_throughput(int argc, char **argv)
         printf("[SUM]  0.00-%.2fs    %.0f MB       %.1f Mbps\n",
                (double)duration_s, mb, mbps);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* http — HTTP transaction-per-second measurement                       */
+/* ------------------------------------------------------------------ */
+static void
+cmd_http(int argc, char **argv)
+{
+    extern volatile int g_run;
+    if (argc < 5) {
+        printf("Usage: http <get|post|put|delete> <dst_ip> <port>"
+               " <duration_s> [url=/] [streams=1] [body_size=0]\n");
+        return;
+    }
+
+    /* Parse method */
+    http_method_t method;
+    if      (strcmp(argv[1], "get")    == 0) method = HTTP_METHOD_GET;
+    else if (strcmp(argv[1], "post")   == 0) method = HTTP_METHOD_POST;
+    else if (strcmp(argv[1], "put")    == 0) method = HTTP_METHOD_PUT;
+    else if (strcmp(argv[1], "delete") == 0) method = HTTP_METHOD_DELETE;
+    else {
+        printf("http: unknown method '%s' (get|post|put|delete)\n", argv[1]);
+        return;
+    }
+
+    uint32_t dst_ip;
+    if (tgen_parse_ipv4(argv[2], &dst_ip) < 0) {
+        printf("http: invalid IP '%s'\n", argv[2]);
+        return;
+    }
+    uint16_t dst_port   = (uint16_t)strtoul(argv[3], NULL, 10);
+    uint32_t duration_s = (uint32_t)strtoul(argv[4], NULL, 10);
+    const char *url     = (argc >= 6) ? argv[5] : "/";
+    uint32_t streams    = (argc >= 7) ? (uint32_t)strtoul(argv[6], NULL, 10) : 1;
+    uint32_t body_size  = (argc >= 8) ? (uint32_t)strtoul(argv[7], NULL, 10) : 0;
+
+    if (duration_s == 0 || streams == 0) {
+        printf("http: duration and streams must be > 0\n");
+        return;
+    }
+    if (streams > 16) streams = 16;
+
+    uint16_t port_id   = 0;
+    uint32_t n_workers = g_core_map.num_workers;
+
+    /* ARP resolve */
+    struct rte_ether_addr dst_mac;
+    if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
+        arp_request(port_id, dst_ip);
+        uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
+        while (rte_rdtsc() < deadline) {
+            arp_mgmt_tick();
+            if (arp_lookup(port_id, dst_ip, &dst_mac)) break;
+            rte_delay_ms(10);
+        }
+    }
+    if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
+        printf("http: ARP failed for %s\n", argv[2]);
+        return;
+    }
+
+    /* Build HTTP request into worker-0 prebuilt slot */
+    static uint8_t body_buf[8192];
+    if (body_size > sizeof(body_buf)) body_size = sizeof(body_buf);
+    if (body_size > 0)
+        memset(body_buf, 'X', body_size);
+
+    static http_conn_t hconn;   /* ~1 MB — must not live on stack */
+    http11_conn_init(&hconn);
+    http_request_t req = {
+        .method       = method,
+        .url          = url,
+        .host         = argv[2],
+        .content_type = (body_size > 0) ? "application/octet-stream" : NULL,
+        .body         = (body_size > 0) ? body_buf : NULL,
+        .body_len     = body_size,
+        .keep_alive   = true,
+    };
+    int req_len = http11_tx_request(&hconn, &req);
+    if (req_len <= 0) {
+        printf("http: failed to build request\n");
+        return;
+    }
+
+    /* Populate prebuilt request for worker-driven send (keep-alive loop) */
+    http_prebuilt_req_t *hp = &g_http_req[0];
+    memcpy(hp->hdr, hconn.tx_hdr, (uint32_t)req_len);
+    hp->hdr_len    = (uint32_t)req_len;
+    hp->keep_alive = true;
+
+    metrics_reset(n_workers);
+
+    /* Open TCP connections (stagger to avoid first-SYN-ACK drop) */
+    uint32_t w = 0;
+    tcb_t *tcbs[16];
+    for (uint32_t i = 0; i < streams; i++) {
+        tcbs[i] = tcp_fsm_connect(w % n_workers,
+                      g_arp[port_id].local_ip, 0,
+                      dst_ip, dst_port, port_id);
+        if (!tcbs[i]) {
+            printf("http: connect failed for stream %u\n", i);
+            streams = i;
+            break;
+        }
+        w++;
+        rte_delay_ms(5);
+    }
+
+    /* Wait for ESTABLISHED (up to 3 s) */
+    {
+        uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
+        bool all_up = false;
+        while (rte_rdtsc() < deadline && !all_up) {
+            arp_mgmt_tick();
+            all_up = true;
+            for (uint32_t i = 0; i < streams; i++) {
+                if (tcbs[i] && tcbs[i]->state != TCP_ESTABLISHED)
+                    all_up = false;
+            }
+            if (!all_up) rte_delay_ms(1);
+        }
+    }
+
+    /* Arm each established stream for worker-driven HTTP keep-alive */
+    uint32_t active = 0;
+    for (uint32_t i = 0; i < streams; i++) {
+        if (tcbs[i] && tcbs[i]->state == TCP_ESTABLISHED) {
+            tcbs[i]->app_ctx   = hp;
+            tcbs[i]->app_state = 4; /* trigger first HTTP request */
+            active++;
+        }
+    }
+
+    printf("HTTP %s %s:%u%s  streams=%u (%u connected)  duration=%us\n",
+           argv[1], argv[2], dst_port, url, streams, active, duration_s);
+
+    /* Wait for duration — worker handles request/response loop */
+    uint64_t end_tsc = rte_rdtsc() + (uint64_t)duration_s * rte_get_tsc_hz();
+    while (rte_rdtsc() < end_tsc && g_run)
+        rte_delay_ms(100);
+
+    /* Close all */
+    for (uint32_t i = 0; i < streams; i++) {
+        if (tcbs[i] && tcbs[i]->in_use &&
+            tcbs[i]->state == TCP_ESTABLISHED) {
+            tcbs[i]->app_state = 0;
+            tcp_fsm_close(i % n_workers, tcbs[i]);
+        }
+    }
+    for (int g = 0; g < 50; g++) {
+        rte_delay_ms(100);
+        arp_mgmt_tick();
+        bool all_done = true;
+        for (uint32_t i = 0; i < streams; i++) {
+            if (tcbs[i] && tcbs[i]->state != TCP_TIME_WAIT
+                        && tcbs[i]->state != TCP_CLOSED
+                        && tcbs[i]->in_use)
+                all_done = false;
+        }
+        if (all_done) break;
+    }
+
+    /* Report */
+    metrics_snapshot_t snap;
+    metrics_snapshot(&snap, n_workers);
+    double rps = (double)snap.total.http_req_tx / (double)duration_s;
+    printf("\n--- HTTP statistics ---\n"
+           "Method: %s, Duration: %us, Streams: %u (%u connected)\n"
+           "Requests:  %"PRIu64" TX\n"
+           "Responses: %"PRIu64" RX "
+           "(2xx=%"PRIu64" 4xx=%"PRIu64" 5xx=%"PRIu64")\n"
+           "Parse errors: %"PRIu64"\n"
+           "Throughput: %.1f req/s\n",
+           argv[1], duration_s, streams, active,
+           snap.total.http_req_tx,
+           snap.total.http_rsp_rx,
+           snap.total.http_rsp_2xx, snap.total.http_rsp_4xx,
+           snap.total.http_rsp_5xx,
+           snap.total.http_parse_err,
+           rps);
+
+    printf("\n--- telemetry ---\n");
+    cli_print_stats();
 }
 
 static void
@@ -570,7 +854,9 @@ cli_run(void)
     cli_register("save",     "Save config JSON file",    cmd_save);
     cli_register("set-cps",  "Set target connections/s", cmd_set_cps);
     cli_register("ping",     "ICMP ping: ping <ip> [count] [size] [ms]", cmd_ping);
-    cli_register("flood",    "TX flood: flood <icmp|udp|tcp> <ip> <secs> [pps] [sz]", cmd_flood);
+    cli_register("tps",      "TPS measurement: tps <ip> <secs> [rate] [size] [port]", cmd_tps);
+    cli_register("flood",    "(alias for tps)", cmd_tps);
+    cli_register("http",     "HTTP TPS: http <get|post|put|delete> <ip> <port> <secs>", cmd_http);
     cli_register("throughput", "TCP throughput: throughput tx/rx <args>",  cmd_throughput);
     cli_register("stop",     "Stop active traffic generation",          cmd_stop_gen);
     cli_register("reset",   "Reset all TCP state (connections, ports)", cmd_reset);
@@ -616,7 +902,7 @@ cli_run(void)
         fflush(stdout);
         /* Poll stdin with short timeout, calling arp_mgmt_tick while idle.
          * Without this, incoming ARP requests pile up unprocessed when
-         * no flood command is active. */
+         * no tps command is active. */
         struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
         while (poll(&pfd, 1, 10 /* ms */) == 0)
             arp_mgmt_tick();
