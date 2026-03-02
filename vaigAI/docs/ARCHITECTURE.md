@@ -7,11 +7,11 @@
 
 ## Table of Contents
 
-1. [System Architecture](#1-system-architecture)
-2. [Life of a Packet](#2-life-of-a-packet)
-3. [Telemetry System](#3-telemetry-system)
-4. [Control Plane / Data Plane Segregation](#4-control-plane--data-plane-segregation)
-5. [Test Infrastructure](#5-test-infrastructure)
+1. [System Architecture](#1-system-architecture) — block diagram, module map, build, startup, core assignment, memory
+2. [Life of a Packet](#2-life-of-a-packet) — RX/TX paths, worker loop, protocol stack, HTTP parser, TLS, TCP flow control
+3. [Telemetry System](#3-telemetry-system) — metrics ownership, counters, histogram, export, logging
+4. [Control Plane / Data Plane](#4-control-plane--data-plane-segregation) — IPC, CLI, REST API, config, shared state
+5. [Test Infrastructure](#5-test-infrastructure) — scripts, topology tiers, protocol suites, coverage
 
 ---
 
@@ -114,7 +114,36 @@ src/
     └── log.h/c                # Structured log macros (wraps rte_log)
 ```
 
-### 1.3 Startup Sequence
+### 1.3 Build System
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  meson.build                                                │
+│                                                             │
+│  vaigai (C17, -march=native, -Wall -Werror)                │
+│                                                             │
+│  Required ──────────────────────────────────────────────── │
+│  │  libdpdk ≥ 24.11    Data-plane I/O + PMDs               │
+│  │  threads (pthreads)  POSIX threading                    │
+│  │  libm               Math library                        │
+│                                                             │
+│  Optional (auto-detected) ─────────────────────────────── │
+│  │  openssl ≥ 1.1   → HAVE_OPENSSL  (TLS engine)          │
+│  │  readline         → HAVE_READLINE (interactive CLI)     │
+│  │  libbpf           → HAVE_AF_XDP   (AF_XDP PMD)         │
+│  │  jansson ≥ 2.14   ┐                                    │
+│  │  libmicrohttpd    ┘→ HAVE_REST    (REST API + JSON)    │
+│                                                             │
+│  Output ── single "vaigai" binary                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+```bash
+meson setup build && ninja -C build    # build
+meson install -C build                 # install
+```
+
+### 1.4 Startup Sequence
 
 ```
 main()
@@ -140,7 +169,7 @@ main()
   └─14─ tgen_cleanup()               Stop workers, free everything, EAL cleanup
 ```
 
-### 1.4 Core Assignment
+### 1.5 Core Assignment
 
 The system auto-scales management overhead based on available cores:
 
@@ -156,7 +185,7 @@ The system auto-scales management overhead based on available cores:
 All remaining lcores become **workers**. Workers are distributed to ports round-robin
 on the same NUMA socket. Each worker gets one RX queue and one TX queue per port.
 
-### 1.5 Memory Layout
+### 1.6 Memory Layout
 
 | Resource          | Scope       | Sizing                                                       |
 |-------------------|-------------|--------------------------------------------------------------|
@@ -169,6 +198,20 @@ on the same NUMA socket. Each worker gets one RX queue and one TX queue per port
 
 Mempool allocation uses a 3-tier NUMA fallback: worker's socket with 1 GB pages →
 `SOCKET_ID_ANY` with 2 MB pages → `SOCKET_ID_ANY` with 4 KB pages.
+
+**Key Constants** (`common/types.h`):
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `TGEN_MAX_PORTS` | 16 | Maximum physical/virtual ports |
+| `TGEN_MAX_LCORES` | 128 | Maximum logical cores |
+| `TGEN_MAX_WORKERS` | 124 | Max workers (128 − 4 mgmt) |
+| `TGEN_MAX_CONNECTIONS` | 1,000,000 | TCB store capacity |
+| `TGEN_MAX_TX/RX_BURST` | 32 | Packets per burst |
+| `TGEN_DEFAULT_RX/TX_DESC` | 2048 | Ring descriptor count |
+| `TGEN_MBUF_DATA_SZ` | 2176 | mbuf data room (2048+128) |
+| `TGEN_ARP_CACHE_SZ` | 1024 | ARP hash entries |
+| `TGEN_TIMEWAIT_DEFAULT_MS` | 4000 | TIME_WAIT duration |
 
 ---
 
@@ -386,6 +429,13 @@ Every worker lcore runs a tight, non-blocking loop:
       │    • TIME_WAIT expiry (conn_close counted once) │
       │    • Delayed ACK flush                          │
       └─────────────────────────────────────────────────┘
+                            │
+      ┌─ Step 5 ─── Port Pool Tick ────────────────────┐
+      │  tcp_port_pool_tick(worker_idx)                 │
+      │    • Drain TIME_WAIT FIFO ring                 │
+      │    • Reclaim expired ephemeral ports            │
+      │    • Update internal TSC timestamp              │
+      └────────────────────────────────────────────────┘
   }
 ```
 
@@ -424,7 +474,77 @@ Every worker lcore runs a tight, non-blocking loop:
 - IPv4 dispatches by `protocol` field: TCP (6), UDP (17), and ICMP (1) are **siblings** — all encapsulated in IP.
 - TLS and HTTP stack only on top of TCP, not UDP or ICMP.
 
-### 2.5 TCP Flow Control & Data Transmission
+### 2.5 HTTP/1.1 Parser — RX State Machine
+
+The HTTP response parser in `http11.c` is a single-pass, zero-copy state machine:
+
+```
+  tcp_fsm_input() delivers payload
+         │
+  ┌──────▼──────┐     HTTP/1.1 200 OK\r\n     ┌────────────────┐
+  │    IDLE     │ ──────────────────────────► │  WAIT_HEADERS  │
+  │  (waiting   │   parse status line:       │  scan for      │
+  │   for resp) │   version, code, reason    │  \r\n\r\n       │
+  └─────────────┘                            └───────┬────────┘
+                                                     │
+                          ┌──────────────────────────┘
+                          │ blank line found
+                          ▼
+            ┌─── Content-Length? ───┬─── Transfer-Encoding: chunked?
+            │                      │
+     ┌──────▼──────┐        ┌──────▼──────┐
+     │  WAIT_BODY  │        │ WAIT_CHUNK  │
+     │  count down │        │  parse hex  │
+     │  remaining  │        │  size lines │
+     └──────┬──────┘        └──────┬──────┘
+            │ len == 0             │ chunk_sz == 0
+            └──────────┬───────────┘
+                       ▼
+               ┌──────────────┐
+               │     DONE     │──► fire callback
+               │  reset for   │    update metrics:
+               │  keep-alive  │    http_rsp_2xx etc.
+               └──────────────┘
+```
+
+**Supported HTTP methods (TX):** `GET`, `POST`, `PUT`, `DELETE`, `HEAD`
+— built by `http_build_request()` with `Host`, `Content-Type`, `Content-Length` headers.
+
+**Pipelining:** `pipeline_depth` tracks in-flight requests per connection.
+
+### 2.6 TLS Integration
+
+TLS sits between TCP and HTTP, using OpenSSL memory BIOs for zero-copy,
+non-blocking operation:
+
+```
+  ┌──────────────────────────────────────────────────────┐
+  │              Application (http11.c)                   │
+  │                 plaintext ↕                           │
+  ├──────────────────────────────────────────────────────┤
+  │              TLS Engine (tls_engine.c)                │
+  │                                                      │
+  │   SSL_write(plain) ──► wbio ──► ciphertext out       │
+  │   SSL_read(cipher) ◄── rbio ◄── ciphertext in        │
+  │                                                      │
+  │   Handshake states: PENDING → IN_PROGRESS → DONE     │
+  │   Cipher suites: ECDHE + AES-GCM (TLS 1.2/1.3)     │
+  │   SNI support for virtual hosting                    │
+  ├──────────────────────────────────────────────────────┤
+  │   ┌─────────────┐  ┌────────────────────────────┐   │
+  │   │ cert_mgr.c  │  │ cryptodev.c                │   │
+  │   │ cert load / │  │ DPDK crypto_qat AES-GCM    │   │
+  │   │ hot-reload  │  │ (fallback → OpenSSL SW)    │   │
+  │   └─────────────┘  └────────────────────────────┘   │
+  ├──────────────────────────────────────────────────────┤
+  │              TCP FSM (tcp_fsm.c)                      │
+  │   app_state flags coordinate TCP→TLS→HTTP layering   │
+  │   tls_hs_start_tsc records handshake start for       │
+  │   latency histogram                                  │
+  └──────────────────────────────────────────────────────┘
+```
+
+### 2.7 TCP Flow Control & Data Transmission
 
 TCP data transfer is driven by the FSM, not `tx_gen_burst()`. The mgmt core
 calls `tcp_fsm_connect()` + `tcp_fsm_send()` on behalf of CLI commands like
@@ -521,7 +641,7 @@ If nobody asks, nobody reads — worker slabs accumulate silently.
 worker_metrics_t g_metrics[TGEN_MAX_WORKERS] __rte_cache_aligned;
 ```
 
-Each worker owns one cache-line-aligned slab. **38 counters** per worker:
+Each worker owns one cache-line-aligned slab. **42 counters** per worker:
 
 | Layer | Counters |
 |-------|----------|
@@ -530,7 +650,7 @@ Each worker owns one cache-line-aligned slab. **38 counters** per worker:
 | ARP | `arp_reply_tx`, `arp_request_tx`, `arp_miss` |
 | ICMP | `icmp_echo_tx`, `icmp_bad_cksum`, `icmp_unreachable_tx` |
 | UDP | `udp_tx`, `udp_rx`, `udp_bad_cksum` |
-| TCP | `tcp_conn_open/close`, `tcp_syn_sent`, `tcp_retransmit`, `tcp_reset_rx/sent`, `tcp_bad_cksum`, `tcp_syn_queue_drops`, `tcp_ooo_pkts`, `tcp_duplicate_acks` |
+| TCP | `tcp_conn_open/close`, `tcp_syn_sent`, `tcp_retransmit`, `tcp_reset_rx/sent`, `tcp_bad_cksum`, `tcp_syn_queue_drops`, `tcp_ooo_pkts`, `tcp_duplicate_acks`, `tcp_payload_tx/rx` |
 | TLS | `tls_handshake_ok/fail`, `tls_records_tx/rx` |
 | HTTP | `http_req_tx`, `http_rsp_rx`, `http_rsp_1xx/../5xx`, `http_parse_err` |
 
@@ -562,7 +682,8 @@ Bucket 63: [2⁶³, ∞) µs  percentile: walk until seen ≥ p% × count
 
 ### 3.6 Export Format
 
-Single endpoint: **`/api/v1/stats`** — flat JSON with all 28 aggregate counters.
+Single endpoint: **`/api/v1/stats`** — flat JSON with all aggregate counters
+plus latency percentiles (p50, p95, p99) from the HDR histogram.
 CLI `stats` calls the same `export_json()` path → identical output to stdout.
 
 ### 3.7 Structured Logging
@@ -666,7 +787,75 @@ Commands flow from management to workers via `config_update_t` messages (256 byt
 - Worker frees message after processing
 - Broadcast sends to all workers; returns success count
 
-### 4.3 How They Work Together — Concrete Scenarios
+### 4.3 CLI Commands
+
+```
+vaigai> help
+```
+
+| Command | Syntax | Description |
+|---------|--------|-------------|
+| `help` | `help` | List available commands |
+| `stats` | `stats` | Print metrics snapshot (JSON) |
+| `ping` | `ping <ip> [count] [size] [interval_ms]` | ICMP echo request |
+| `tps` | `tps <ip> <dur_s> [rate] [size] [port]` | Transactions/sec (protocol from config) |
+| `flood` | *(alias for `tps`)* | Same as `tps` |
+| `http` | `http <method> <ip> <port> <dur_s> [url] [streams] [body_sz]` | HTTP transaction test |
+| `throughput` | `throughput tx <ip> <port> <dur_s> [streams]` | TCP TX throughput (iperf3-like) |
+| | `throughput rx <port> <dur_s>` | TCP RX throughput (passive) |
+| `stop` | `stop` | Stop active traffic generation |
+| `reset` | `reset` | RST all TCBs, reset port pools + metrics |
+| `trace` | `trace start [port] [queue] [count]` | Start packet capture |
+| | `trace stop` | Stop capture |
+| | `trace save <file.pcapng>` | Save capture to pcapng |
+| `load` | `load <config.json>` | Load JSON configuration |
+| `save` | `save <config.json>` | Save current config to JSON |
+| `set-cps` | `set-cps <value>` | Set target connections/second |
+| `quit` | `quit` | Graceful shutdown |
+
+### 4.4 REST API
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/stats` | `GET` | Metrics snapshot (same JSON as CLI `stats`) |
+| `/api/v1/config` | `GET` | Current configuration |
+| `/api/v1/start` | `POST` | Start traffic generation |
+| `/api/v1/stop` | `POST` | Stop traffic generation |
+
+All responses are JSON with CORS headers (`Access-Control-Allow-Origin: *`).
+REST server runs on the management core via `libmicrohttpd`.
+
+### 4.5 Configuration Schema
+
+```json
+{
+  "protocol": "tcp|udp|icmp|http|tls|https",
+  "tls_enabled": true,
+  "rest_port": 8080,
+
+  "flows": [{
+    "dst_ip": "10.0.0.2",
+    "src_ip_lo": "10.0.0.1",    "src_ip_hi": "10.0.0.1",
+    "dst_port": 443,
+    "vlan_id": 0,
+    "enable_tls": true,
+    "sni": "example.com",
+    "http_url": "/index.html",  "http_host": "example.com",
+    "http_body_len": 0,         "icmp_ping": false
+  }],
+
+  "load": {
+    "target_cps": 10000,   "target_rps": 0,
+    "max_concurrent": 4096,"duration_secs": 30,
+    "ramp_up_secs": 0,     "ramp_down_secs": 0
+  }
+}
+```
+
+Loaded from `$VAIGAI_CONFIG` env var at startup or via CLI `load` command.
+`config_push_to_workers()` distributes flow profiles to the ARP subsystem.
+
+### 4.6 How They Work Together — Concrete Scenarios
 
 #### Scenario 1: `tps 10.0.0.1 3 1000 64 9`
 
@@ -741,7 +930,7 @@ but never process them. They forward to the management core via a per-port SPSC
 ring. The management core handles all cache mutations, reply generation, and
 expiry probing. Workers read the cache via `arp_lookup()` under a read-lock.
 
-### 4.4 Why This Design
+### 4.7 Why This Design
 
 | Concern                   | How It's Addressed                                          |
 |---------------------------|-------------------------------------------------------------|
@@ -754,19 +943,43 @@ expiry probing. Workers read the cache via `arp_lookup()` under a read-lock.
 
 ---
 
+### 4.8 Shared State Inventory
+
+The following global state is accessed by both planes. Each is designed to be
+safe without mutual exclusion in the fast path:
+
+| State | Writer | Reader | Mechanism |
+|---|---|---|---|
+| `g_metrics[w]` | Worker `w` | Mgmt | Exclusive write; racy read |
+| `g_arp[p].table` | Mgmt | Workers | `rte_rwlock` (read-side only on workers) |
+| `g_arp_rings[p]` | Workers | Mgmt | SPSC `rte_ring` |
+| `g_udp_rings[p]` | Workers | Mgmt | SPSC `rte_ring` |
+| `g_ipc_rings[w]` | Mgmt | Worker `w` | SPSC `rte_ring` |
+| `g_ack_rings[w]` | Worker `w` | Mgmt | SPSC `rte_ring` |
+| `g_run` | Signal handler | All | `volatile int` — process lifecycle |
+| `g_traffic` | REST API | Workers | `volatile int` — traffic pause/resume |
+| `g_worker_ctx[w].tx_gen` | Worker `w` | Worker `w` | Single owner (configured via IPC copy) |
+
+---
+
 ## 5. Test Infrastructure
 
 ### 5.1 Test Script Overview
 
 ```
 tests/
-├── ping_veth.sh        # ICMP over veth — smoke test (no VM)
-├── udp_veth.sh         # UDP over veth — datagram validation
-├── arp_test.sh         # ARP resolution + cache lifecycle
-├── tcp_tap.sh          # TCP SYN/data/FIN over TAP + Firecracker
-├── http_nic.sh         # HTTP RPS + throughput over NIC + QEMU
-├── tls_nic.sh          # TLS handshake/throughput over NIC + QEMU + QAT
-└── https_nic.sh        # HTTPS (nginx SSL) over NIC + QEMU + QAT
+├── ping_veth.sh            # ICMP over veth — smoke test (no VM)
+├── udp_veth.sh             # UDP over veth — datagram validation
+├── arp_test.sh             # ARP resolution + cache lifecycle
+├── tcp_tap.sh              # TCP SYN/data/FIN over TAP + Firecracker
+├── http_nic.sh             # HTTP RPS + throughput over NIC + QEMU
+├── tls_nic.sh              # TLS handshake/throughput over NIC + QEMU + QAT
+├── https_nic.sh            # HTTPS (nginx SSL) over NIC + QEMU + QAT
+│
+└── proto/                  ── Protocol correctness suites ──
+    ├── tcp_suite.sh        # 15 tests: handshake, RST, loss, reorder, churn
+    ├── tls_suite.sh        # 15 tests: TLS 1.2/1.3, certs, ciphers, leak
+    └── http1.1_suite.sh    # 21 tests: GET/POST/PUT/DELETE, keep-alive, MTU
 ```
 
 ### 5.2 Topology Tiers
@@ -774,10 +987,56 @@ tests/
 | Tier | Transport | VM | NIC | Script(s) |
 |------|-----------|-----|------|----------|
 | **Kernel** | veth / TAP | None | Virtual | `ping_veth.sh`, `udp_veth.sh`, `arp_test.sh` |
+| **Kernel + Proto** | veth pair | None | Virtual | `proto/tcp_suite.sh`, `proto/tls_suite.sh`, `proto/http1.1_suite.sh` |
 | **TAP + Firecracker** | TAP + bridge | Firecracker microVM | `net_tap` PMD | `tcp_tap.sh` |
 | **NIC + QEMU** | Physical loopback | QEMU/KVM + vfio-pci | HW PMD (mlx5/i40e) | `http_nic.sh`, `tls_nic.sh`, `https_nic.sh` |
 
-### 5.3 TLS / HTTPS Test Architecture
+### 5.3 Protocol Correctness Suites (`tests/proto/`)
+
+The `proto/` suites run over veth pairs with real network peers (ncat, openssl,
+Python HTTP) — no VM required. They validate protocol correctness, not performance.
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  tcp_suite.sh (15 tests)                                        │
+│  ──────────────────────────────────────────────────────────────  │
+│  T01  3-way handshake          T09  High CPS / SYN flood       │
+│  T02  Connection lifecycle     T10  Multiple sequential bursts  │
+│  T03  RST on closed port       T11  Echo peer connectivity      │
+│  T04  RST mid-connection       T12  High-latency path (100ms)  │
+│  T05  Clean-path integrity     T13  Heavy loss stress (20%)    │
+│  T06  Retransmit under loss    T14  Small MSS / MTU 576        │
+│  T07  Survive reordering       T15  Rapid reconnect churn      │
+│  T08  Combined loss+reorder                                    │
+├──────────────────────────────────────────────────────────────────┤
+│  tls_suite.sh (15 tests)                                        │
+│  ──────────────────────────────────────────────────────────────  │
+│  T01  TLS 1.2 handshake        T09  Large payload / multi-rec  │
+│  T02  TLS 1.3 handshake        T10  Peer crash mid-handshake   │
+│  T03  Untrusted cert reject    T11  CHACHA20-POLY1305 cipher   │
+│  T04  TLS data transfer        T12  Expired cert rejection     │
+│  T05  Clean TLS shutdown       T13  Version downgrade block    │
+│  T06  Handshake TPS flood      T14  TLS under packet loss      │
+│  T07  Concurrent sessions      T15  Rapid session churn        │
+│  T08  AES-256-GCM cipher                                      │
+├──────────────────────────────────────────────────────────────────┤
+│  http1.1_suite.sh (21 tests)                                    │
+│  ──────────────────────────────────────────────────────────────  │
+│  T01  HTTP GET connectivity    T12  Clean-path integrity       │
+│  T02  HTTP connection rate     T13  POST-like upstream         │
+│  T03  Rate-limited HTTP        T14  Keep-Alive persistence     │
+│  T04  HTTP throughput TX       T15  Combined impairments       │
+│  T05  Concurrent streams       T16  Small MTU / mobile         │
+│  T06  Non-standard port        T17  Server restart resilience  │
+│  T07  Closed port RST          T18  GET via http command       │
+│  T08  HTTP under packet loss   T19  POST via http command      │
+│  T09  HTTP under high latency  T20  PUT via http command       │
+│  T10  Reconnection churn       T21  DELETE via http command    │
+│  T11  Server crash mid-conn                                    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 5.4 TLS / HTTPS Test Architecture
 
 The TLS and HTTPS tests add crypto acceleration testing to the NIC + QEMU tier:
 
@@ -809,7 +1068,7 @@ The TLS and HTTPS tests add crypto acceleration testing to the NIC + QEMU tier:
 vaigai uses the DPDK `crypto_qat` PMD; the VM server uses OpenSSL `qatengine`
 with the QAT device passed through via vfio-pci.
 
-### 5.4 Common Test Infrastructure
+### 5.5 Common Test Infrastructure
 
 All NIC-tier scripts share a common pattern:
 
@@ -826,19 +1085,4 @@ See [tls-test.md](tls-test.md), [https-test.md](https-test.md),
 [http-test.md](http-test.md), and [tcp-test.md](tcp-test.md) for
 detailed test plans and code coverage matrices.
 
-### 4.5 Shared State Inventory
 
-The following global state is accessed by both planes. Each is designed to be
-safe without mutual exclusion in the fast path:
-
-| State                      | Writer        | Reader        | Mechanism                  |
-|----------------------------|---------------|---------------|----------------------------|
-| `g_metrics[w]`             | Worker `w`    | Mgmt          | Exclusive write; racy read |
-| `g_arp[p].table`           | Mgmt          | Workers       | `rte_rwlock` (read-side only on workers) |
-| `g_arp_rings[p]`           | Workers       | Mgmt          | SPSC `rte_ring`            |
-| `g_udp_rings[p]`           | Workers       | Mgmt          | SPSC `rte_ring`            |
-| `g_ipc_rings[w]`           | Mgmt          | Worker `w`    | SPSC `rte_ring`            |
-| `g_ack_rings[w]`           | Worker `w`    | Mgmt          | SPSC `rte_ring`            |
-| `g_run`                    | Signal handler| All           | `volatile int`             |
-| `g_traffic`                | REST API      | Workers       | `volatile int`             |
-| `g_worker_ctx[w].tx_gen`   | Worker `w`    | Worker `w`    | Single owner (configured via IPC copy) |

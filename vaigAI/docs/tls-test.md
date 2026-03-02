@@ -6,6 +6,19 @@
 
 ---
 
+## At a Glance
+
+| | |
+|---|---|
+| **Script** | `tests/tls_nic.sh` |
+| **Transport** | Physical NIC loopback (XXV710 i40e 25 Gbps) |
+| **Peer** | QEMU VM: `openssl s_server` (:4433) |
+| **Crypto** | QAT DH895XCC hw offload ↔ OpenSSL software (2×2 matrix) |
+| **Tests** | T1: TLS TPS · T2: Bulk throughput · T3: Latency p50/p95/p99 · T4: Crypto matrix · T5: Concurrency |
+| **Code exercised** | `tls_engine.c` · `cryptodev.c` · `cert_mgr.c` · `tcp_fsm.c` · `histogram.c` |
+
+---
+
 ## 1. Topology
 
 ```

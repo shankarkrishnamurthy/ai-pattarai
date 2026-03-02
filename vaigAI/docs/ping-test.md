@@ -1,8 +1,24 @@
-# Test Architecture
+# ICMP Ping Test — veth Pair
 
-## ping_veth — ICMP over veth pair
+> **Scope:** ICMP echo request/reply over virtual Ethernet using AF_PACKET or AF_XDP PMDs.
+> No VM required — runs entirely in host namespaces.
 
-### Topology
+---
+
+## At a Glance
+
+| | |
+|---|---|
+| **Script** | `tests/ping_veth.sh` |
+| **Transport** | veth pair (AF_PACKET / AF_XDP) |
+| **Peer** | Alpine container (kernel ICMP responder) |
+| **Modes** | Interval (5 pings) · Flood (line-rate N seconds) |
+| **Pass** | All replies received (interval) · tx_pkts > 0 (flood) |
+| **Code exercised** | `icmp.c` · `ipv4.c` · `arp.c` · `ethernet.c` · `port_init.c` |
+
+---
+
+## Topology
 
 ```
  Host (root netns)                        Container netns

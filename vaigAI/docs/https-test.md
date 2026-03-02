@@ -6,6 +6,19 @@
 
 ---
 
+## At a Glance
+
+| | |
+|---|---|
+| **Script** | `tests/https_nic.sh` |
+| **Transport** | Physical NIC loopback (XXV710 i40e 25 Gbps) |
+| **Peer** | QEMU VM: nginx SSL (:443) with static files (1k/100k/1m) |
+| **Crypto** | QAT DH895XCC hw offload ↔ OpenSSL software (2×2 matrix) |
+| **Tests** | T1: HTTPS TPS · T2: Throughput · T3: Latency · T4: Crypto matrix · T5: Concurrency |
+| **Code exercised** | `http11.c` · `tls_engine.c` · `cryptodev.c` · `tcp_fsm.c` · `config_mgr.c` |
+
+---
+
 ## TLS vs HTTPS Test Comparison
 
 | Aspect | `tls_nic.sh` | `https_nic.sh` |

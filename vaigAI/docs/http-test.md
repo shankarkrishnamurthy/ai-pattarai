@@ -6,6 +6,18 @@
 
 ---
 
+## At a Glance
+
+| | |
+|---|---|
+| **Script** | `tests/http_nic.sh` |
+| **Transport** | Physical NIC loopback (ConnectX-4 mlx5 50 Gbps) |
+| **Peer** | QEMU VM: nginx (:80) · socat echo/discard/chargen |
+| **Tests** | Connectivity · T1: HTTP RPS (unlimited + rate-limited) · T2: TCP throughput |
+| **Code exercised** | `tcp_fsm.c` · `http11.c` · `tx_gen.c` · `tcp_congestion.c` · `port_init.c` (mlx5) |
+
+---
+
 ## 1. Topology
 
 ```

@@ -1,6 +1,18 @@
 # TCP Test Plan — Dual TAP + Bridge + Firecracker
 
-> Scope: **TCP only.** HTTP and TLS tests are covered separately.
+> **Scope:** TCP-only correctness and throughput. HTTP and TLS tests are covered separately.
+
+---
+
+## At a Glance
+
+| | |
+|---|---|
+| **Script** | `tests/tcp_tap.sh` |
+| **Transport** | TAP PMD → bridge → Firecracker microVM |
+| **Peer** | Alpine VM: socat echo (:5000) · discard (:5001) · chargen (:5002) |
+| **Tests** | T1: SYN flood CPS · T2: Full lifecycle · T3: Bidirectional throughput |
+| **Code exercised** | `tcp_fsm.c` · `tcp_tcb.c` · `tcp_congestion.c` · `tcp_timer.c` · `tcp_port_pool.c` |
 
 ---
 

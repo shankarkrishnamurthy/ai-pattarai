@@ -1,8 +1,24 @@
-# Test Architecture
+# UDP Test — veth Pair
 
-## udp_veth — UDP over veth pair
+> **Scope:** UDP datagram generation over virtual Ethernet with kernel-side
+> cross-validation via `/proc/net/snmp` NoPorts counter.
 
-### Topology
+---
+
+## At a Glance
+
+| | |
+|---|---|
+| **Script** | `tests/udp_veth.sh` |
+| **Transport** | veth pair (AF_PACKET / AF_XDP) |
+| **Peer** | Alpine container (no listener → NoPorts++) |
+| **Modes** | Rate-limited (1000 pps) · Flood (line-rate N seconds) |
+| **Pass** | `udp_tx ≈ NoPorts delta` (rate) · `udp_tx > 0` (flood) |
+| **Code exercised** | `udp.c` · `tx_gen.c` · `ipv4.c` · `ethernet.c` · `metrics.c` |
+
+---
+
+## Topology
 
 ```
  Host (root netns)                        Container netns
