@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include "../common/types.h"
 #include <rte_common.h>
+#include "histogram.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -86,6 +87,9 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 extern worker_metrics_t g_metrics[TGEN_MAX_WORKERS];
 
+/* Per-worker latency histograms (TLS handshake latency in µs). */
+extern histogram_t g_latency_hist[TGEN_MAX_WORKERS];
+
 /* ------------------------------------------------------------------ */
 /* Fast increment macros (no atomics — same lcore owns each slab)       */
 /* ------------------------------------------------------------------ */
@@ -148,6 +152,7 @@ extern worker_metrics_t g_metrics[TGEN_MAX_WORKERS];
 typedef struct {
     worker_metrics_t total;
     worker_metrics_t per_worker[TGEN_MAX_WORKERS];
+    histogram_t      latency;   /* aggregated across all workers */
     uint32_t         n_workers;
 } metrics_snapshot_t;
 

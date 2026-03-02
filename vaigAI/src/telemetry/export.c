@@ -2,6 +2,7 @@
  * vaigAI: Metrics export implementations.
  */
 #include "export.h"
+#include "histogram.h"
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
@@ -35,8 +36,12 @@ export_json(const metrics_snapshot_t *snap, char *buf, size_t len)
         "  \"tcp_ooo_pkts\": %"PRIu64",\n"
         "  \"tcp_payload_tx\": %"PRIu64", \"tcp_payload_rx\": %"PRIu64",\n"
         "  \"http_req_tx\": %"PRIu64", \"http_rsp_rx\": %"PRIu64",\n"
-        "  \"http_2xx\": %"PRIu64", \"http_4xx\": %"PRIu64",\n"
-        "  \"tls_ok\": %"PRIu64", \"tls_fail\": %"PRIu64"\n"
+        "  \"http_rsp_1xx\": %"PRIu64", \"http_rsp_2xx\": %"PRIu64",\n"
+        "  \"http_rsp_3xx\": %"PRIu64", \"http_rsp_4xx\": %"PRIu64",\n"
+        "  \"http_rsp_5xx\": %"PRIu64", \"http_parse_err\": %"PRIu64",\n"
+        "  \"tls_handshake_ok\": %"PRIu64", \"tls_handshake_fail\": %"PRIu64",\n"
+        "  \"tls_records_tx\": %"PRIu64", \"tls_records_rx\": %"PRIu64",\n"
+        "  \"p50\": %"PRIu64", \"p95\": %"PRIu64", \"p99\": %"PRIu64"\n"
         "}\n",
         snap->n_workers,
         t->tx_pkts, t->tx_bytes,
@@ -58,8 +63,14 @@ export_json(const metrics_snapshot_t *snap, char *buf, size_t len)
         t->tcp_ooo_pkts,
         t->tcp_payload_tx, t->tcp_payload_rx,
         t->http_req_tx,   t->http_rsp_rx,
-        t->http_rsp_2xx,  t->http_rsp_4xx,
-        t->tls_handshake_ok, t->tls_handshake_fail);
+        t->http_rsp_1xx,  t->http_rsp_2xx,
+        t->http_rsp_3xx,  t->http_rsp_4xx,
+        t->http_rsp_5xx,  t->http_parse_err,
+        t->tls_handshake_ok, t->tls_handshake_fail,
+        t->tls_records_tx, t->tls_records_rx,
+        hist_percentile(&snap->latency, 50.0),
+        hist_percentile(&snap->latency, 95.0),
+        hist_percentile(&snap->latency, 99.0));
     return n;
 }
 

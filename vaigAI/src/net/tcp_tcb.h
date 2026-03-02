@@ -110,6 +110,9 @@ typedef struct {
     uint64_t    app_state;
     void       *app_ctx;     /* pointer to L7 context (HTTP, TLS, etc.) */
 
+    /* TLS handshake timing (TSC at handshake start) */
+    uint64_t    tls_hs_start_tsc;
+
     /* Valid flag */
     bool        in_use;
 } tcb_t;

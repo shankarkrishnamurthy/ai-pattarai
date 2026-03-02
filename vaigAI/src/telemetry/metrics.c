@@ -7,6 +7,9 @@
 /* Global array — one cache-line-aligned slab per worker. */
 worker_metrics_t g_metrics[TGEN_MAX_WORKERS];
 
+/* Per-worker latency histograms. */
+histogram_t g_latency_hist[TGEN_MAX_WORKERS];
+
 void
 metrics_snapshot(metrics_snapshot_t *snap, uint32_t n_workers)
 {
@@ -42,11 +45,27 @@ metrics_snapshot(metrics_snapshot_t *snap, uint32_t n_workers)
         ACC(http_parse_err);
 #undef ACC
     }
+
+    /* Aggregate latency histograms across workers */
+    hist_reset(&snap->latency);
+    for (uint32_t w = 0; w < n_workers && w < TGEN_MAX_WORKERS; w++) {
+        for (uint32_t b = 0; b < HIST_BUCKETS; b++) {
+            snap->latency.counts[b] += g_latency_hist[w].counts[b];
+            snap->latency.total_count += g_latency_hist[w].counts[b];
+        }
+        snap->latency.total_sum_us += g_latency_hist[w].total_sum_us;
+        if (g_latency_hist[w].min_us < snap->latency.min_us)
+            snap->latency.min_us = g_latency_hist[w].min_us;
+        if (g_latency_hist[w].max_us > snap->latency.max_us)
+            snap->latency.max_us = g_latency_hist[w].max_us;
+    }
 }
 
 void
 metrics_reset(uint32_t n_workers)
 {
-    for (uint32_t w = 0; w < n_workers && w < TGEN_MAX_WORKERS; w++)
+    for (uint32_t w = 0; w < n_workers && w < TGEN_MAX_WORKERS; w++) {
         memset(&g_metrics[w], 0, sizeof(worker_metrics_t));
+        hist_reset(&g_latency_hist[w]);
+    }
 }

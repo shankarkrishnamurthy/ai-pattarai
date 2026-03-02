@@ -15,6 +15,10 @@
 #include "../core/core_assign.h"
 #include "../common/util.h"
 #include "../telemetry/metrics.h"
+#include "../telemetry/histogram.h"
+#include "../tls/tls_session.h"
+#include "../tls/tls_engine.h"
+#include "../telemetry/log.h"
 
 #include <string.h>
 #include <netinet/in.h>
@@ -31,6 +35,17 @@
 #define SEQ_LE(a,b)   ((int32_t)((a)-(b)) <= 0)
 #define SEQ_GT(a,b)   ((int32_t)((a)-(b)) >  0)
 #define SEQ_GE(a,b)   ((int32_t)((a)-(b)) >= 0)
+
+/* ── Detach TLS session before freeing a TCB ─────────────────────────────── */
+static inline void
+tls_detach_if_needed(uint32_t worker_idx, tcb_t *tcb)
+{
+    if (tcb->app_state >= 2) {
+        uint32_t ci = (uint32_t)(tcb - g_tcb_stores[worker_idx].tcbs);
+        tls_session_detach(worker_idx, ci);
+        tcb->app_state = 0;
+    }
+}
 
 /* ── Build and send a TCP segment ────────────────────────────────────────── */
 static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
@@ -244,6 +259,38 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcp_send_segment(worker_idx, tcb,
                               RTE_TCP_ACK_FLAG,
                               NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
+
+            /* ── TLS handshake initiation ─────────────────────────── */
+            if (tcb->app_state == 1) { /* TLS requested */
+                uint32_t conn_idx = (uint32_t)(tcb - g_tcb_stores[worker_idx].tcbs);
+                int trc = tls_session_attach(worker_idx, conn_idx, false, NULL);
+                if (trc == 0) {
+                    tcb->app_state = 2; /* TLS handshaking */
+                    tcb->tls_hs_start_tsc = rte_rdtsc();
+                    tls_session_t *sess = tls_session_get(worker_idx, conn_idx);
+                    if (sess) {
+                        uint8_t tls_out[4096];
+                        size_t  tls_out_len = sizeof(tls_out);
+                        int hr = tls_handshake(sess, NULL, 0, tls_out, &tls_out_len);
+                        if (tls_out_len > 0)
+                            tcp_fsm_send(worker_idx, tcb, tls_out, (uint32_t)tls_out_len);
+                        if (hr == 1) {
+                            tcb->app_state = 3; /* TLS established */
+                            worker_metrics_add_tls_ok(worker_idx);
+                            uint64_t lat_us = (rte_rdtsc() - tcb->tls_hs_start_tsc)
+                                              * 1000000ULL / rte_get_tsc_hz();
+                            hist_record(&g_latency_hist[worker_idx], lat_us);
+                        } else if (hr < 0) {
+                            tcb->app_state = 0;
+                            worker_metrics_add_tls_fail(worker_idx);
+                        }
+                    }
+                } else {
+                    tcb->app_state = 0;
+                    worker_metrics_add_tls_fail(worker_idx);
+                    TGEN_ERR(TGEN_LOG_TLS, "tls_session_attach failed: %d\n", trc);
+                }
+            }
         }
         break;
 
@@ -302,7 +349,50 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                 tcb->delayed_ack_tsc = rte_rdtsc() +
                     TCP_DELAYED_ACK_US * g_tsc_hz / 1000000ULL;
                 worker_metrics_add_tcp_payload_rx(worker_idx, data_len);
-                /* TODO: pass data to L7 */
+
+                /* ── L7: TLS handshake / decrypt ──────────────────── */
+                if (tcb->app_state == 2 || tcb->app_state == 3) {
+                    uint32_t ci = (uint32_t)(tcb - g_tcb_stores[worker_idx].tcbs);
+                    tls_session_t *ts = tls_session_get(worker_idx, ci);
+                    if (ts) {
+                        const uint8_t *payload_data =
+                            (const uint8_t *)tcp + hdr_len;
+                        if (tcb->app_state == 2) {
+                            /* TLS handshake in progress */
+                            uint8_t tls_out[4096];
+                            size_t  tls_out_len = sizeof(tls_out);
+                            int hr = tls_handshake(ts, payload_data, data_len,
+                                                   tls_out, &tls_out_len);
+                            if (tls_out_len > 0) {
+                                tcp_fsm_send(worker_idx, tcb,
+                                             tls_out, (uint32_t)tls_out_len);
+                                worker_metrics_add_tls_tx(worker_idx);
+                            }
+                            if (hr == 1) {
+                                tcb->app_state = 3;
+                                worker_metrics_add_tls_ok(worker_idx);
+                                uint64_t lat_us = (rte_rdtsc() - tcb->tls_hs_start_tsc)
+                                                  * 1000000ULL / rte_get_tsc_hz();
+                                hist_record(&g_latency_hist[worker_idx], lat_us);
+                                /* For flood/CPS mode: close after TLS done
+                                 * so server can accept next connection.
+                                 * Throughput mode will override app_ctx. */
+                                if (!tcb->app_ctx)
+                                    tcp_fsm_close(worker_idx, tcb);
+                            } else if (hr < 0) {
+                                tcb->app_state = 0;
+                                worker_metrics_add_tls_fail(worker_idx);
+                            }
+                        } else {
+                            /* TLS established — decrypt */
+                            uint8_t plain[4096];
+                            int n = tls_decrypt(ts, payload_data, data_len,
+                                                plain, sizeof(plain));
+                            if (n > 0)
+                                worker_metrics_add_tls_rx(worker_idx);
+                        }
+                    }
+                }
             }
         }
 
@@ -375,6 +465,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
 
     case TCP_LAST_ACK:
         if (flags & RTE_TCP_ACK_FLAG) {
+            tls_detach_if_needed(worker_idx, tcb);
             tcb_free(&g_tcb_stores[worker_idx], tcb);
             worker_metrics_add_tcp_conn_close(worker_idx);
         }
@@ -391,6 +482,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
     /* RST processing — only for active connections (not TIME_WAIT or already freed) */
     if ((flags & RTE_TCP_RST_FLAG) && tcb->in_use &&
         tcb->state != TCP_TIME_WAIT) {
+        tls_detach_if_needed(worker_idx, tcb);
         tcb_free(&g_tcb_stores[worker_idx], tcb);
         worker_metrics_add_tcp_reset_rx(worker_idx);
     }
@@ -433,6 +525,9 @@ tcb_t *tcp_fsm_connect(uint32_t worker_idx,
     tcb->lcore_id     = (uint8_t)rte_lcore_id();
     tcb->active_open  = true;
     tcb->ts_enabled   = true;
+    /* Store creation time for TLS handshake timeout.
+     * Reuses timewait_deadline_tsc (only used in TIME_WAIT state). */
+    tcb->timewait_deadline_tsc = rte_rdtsc();
 
     tcp_send_segment(worker_idx, tcb, RTE_TCP_SYN_FLAG,
                       NULL, 0, tcb->snd_nxt, 0);
@@ -463,6 +558,7 @@ void tcp_fsm_reset(uint32_t worker_idx, tcb_t *tcb)
 {
     tcp_send_segment(worker_idx, tcb, RTE_TCP_RST_FLAG | RTE_TCP_ACK_FLAG,
                       NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
+    tls_detach_if_needed(worker_idx, tcb);
     tcb_free(&g_tcb_stores[worker_idx], tcb);
     worker_metrics_add_tcp_reset_sent(worker_idx);
 }
