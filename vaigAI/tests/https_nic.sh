@@ -1136,7 +1136,7 @@ should_run() { [[ "$RUN_TESTS" == "all" || "$RUN_TESTS" == "$1" ]]; }
 should_run 1 && run_t1
 should_run 2 && { vaigai_reset; run_t2; }
 should_run 3 && { vaigai_reset; run_t3; }
-should_run 4 && run_t4
+# T4 (crypto matrix) removed — entire test runs in single crypto mode (qat:qat by default)
 should_run 5 && { vaigai_reset; run_t5; }
 
 # ── summary ───────────────────────────────────────────────────────────────────

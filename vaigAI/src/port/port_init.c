@@ -95,6 +95,10 @@ static int port_setup(uint16_t port_id,
     if (!caps->has_rss)
         n_rxq = 1; /* single-queue fallback */
 
+    /* TAP PMD requires equal RX and TX queue counts */
+    if (caps->driver == DRIVER_TAP && n_txq > n_rxq)
+        n_txq = n_rxq;
+
     struct rte_eth_conf port_conf;
     memset(&port_conf, 0, sizeof(port_conf));
 
@@ -239,7 +243,9 @@ int tgen_ports_init(uint32_t num_rx_desc, uint32_t num_tx_desc)
         if (port_setup(port_id, n_queues, n_txq,
                        num_rx_desc, num_tx_desc, mp) < 0)
             return -1;
-        g_port_caps[port_id].mgmt_tx_q = (uint16_t)n_queues;
+        /* TAP shares worker queue 0 (no extra mgmt TX queue) */
+        g_port_caps[port_id].mgmt_tx_q =
+            (g_port_caps[port_id].driver == DRIVER_TAP) ? 0 : (uint16_t)n_queues;
 
         /* Run soft NIC post-init if needed */
         soft_nic_post_init(port_id, &g_port_caps[port_id]);

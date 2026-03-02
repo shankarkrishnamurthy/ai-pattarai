@@ -76,6 +76,7 @@ done
 # ── parameterised config ─────────────────────────────────────────────────────
 NIC_PCI_VAIGAI="${NIC_PCI_VAIGAI:-0000:95:00.0}"
 NIC_PCI_VM="${NIC_PCI_VM:-0000:95:00.1}"
+NIC_IFACE_VAIGAI="${NIC_IFACE_VAIGAI:-}"
 NIC_IFACE_VM="${NIC_IFACE_VM:-ens30f1np1}"
 VAIGAI_IP="${VAIGAI_IP:-10.0.0.1}"
 VM_IP="${VM_IP:-10.0.0.2}"
@@ -281,31 +282,35 @@ vaigai_stop() {
 #  VFIO-PCI bind/unbind helpers
 # ══════════════════════════════════════════════════════════════════════════════
 ORIG_DRIVER_VM=""
+ORIG_DRIVER_VAIGAI=""
 
 vfio_bind() {
     local pci_addr="$1"
     local iface="$2"
+    local orig_var="$3"
 
     # Load vfio-pci if needed
     modprobe vfio-pci 2>/dev/null || true
 
     # Record original driver
-    ORIG_DRIVER_VM=$(basename "$(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null)" 2>/dev/null || echo "")
+    local orig_drv
+    orig_drv=$(basename "$(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null)" 2>/dev/null || echo "")
+    eval "$orig_var=\"$orig_drv\""
 
-    if [[ "$ORIG_DRIVER_VM" == "vfio-pci" ]]; then
+    if [[ "$orig_drv" == "vfio-pci" ]]; then
         info "NIC $pci_addr already bound to vfio-pci"
         return 0
     fi
 
     # Bring interface down first
-    if ip link show "$iface" &>/dev/null; then
+    if [[ -n "$iface" ]] && ip link show "$iface" &>/dev/null; then
         ip link set "$iface" down 2>/dev/null || true
     fi
 
     # Unbind from current driver
-    if [[ -n "$ORIG_DRIVER_VM" ]]; then
-        info "Unbinding $pci_addr from $ORIG_DRIVER_VM"
-        echo "$pci_addr" > "/sys/bus/pci/drivers/$ORIG_DRIVER_VM/unbind" 2>/dev/null || true
+    if [[ -n "$orig_drv" ]]; then
+        info "Unbinding $pci_addr from $orig_drv"
+        echo "$pci_addr" > "/sys/bus/pci/drivers/$orig_drv/unbind" 2>/dev/null || true
         sleep 0.5
     fi
 
@@ -321,7 +326,7 @@ vfio_bind() {
     local cur_driver
     cur_driver=$(basename "$(readlink -f /sys/bus/pci/devices/$pci_addr/driver 2>/dev/null)" 2>/dev/null || echo "")
     if [[ "$cur_driver" == "vfio-pci" ]]; then
-        info "Bound $pci_addr to vfio-pci (was: $ORIG_DRIVER_VM)"
+        info "Bound $pci_addr to vfio-pci (was: $orig_drv)"
     else
         die "Failed to bind $pci_addr to vfio-pci (current: $cur_driver)"
     fi
@@ -534,14 +539,25 @@ teardown() {
     if [[ -n "$ORIG_DRIVER_VM" ]] && [[ "$ORIG_DRIVER_VM" != "vfio-pci" ]]; then
         vfio_unbind "$NIC_PCI_VM" "$ORIG_DRIVER_VM"
     fi
+    # Restore vaigAI NIC to original driver (non-bifurcated mode)
+    if [[ -n "$ORIG_DRIVER_VAIGAI" ]] && [[ "$ORIG_DRIVER_VAIGAI" != "vfio-pci" ]]; then
+        vfio_unbind "$NIC_PCI_VAIGAI" "$ORIG_DRIVER_VAIGAI"
+    fi
 }
 trap teardown EXIT
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Step 1: Bind VM NIC to vfio-pci
+#  Step 1: Bind NICs to vfio-pci
 # ══════════════════════════════════════════════════════════════════════════════
 info "Step 1: Binding $NIC_PCI_VM to vfio-pci for passthrough"
-vfio_bind "$NIC_PCI_VM" "$NIC_IFACE_VM"
+vfio_bind "$NIC_PCI_VM" "$NIC_IFACE_VM" ORIG_DRIVER_VM
+
+# For non-bifurcated NICs (e.g. Intel i40e), also bind vaigAI NIC to vfio-pci
+VAIGAI_NIC_DRIVER=$(basename "$(readlink -f /sys/bus/pci/devices/$NIC_PCI_VAIGAI/driver 2>/dev/null)" 2>/dev/null || echo "")
+if [[ "$VAIGAI_NIC_DRIVER" != "mlx5_core" ]]; then
+    info "Step 1b: Binding vaigAI NIC $NIC_PCI_VAIGAI to vfio-pci (non-bifurcated mode)"
+    vfio_bind "$NIC_PCI_VAIGAI" "$NIC_IFACE_VAIGAI" ORIG_DRIVER_VAIGAI
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Step 2: Start QEMU VM with PCI passthrough
@@ -550,9 +566,9 @@ info "Step 2: Starting QEMU VM"
 qemu_start
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Step 3: Start vaigai on DPDK mlx5
+#  Step 3: Start vaigai on DPDK NIC PMD
 # ══════════════════════════════════════════════════════════════════════════════
-info "Step 3: Starting vaigai (DPDK mlx5 PMD on $NIC_PCI_VAIGAI)"
+info "Step 3: Starting vaigai (DPDK PMD on $NIC_PCI_VAIGAI)"
 vaigai_start
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -185,9 +185,11 @@ cmd_tps(int argc, char **argv)
 
     /* ── Backward compat: skip legacy protocol keyword if present ──── */
     int ip_idx = 1;
+    const char *cli_proto = NULL;
     if (strcmp(argv[1], "tcp")  == 0 || strcmp(argv[1], "http") == 0 ||
         strcmp(argv[1], "udp")  == 0 || strcmp(argv[1], "icmp") == 0 ||
         strcmp(argv[1], "tls")  == 0 || strcmp(argv[1], "https") == 0) {
+        cli_proto = argv[1];
         ip_idx = 2;
         if (argc < 4) {
             printf("Usage: tps <dst_ip> <duration_s>"
@@ -196,7 +198,20 @@ cmd_tps(int argc, char **argv)
         }
     }
 
-    tx_gen_proto_t proto = tps_detect_proto();
+    /* CLI protocol keyword overrides config file */
+    tx_gen_proto_t proto;
+    if (cli_proto) {
+        if (strcmp(cli_proto, "icmp") == 0)
+            proto = TX_GEN_PROTO_ICMP;
+        else if (strcmp(cli_proto, "udp") == 0)
+            proto = TX_GEN_PROTO_UDP;
+        else if (strcmp(cli_proto, "http") == 0 || strcmp(cli_proto, "https") == 0)
+            proto = TX_GEN_PROTO_HTTP;
+        else
+            proto = TX_GEN_PROTO_TCP_SYN;
+    } else {
+        proto = tps_detect_proto();
+    }
 
     /* ── Parse destination IP ───────────────────────────────────────── */
     uint32_t dst_ip;
