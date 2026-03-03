@@ -131,7 +131,7 @@ bash tests/ping_veth.sh --xdp --flood 5
 │  RUN                                                        │
 │                                                             │
 │  stdin ──► "ping 192.168.200.2 5 56 1000"  ──┐             │
-│            or "tps 192.168.200.2 Ns"          ├──► vaigai  │
+│            or "start --proto icmp ..."       ├──► vaigai  │
 │            "quit"                            ──┘             │
 │                                                 │           │
 │  stdout ◄── capture all output ◄────────────────┘           │

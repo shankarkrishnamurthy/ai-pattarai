@@ -312,10 +312,10 @@ The TX generator produces synthetic traffic from worker cores, controlled by the
 management plane via IPC.
 
 ```
-  CLI: "tps 10.0.0.1 3 1000 64 9"
+  CLI: "start --proto udp --ip 10.0.0.1 --duration 3 --rate 1000 --size 64 --port 9"
        │
        ▼
-  cmd_tps()                                           ── mgmt core ──
+  cmd_start()                                         ── mgmt core ──
   ├── ARP-resolve destination MAC (3 s timeout)
   ├── Build tx_gen_config_t
   ├── metrics_reset()
@@ -548,7 +548,7 @@ non-blocking operation:
 
 TCP data transfer is driven by the FSM, not `tx_gen_burst()`. The mgmt core
 calls `tcp_fsm_connect()` + `tcp_fsm_send()` on behalf of CLI commands like
-`throughput`.
+`start --reuse --streams`.
 
 ```
   tcp_fsm_send(worker_idx, tcb, data, len)
@@ -612,7 +612,7 @@ The management core **pulls on demand** — only when a human or HTTP client ask
                                │  ─────────────────────│
                                │  CLI "stats"  snapshot │
                                │  GET /stats   snapshot │
-                               │  tps loop     1 Hz    │
+                               │  start loop   1 Hz    │
                                └───────┬───────────────┘
                                        │ render
                           ┌────────────┴────────────┐
@@ -630,7 +630,7 @@ Management never writes to `g_metrics[]`. Ownership is strict and one-directiona
 |---------|-------------|-----------|
 | CLI `stats` command | mgmt core (readline thread) | once per keystroke |
 | REST `GET /api/v1/stats` | libmicrohttpd thread on mgmt core | once per HTTP request |
-| `tps` live progress | mgmt core in sleep loop | 1 Hz for the tps duration |
+| `start` live progress | mgmt core in sleep loop | 1 Hz for the start duration |
 
 There is **no periodic background scrape** and **no metric log file**.
 If nobody asks, nobody reads — worker slabs accumulate silently.
@@ -798,16 +798,12 @@ vaigai> help
 | `help` | `help` | List available commands |
 | `stats` | `stats` | Print metrics snapshot (JSON) |
 | `ping` | `ping <ip> [count] [size] [interval_ms]` | ICMP echo request |
-| `tps` | `tps <ip> <dur_s> [rate] [size] [port]` | Transactions/sec (protocol from config) |
-| `throughput` | `throughput tx <ip> <port> <dur_s> [streams]` | TCP TX throughput (iperf3-like) |
-| | `throughput rx <port> <dur_s>` | TCP RX throughput (passive) |
+| `start` | `start --proto <proto> --ip <ip> --duration <s> [--rate <pps>] [--size <bytes>] [--port <port>] [--tls] [--reuse] [--streams <n>]` | Start traffic generation |
 | `stop` | `stop` | Stop active traffic generation |
 | `reset` | `reset` | RST all TCBs, reset port pools + metrics |
 | `trace` | `trace start [port] [queue] [count]` | Start packet capture |
 | | `trace stop` | Stop capture |
 | | `trace save <file.pcapng>` | Save capture to pcapng |
-| `load` | `load <config.json>` | Load JSON configuration |
-| `save` | `save <config.json>` | Save current config to JSON |
 | `quit` | `quit` | Graceful shutdown |
 
 ### 4.4 REST API
@@ -849,19 +845,19 @@ REST server runs on the management core via `libmicrohttpd`.
 }
 ```
 
-Loaded from `$VAIGAI_CONFIG` env var at startup or via CLI `load` command.
+Loaded from `$VAIGAI_CONFIG` env var at startup.
 `config_push_to_workers()` distributes flow profiles to the ARP subsystem.
 
 ### 4.6 How They Work Together — Concrete Scenarios
 
-#### Scenario 1: `tps 10.0.0.1 3 1000 64 9`
+#### Scenario 1: `start --proto udp --ip 10.0.0.1 --duration 3 --rate 1000 --size 64 --port 9`
 
 ```
   Time ──────────────────────────────────────────────────────────►
 
   Mgmt Core                         Worker 0        Worker 1
   ─────────                         ────────        ────────
-  cmd_tps() parses args
+  cmd_start() parses args
   arp_request(10.0.0.1)
   arp_mgmt_tick() ← poll ARP ring
   [ARP reply arrives] →             arp_input()

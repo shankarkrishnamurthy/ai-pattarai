@@ -100,7 +100,7 @@ with nginx — for HTTP/1.0 connection-per-request patterns, **CPS ≈ RPS**.
 #### T1a — Unlimited Flood
 
 ```
-vaigai>  tps 10.0.0.2 10 0 56 80
+vaigai>  start --proto http --ip 10.0.0.2 --duration 10 --size 56 --port 80
 ```
 
 | Metric | Pass |
@@ -111,7 +111,7 @@ vaigai>  tps 10.0.0.2 10 0 56 80
 #### T1b — Rate-Limited
 
 ```
-vaigai>  tps 10.0.0.2 10 5000 56 80
+vaigai>  start --proto http --ip 10.0.0.2 --duration 10 --rate 5000 --size 56 --port 80
 ```
 
 | Metric | Pass |
@@ -147,7 +147,7 @@ vaigAI opens 4 parallel TCP streams and pumps zero-fill data continuously.
 ```
 
 ```
-vaigai>  throughput tx 10.0.0.2 5001 10 4
+vaigai>  start --ip 10.0.0.2 --port 5001 --duration 10 --reuse --streams 4
 ```
 
 | Metric | Pass |
@@ -213,11 +213,11 @@ vaigai>  throughput tx 10.0.0.2 5001 10 4
 │  RUN                                                                 │
 │                                                                      │
 │  Connectivity ─► ping 10.0.0.2 (retry ×5)                           │
-│  T1a ──────────► tps 10.0.0.2 10 0 56 80           (unlimited)      │
+│  T1a ──────────► start --proto http ... --port 80      (unlimited)     │
 │  reset                                                               │
-│  T1b ──────────► tps 10.0.0.2 10 5000 56 80        (rate-limited)   │
+│  T1b ──────────► start ... --rate 5000                (rate-limited)  │
 │  reset                                                               │
-│  T2 ───────────► throughput tx 10.0.0.2 5001 10 4                    │
+│  T2 ───────────► start ... --port 5001 --reuse --streams 4           │
 │                                                                      │
 │  After each command: stats → JSON parse → assert                     │
 └─────────────────────────────┬────────────────────────────────────────┘

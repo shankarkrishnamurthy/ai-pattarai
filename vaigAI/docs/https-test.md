@@ -155,7 +155,7 @@ request serialization and response parsing overhead.
 #### T1a — Unlimited Flood (peak discovery)
 
 ```
-vaigai>  tps 10.0.0.2 10 0 56 443
+vaigai>  start --proto https --ip 10.0.0.2 --duration 10 --size 56 --port 443 --tls
 ```
 
 | Metric | Pass |
@@ -171,7 +171,7 @@ vaigai>  tps 10.0.0.2 10 0 56 443
 #### T1b — Rate-Limited
 
 ```
-vaigai>  tps 10.0.0.2 10 5000 56 443
+vaigai>  start --proto https --ip 10.0.0.2 --duration 10 --rate 5000 --size 56 --port 443 --tls
 ```
 
 | Metric | Pass |
@@ -207,7 +207,7 @@ encryption + HTTP framing overhead.
 ```
 
 ```
-vaigai>  throughput tx 10.0.0.2 443 10 4
+vaigai>  start --ip 10.0.0.2 --port 443 --duration 10 --reuse --streams 4 --tls
 ```
 
 | Metric | Pass |
@@ -231,7 +231,7 @@ Rate-limited HTTPS transaction test with latency percentile capture.
 Measures full round-trip: SYN → TLS → HTTP GET → HTTP 200 → close.
 
 ```
-vaigai>  tps 10.0.0.2 10 2500 56 443
+vaigai>  start --proto https --ip 10.0.0.2 --duration 10 --rate 2500 --size 56 --port 443 --tls
 ```
 
 | Metric | Pass |
@@ -357,11 +357,11 @@ peak HTTPS TPS at each level.
 │  RUN                                                                 │
 │                                                                      │
 │  Connectivity ─► ping 10.0.0.2 (retry ×5)                           │
-│  T1a ──────────► tps ... 0 56 443             (unlimited HTTPS TPS) │
-│  T1b ──────────► tps ... 5000 56 443          (rate-limited)        │
-│  T2a ──────────► throughput tx ... 443 10 4   (unlimited Mbps)      │
-│  T2b ──────────► throughput tx ... 443 10 4   (rate-limited)        │
-│  T3  ──────────► tps ... 2500 56 443          (latency percentiles) │
+│  T1a ──────────► start --proto https ... --tls  (unlimited HTTPS TPS) │
+│  T1b ──────────► start ... --rate 5000 --tls   (rate-limited)        │
+│  T2a ──────────► start ... --reuse --streams 4 --tls (unlimited Mbps)│
+│  T2b ──────────► start ... --reuse --streams 4 --tls (rate-limited)  │
+│  T3  ──────────► start ... --rate 2500 --tls   (latency percentiles) │
 │  T4  ──────────► 2×2 matrix (restart per combo)                     │
 │  T5  ──────────► concurrency sweep [256..65536]                     │
 │                                                                      │

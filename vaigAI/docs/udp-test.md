@@ -110,10 +110,12 @@ bash tests/udp_veth.sh --xdp --flood-seconds 10
 │  RUN (one of two modes)                                     │
 │                                                             │
 │  Rate-limited (default):                                    │
-│  stdin ──► "tps 192.168.201.2 1 1000 64 9"       ──► vaigai│
+│  stdin ──► "start --proto udp --ip 192.168.201.2 ──► vaigai│
+│             --duration 1 --rate 1000 --size 64 --port 9"  │
 │                                                             │
 │  Flood (--flood-seconds N):                                 │
-│  stdin ──► "tps 192.168.201.2 Ns 0 64 9"        ──► vaigai │
+│  stdin ──► "start --proto udp --ip 192.168.201.2 ──► vaigai│
+│             --duration N --size 64 --port 9"               │
 │                                                             │
 │  Read container NoPorts before & after                      │
 └──────────────────────────┬──────────────────────────────────┘

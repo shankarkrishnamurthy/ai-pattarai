@@ -71,7 +71,7 @@ Init script starts three listeners:
 
 Benchmark connections per second.
 
-**CLI:** `tps 192.168.204.2 10 0 56 5000`
+**CLI:** `start --proto tcp --ip 192.168.204.2 --duration 10 --size 56 --port 5000`
 
 **Exercises:** `tcp_fsm_connect` · SYN option encoding · SYN_SENT→ESTABLISHED ·
 `tcb_alloc` hash insert · `tcp_port_alloc` churn · ARP resolution
@@ -89,7 +89,7 @@ Benchmark connections per second.
 
 Complete connection with bidirectional data via echo server.
 
-**CLI:** `throughput tx 192.168.204.2 5000 5 1`
+**CLI:** `start --ip 192.168.204.2 --port 5000 --duration 5 --reuse --streams 1`
 
 vaigAI connects, sends data, receives echoed data, closes.
 
@@ -114,7 +114,7 @@ Sustained TCP throughput measurement (iperf3 equivalent).
 
 vaigAI opens connections to discard server and pumps data.
 
-**CLI:** `throughput tx 192.168.204.2 5001 10 4`
+**CLI:** `start --ip 192.168.204.2 --port 5001 --duration 10 --reuse --streams 4`
 
 **VM:** `socat TCP-L:5001,fork,reuseaddr /dev/null` — reads and drops; kernel ACKs.
 
@@ -131,7 +131,7 @@ slow start → congestion avoidance · `snd_wnd` tracking · window scale
 
 VM chargen server connects to vaigAI listener and sends 1 GB.
 
-**CLI:** `throughput rx 5001 10`
+**CLI:** *(removed — `throughput rx` is no longer available)*
 
 **VM:** `socat TCP:192.168.204.1:5001 SYSTEM:'dd if=/dev/zero bs=64k count=16384'`
 

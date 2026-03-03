@@ -144,7 +144,7 @@ and symmetric cipher negotiation.
 #### T1a — Unlimited Flood (peak discovery)
 
 ```
-vaigai>  tps 10.0.0.2 10 0 56 4433
+vaigai>  start --proto tls --ip 10.0.0.2 --duration 10 --size 56 --port 4433 --tls
 ```
 
 | Metric | Pass |
@@ -156,7 +156,7 @@ vaigai>  tps 10.0.0.2 10 0 56 4433
 #### T1b — Rate-Limited
 
 ```
-vaigai>  tps 10.0.0.2 10 5000 56 4433
+vaigai>  start --proto tls --ip 10.0.0.2 --duration 10 --rate 5000 --size 56 --port 4433 --tls
 ```
 
 | Metric | Pass |
@@ -190,7 +190,7 @@ streams and pumps encrypted payload data continuously.
 ```
 
 ```
-vaigai>  throughput tx 10.0.0.2 4433 10 4
+vaigai>  start --ip 10.0.0.2 --port 4433 --duration 10 --reuse --streams 4 --tls
 ```
 
 | Metric | Pass |
@@ -212,7 +212,7 @@ Rate-limited handshake test with latency percentile capture.
 Uses half the `TARGET_CPS` rate to avoid saturation effects.
 
 ```
-vaigai>  tps 10.0.0.2 10 2500 56 4433
+vaigai>  start --proto tls --ip 10.0.0.2 --duration 10 --rate 2500 --size 56 --port 4433 --tls
 ```
 
 | Metric | Pass |
@@ -334,10 +334,10 @@ peak TPS at each level.
 │  RUN                                                                 │
 │                                                                      │
 │  Connectivity ─► ping 10.0.0.2 (retry ×5)                           │
-│  T1a ──────────► tps ... 0 56 4433           (unlimited — peak TPS) │
-│  T1b ──────────► tps ... 5000 56 4433        (rate-limited)         │
-│  T2  ──────────► throughput tx ... 4433 10 4 (bulk encrypted data)  │
-│  T3  ──────────► tps ... 2500 56 4433        (latency percentiles)  │
+│  T1a ──────────► start --proto tls ... --tls    (unlimited — peak TPS) │
+│  T1b ──────────► start ... --rate 5000 --tls   (rate-limited)         │
+│  T2  ──────────► start ... --reuse --streams 4 --tls (bulk encrypted) │
+│  T3  ──────────► start ... --rate 2500 --tls   (latency percentiles)  │
 │  T4  ──────────► 2×2 matrix (restart per combo, 5s flood + 5s tput) │
 │  T5  ──────────► concurrency sweep [256..65536] (5s flood each)     │
 │                                                                      │
