@@ -16,6 +16,7 @@
 #include "../telemetry/log.h"
 #include "../core/ipc.h"
 #include "../core/tx_gen.h"
+#include "../core/worker_loop.h"
 #include "../core/core_assign.h"
 #include "../tls/tls_session.h"
 #include "../tls/tls_engine.h"
@@ -84,14 +85,6 @@ cmd_save(int argc, char **argv)
     else        printf("Config saved to %s\n", argv[1]);
 }
 
-static void
-cmd_set_cps(int argc, char **argv)
-{
-    if (argc < 2) { printf("Usage: set-cps <value>\n"); return; }
-    g_config.load.target_cps = (uint64_t)strtoull(argv[1], NULL, 10);
-    config_push_to_workers();
-    printf("target_cps = %"PRIu64"\n", g_config.load.target_cps);
-}
 
 static void
 cmd_trace(int argc, char **argv)
@@ -498,190 +491,6 @@ cmd_throughput(int argc, char **argv)
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* http — HTTP transaction-per-second measurement                       */
-/* ------------------------------------------------------------------ */
-static void
-cmd_http(int argc, char **argv)
-{
-    extern volatile int g_run;
-    if (argc < 5) {
-        printf("Usage: http <get|post|put|delete> <dst_ip> <port>"
-               " <duration_s> [url=/] [streams=1] [body_size=0]\n");
-        return;
-    }
-
-    /* Parse method */
-    http_method_t method;
-    if      (strcmp(argv[1], "get")    == 0) method = HTTP_METHOD_GET;
-    else if (strcmp(argv[1], "post")   == 0) method = HTTP_METHOD_POST;
-    else if (strcmp(argv[1], "put")    == 0) method = HTTP_METHOD_PUT;
-    else if (strcmp(argv[1], "delete") == 0) method = HTTP_METHOD_DELETE;
-    else {
-        printf("http: unknown method '%s' (get|post|put|delete)\n", argv[1]);
-        return;
-    }
-
-    uint32_t dst_ip;
-    if (tgen_parse_ipv4(argv[2], &dst_ip) < 0) {
-        printf("http: invalid IP '%s'\n", argv[2]);
-        return;
-    }
-    uint16_t dst_port   = (uint16_t)strtoul(argv[3], NULL, 10);
-    uint32_t duration_s = (uint32_t)strtoul(argv[4], NULL, 10);
-    const char *url     = (argc >= 6) ? argv[5] : "/";
-    uint32_t streams    = (argc >= 7) ? (uint32_t)strtoul(argv[6], NULL, 10) : 1;
-    uint32_t body_size  = (argc >= 8) ? (uint32_t)strtoul(argv[7], NULL, 10) : 0;
-
-    if (duration_s == 0 || streams == 0) {
-        printf("http: duration and streams must be > 0\n");
-        return;
-    }
-    if (streams > 16) streams = 16;
-
-    uint16_t port_id   = 0;
-    uint32_t n_workers = g_core_map.num_workers;
-
-    /* ARP resolve */
-    struct rte_ether_addr dst_mac;
-    if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
-        arp_request(port_id, dst_ip);
-        uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
-        while (rte_rdtsc() < deadline) {
-            arp_mgmt_tick();
-            if (arp_lookup(port_id, dst_ip, &dst_mac)) break;
-            rte_delay_ms(10);
-        }
-    }
-    if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
-        printf("http: ARP failed for %s\n", argv[2]);
-        return;
-    }
-
-    /* Build HTTP request into worker-0 prebuilt slot */
-    static uint8_t body_buf[8192];
-    if (body_size > sizeof(body_buf)) body_size = sizeof(body_buf);
-    if (body_size > 0)
-        memset(body_buf, 'X', body_size);
-
-    static http_conn_t hconn;   /* ~1 MB — must not live on stack */
-    http11_conn_init(&hconn);
-    http_request_t req = {
-        .method       = method,
-        .url          = url,
-        .host         = argv[2],
-        .content_type = (body_size > 0) ? "application/octet-stream" : NULL,
-        .body         = (body_size > 0) ? body_buf : NULL,
-        .body_len     = body_size,
-        .keep_alive   = true,
-    };
-    int req_len = http11_tx_request(&hconn, &req);
-    if (req_len <= 0) {
-        printf("http: failed to build request\n");
-        return;
-    }
-
-    /* Populate prebuilt request for worker-driven send (keep-alive loop) */
-    http_prebuilt_req_t *hp = &g_http_req[0];
-    memcpy(hp->hdr, hconn.tx_hdr, (uint32_t)req_len);
-    hp->hdr_len    = (uint32_t)req_len;
-    hp->keep_alive = true;
-
-    metrics_reset(n_workers);
-
-    /* Open TCP connections (stagger to avoid first-SYN-ACK drop) */
-    uint32_t w = 0;
-    tcb_t *tcbs[16];
-    for (uint32_t i = 0; i < streams; i++) {
-        tcbs[i] = tcp_fsm_connect(w % n_workers,
-                      g_arp[port_id].local_ip, 0,
-                      dst_ip, dst_port, port_id);
-        if (!tcbs[i]) {
-            printf("http: connect failed for stream %u\n", i);
-            streams = i;
-            break;
-        }
-        w++;
-        rte_delay_ms(5);
-    }
-
-    /* Wait for ESTABLISHED (up to 3 s) */
-    {
-        uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
-        bool all_up = false;
-        while (rte_rdtsc() < deadline && !all_up) {
-            arp_mgmt_tick();
-            all_up = true;
-            for (uint32_t i = 0; i < streams; i++) {
-                if (tcbs[i] && tcbs[i]->state != TCP_ESTABLISHED)
-                    all_up = false;
-            }
-            if (!all_up) rte_delay_ms(1);
-        }
-    }
-
-    /* Arm each established stream for worker-driven HTTP keep-alive */
-    uint32_t active = 0;
-    for (uint32_t i = 0; i < streams; i++) {
-        if (tcbs[i] && tcbs[i]->state == TCP_ESTABLISHED) {
-            tcbs[i]->app_ctx   = hp;
-            tcbs[i]->app_state = 4; /* trigger first HTTP request */
-            active++;
-        }
-    }
-
-    printf("HTTP %s %s:%u%s  streams=%u (%u connected)  duration=%us\n",
-           argv[1], argv[2], dst_port, url, streams, active, duration_s);
-
-    /* Wait for duration — worker handles request/response loop */
-    uint64_t end_tsc = rte_rdtsc() + (uint64_t)duration_s * rte_get_tsc_hz();
-    while (rte_rdtsc() < end_tsc && g_run)
-        rte_delay_ms(100);
-
-    /* Close all */
-    for (uint32_t i = 0; i < streams; i++) {
-        if (tcbs[i] && tcbs[i]->in_use &&
-            tcbs[i]->state == TCP_ESTABLISHED) {
-            tcbs[i]->app_state = 0;
-            tcp_fsm_close(i % n_workers, tcbs[i]);
-        }
-    }
-    for (int g = 0; g < 50; g++) {
-        rte_delay_ms(100);
-        arp_mgmt_tick();
-        bool all_done = true;
-        for (uint32_t i = 0; i < streams; i++) {
-            if (tcbs[i] && tcbs[i]->state != TCP_TIME_WAIT
-                        && tcbs[i]->state != TCP_CLOSED
-                        && tcbs[i]->in_use)
-                all_done = false;
-        }
-        if (all_done) break;
-    }
-
-    /* Report */
-    metrics_snapshot_t snap;
-    metrics_snapshot(&snap, n_workers);
-    double rps = (double)snap.total.http_req_tx / (double)duration_s;
-    printf("\n--- HTTP statistics ---\n"
-           "Method: %s, Duration: %us, Streams: %u (%u connected)\n"
-           "Requests:  %"PRIu64" TX\n"
-           "Responses: %"PRIu64" RX "
-           "(2xx=%"PRIu64" 4xx=%"PRIu64" 5xx=%"PRIu64")\n"
-           "Parse errors: %"PRIu64"\n"
-           "Throughput: %.1f req/s\n",
-           argv[1], duration_s, streams, active,
-           snap.total.http_req_tx,
-           snap.total.http_rsp_rx,
-           snap.total.http_rsp_2xx, snap.total.http_rsp_4xx,
-           snap.total.http_rsp_5xx,
-           snap.total.http_parse_err,
-           rps);
-
-    printf("\n--- telemetry ---\n");
-    cli_print_stats();
-}
-
 static void
 cmd_stop_gen(int argc, char **argv)
 {
@@ -700,19 +509,19 @@ cmd_reset(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
-    /* Stop any active traffic generation first */
-    config_update_t stopcmd;
-    memset(&stopcmd, 0, sizeof(stopcmd));
-    stopcmd.cmd = CFG_CMD_STOP;
-    stopcmd.seq = 2;
-    tgen_ipc_broadcast(&stopcmd);
-
-    /* Brief pause so workers drain TX */
-    rte_delay_ms(50);
+    /* Refuse if traffic generation is still active */
+    uint32_t n_workers = g_core_map.num_workers;
+    for (uint32_t w = 0; w < n_workers; w++) {
+        if (__atomic_load_n(&g_worker_ctx[w].tx_gen.active,
+                            __ATOMIC_ACQUIRE)) {
+            printf("reset: traffic generation is still active — "
+                   "run 'stop' first.\n");
+            return;
+        }
+    }
 
     /* Send RST for all active TCBs so the remote side also cleans up.
      * Batch RSTs to avoid TX ring overflow (ring size is typically 2048). */
-    uint32_t n_workers = g_core_map.num_workers;
     for (uint32_t w = 0; w < n_workers; w++) {
         tcb_store_t *store = &g_tcb_stores[w];
         uint32_t batch = 0;
@@ -799,11 +608,8 @@ cli_run(void)
     cli_register("stats",    "Print current statistics", cmd_stats);
     cli_register("load",     "Load config JSON file",    cmd_load);
     cli_register("save",     "Save config JSON file",    cmd_save);
-    cli_register("set-cps",  "Set target connections/s", cmd_set_cps);
     cli_register("ping",     "ICMP ping: ping <ip> [count] [size] [ms]", cmd_ping);
     cli_register("tps",      "TPS measurement: tps <ip> <secs> [rate] [size] [port]", cmd_tps);
-    cli_register("flood",    "(alias for tps)", cmd_tps);
-    cli_register("http",     "HTTP TPS: http <get|post|put|delete> <ip> <port> <secs>", cmd_http);
     cli_register("throughput", "TCP throughput: throughput tx/rx <args>",  cmd_throughput);
     cli_register("stop",     "Stop active traffic generation",          cmd_stop_gen);
     cli_register("reset",   "Reset all TCP state (connections, ports)", cmd_reset);

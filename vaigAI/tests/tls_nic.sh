@@ -323,6 +323,8 @@ vaigai_reset() {
         warn "vaigai (PID $VAIGAI_PID) not running — cannot reset"
         return 1
     fi
+    echo "stop" >&7 2>/dev/null || true
+    sleep 1
     echo "reset" >&7 2>/dev/null || { warn "vaigai pipe broken"; return 1; }
     sleep 5
 }
@@ -993,8 +995,6 @@ run_t2() {
     vaigai_reset || true
 
     info "T2b: Rate-limited TLS throughput (${THROUGHPUT_DUR}s, target ${TARGET_CPS} cps)"
-    printf 'set-cps %s\n' "$TARGET_CPS" >&7 2>/dev/null || true
-    sleep 1
     vaigai_cmd "throughput tx $VM_IP $TLS_PORT $THROUGHPUT_DUR $THROUGHPUT_STREAMS"
 
     payload_tx=$(json_val tcp_payload_tx)

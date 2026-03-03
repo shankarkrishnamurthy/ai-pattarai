@@ -298,6 +298,8 @@ EOCFG
 }
 
 vaigai_reset() {
+    echo "stop" >&7
+    sleep 1
     echo "reset" >&7
     sleep 4
 }
@@ -923,8 +925,6 @@ run_t2() {
     vaigai_reset
 
     info "T2b: Rate-limited HTTPS throughput (${THROUGHPUT_DUR}s, target ${TARGET_CPS} cps)"
-    printf 'set-cps %s\n' "$TARGET_CPS" >&7
-    sleep 1
     vaigai_cmd "throughput tx $VM_IP 5001 $THROUGHPUT_DUR $THROUGHPUT_STREAMS"
 
     payload_tx=$(json_val tcp_payload_tx)

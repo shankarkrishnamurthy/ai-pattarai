@@ -138,7 +138,7 @@ vaigai_cmd() {
 
     printf '%s\n' "$cmd" >&7
 
-    # Wait based on command duration arg (field 4 for flood)
+    # Wait based on command duration arg (field 4 for tps)
     local dur
     dur=$(echo "$cmd" | awk '{print $4}')
     if [[ "$dur" =~ ^[0-9]+$ ]] && [[ "$dur" -gt 0 ]]; then
@@ -404,7 +404,7 @@ run_t1() {
     start_vaigai_trace "t1"
 
     # ── Run the flood command (triggers ARP) ──
-    vaigai_cmd "flood icmp $VM_IP 2 100 56"
+    vaigai_cmd "tps icmp $VM_IP 2 100 56"
 
     # ── Stop tracing and show captures ──
     stop_vaigai_trace "t1"
@@ -507,7 +507,7 @@ run_t3() {
     start_vaigai_trace "t3"
 
     # ── Run the flood ──
-    vaigai_cmd "flood icmp $VM_IP 3 50 56"
+    vaigai_cmd "tps icmp $VM_IP 3 50 56"
 
     # ── Stop tracing and show captures ──
     stop_vaigai_trace "t3"

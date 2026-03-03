@@ -11,7 +11,7 @@
 2. [Life of a Packet](#2-life-of-a-packet) — RX/TX paths, worker loop, protocol stack, HTTP parser, TLS, TCP flow control
 3. [Telemetry System](#3-telemetry-system) — metrics ownership, counters, histogram, export, logging
 4. [Control Plane / Data Plane](#4-control-plane--data-plane-segregation) — IPC, CLI, REST API, config, shared state
-5. [Test Infrastructure](#5-test-infrastructure) — scripts, topology tiers, protocol suites, coverage
+5. [Test Infrastructure](#5-test-infrastructure) — scripts, topology tiers, coverage
 
 ---
 
@@ -799,8 +799,6 @@ vaigai> help
 | `stats` | `stats` | Print metrics snapshot (JSON) |
 | `ping` | `ping <ip> [count] [size] [interval_ms]` | ICMP echo request |
 | `tps` | `tps <ip> <dur_s> [rate] [size] [port]` | Transactions/sec (protocol from config) |
-| `flood` | *(alias for `tps`)* | Same as `tps` |
-| `http` | `http <method> <ip> <port> <dur_s> [url] [streams] [body_sz]` | HTTP transaction test |
 | `throughput` | `throughput tx <ip> <port> <dur_s> [streams]` | TCP TX throughput (iperf3-like) |
 | | `throughput rx <port> <dur_s>` | TCP RX throughput (passive) |
 | `stop` | `stop` | Stop active traffic generation |
@@ -810,7 +808,6 @@ vaigai> help
 | | `trace save <file.pcapng>` | Save capture to pcapng |
 | `load` | `load <config.json>` | Load JSON configuration |
 | `save` | `save <config.json>` | Save current config to JSON |
-| `set-cps` | `set-cps <value>` | Set target connections/second |
 | `quit` | `quit` | Graceful shutdown |
 
 ### 4.4 REST API
@@ -974,12 +971,7 @@ tests/
 ├── tcp_tap.sh              # TCP SYN/data/FIN over TAP + Firecracker
 ├── http_nic.sh             # HTTP RPS + throughput over NIC + QEMU
 ├── tls_nic.sh              # TLS handshake/throughput over NIC + QEMU + QAT
-├── https_nic.sh            # HTTPS (nginx SSL) over NIC + QEMU + QAT
-│
-└── proto/                  ── Protocol correctness suites ──
-    ├── tcp_suite.sh        # 15 tests: handshake, RST, loss, reorder, churn
-    ├── tls_suite.sh        # 15 tests: TLS 1.2/1.3, certs, ciphers, leak
-    └── http1.1_suite.sh    # 21 tests: GET/POST/PUT/DELETE, keep-alive, MTU
+└── https_nic.sh            # HTTPS (nginx SSL) over NIC + QEMU + QAT
 ```
 
 ### 5.2 Topology Tiers
@@ -987,56 +979,10 @@ tests/
 | Tier | Transport | VM | NIC | Script(s) |
 |------|-----------|-----|------|----------|
 | **Kernel** | veth / TAP | None | Virtual | `ping_veth.sh`, `udp_veth.sh`, `arp_test.sh` |
-| **Kernel + Proto** | veth pair | None | Virtual | `proto/tcp_suite.sh`, `proto/tls_suite.sh`, `proto/http1.1_suite.sh` |
 | **TAP + Firecracker** | TAP + bridge | Firecracker microVM | `net_tap` PMD | `tcp_tap.sh` |
 | **NIC + QEMU** | Physical loopback | QEMU/KVM + vfio-pci | HW PMD (mlx5/i40e) | `http_nic.sh`, `tls_nic.sh`, `https_nic.sh` |
 
-### 5.3 Protocol Correctness Suites (`tests/proto/`)
-
-The `proto/` suites run over veth pairs with real network peers (ncat, openssl,
-Python HTTP) — no VM required. They validate protocol correctness, not performance.
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  tcp_suite.sh (15 tests)                                        │
-│  ──────────────────────────────────────────────────────────────  │
-│  T01  3-way handshake          T09  High CPS / SYN flood       │
-│  T02  Connection lifecycle     T10  Multiple sequential bursts  │
-│  T03  RST on closed port       T11  Echo peer connectivity      │
-│  T04  RST mid-connection       T12  High-latency path (100ms)  │
-│  T05  Clean-path integrity     T13  Heavy loss stress (20%)    │
-│  T06  Retransmit under loss    T14  Small MSS / MTU 576        │
-│  T07  Survive reordering       T15  Rapid reconnect churn      │
-│  T08  Combined loss+reorder                                    │
-├──────────────────────────────────────────────────────────────────┤
-│  tls_suite.sh (15 tests)                                        │
-│  ──────────────────────────────────────────────────────────────  │
-│  T01  TLS 1.2 handshake        T09  Large payload / multi-rec  │
-│  T02  TLS 1.3 handshake        T10  Peer crash mid-handshake   │
-│  T03  Untrusted cert reject    T11  CHACHA20-POLY1305 cipher   │
-│  T04  TLS data transfer        T12  Expired cert rejection     │
-│  T05  Clean TLS shutdown       T13  Version downgrade block    │
-│  T06  Handshake TPS flood      T14  TLS under packet loss      │
-│  T07  Concurrent sessions      T15  Rapid session churn        │
-│  T08  AES-256-GCM cipher                                      │
-├──────────────────────────────────────────────────────────────────┤
-│  http1.1_suite.sh (21 tests)                                    │
-│  ──────────────────────────────────────────────────────────────  │
-│  T01  HTTP GET connectivity    T12  Clean-path integrity       │
-│  T02  HTTP connection rate     T13  POST-like upstream         │
-│  T03  Rate-limited HTTP        T14  Keep-Alive persistence     │
-│  T04  HTTP throughput TX       T15  Combined impairments       │
-│  T05  Concurrent streams       T16  Small MTU / mobile         │
-│  T06  Non-standard port        T17  Server restart resilience  │
-│  T07  Closed port RST          T18  GET via http command       │
-│  T08  HTTP under packet loss   T19  POST via http command      │
-│  T09  HTTP under high latency  T20  PUT via http command       │
-│  T10  Reconnection churn       T21  DELETE via http command    │
-│  T11  Server crash mid-conn                                    │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### 5.4 TLS / HTTPS Test Architecture
+### 5.3 TLS / HTTPS Test Architecture
 
 The TLS and HTTPS tests add crypto acceleration testing to the NIC + QEMU tier:
 
@@ -1068,7 +1014,7 @@ The TLS and HTTPS tests add crypto acceleration testing to the NIC + QEMU tier:
 vaigai uses the DPDK `crypto_qat` PMD; the VM server uses OpenSSL `qatengine`
 with the QAT device passed through via vfio-pci.
 
-### 5.5 Common Test Infrastructure
+### 5.4 Common Test Infrastructure
 
 All NIC-tier scripts share a common pattern:
 

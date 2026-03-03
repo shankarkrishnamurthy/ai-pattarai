@@ -192,6 +192,8 @@ EOCFG
 }
 
 vaigai_reset() {
+    echo "stop" >&7
+    sleep 1
     echo "reset" >&7
     sleep 2
 }
@@ -219,7 +221,7 @@ vaigai_cmd() {
         [[ "$p_interval_ms" =~ ^[0-9]+$ ]] || p_interval_ms=1000
         dur=$(( (p_count * p_interval_ms + 999) / 1000 ))
     else
-        # flood <proto> <ip> <duration_s> [rate] [size] [port]
+        # tps <proto> <ip> <duration_s> [rate] [size] [port]
         dur=$(echo "$cmd" | awk '{print $4}')
     fi
     if [[ "$dur" =~ ^[0-9]+$ ]] && [[ "$dur" -gt 0 ]]; then
@@ -638,7 +640,7 @@ run_t1() {
 
     # ── T1a: Unlimited (flood) CPS ────────────────────────────────────
     info "T1a: Unlimited CPS → ${VM_IP}:80 (${FLOOD_DURATION}s, flood)"
-    vaigai_cmd "flood tcp $VM_IP $FLOOD_DURATION 0 56 80"
+    vaigai_cmd "tps tcp $VM_IP $FLOOD_DURATION 0 56 80"
 
     local tx_pkts
     tx_pkts=$(json_val tx_pkts)
@@ -657,7 +659,7 @@ run_t1() {
 
     # ── T1b: Rate-limited CPS ─────────────────────────────────────────
     info "T1b: Rate-limited CPS → ${VM_IP}:80 (${FLOOD_DURATION}s, target ${TARGET_CPS} cps)"
-    vaigai_cmd "flood tcp $VM_IP $FLOOD_DURATION $TARGET_CPS 56 80"
+    vaigai_cmd "tps tcp $VM_IP $FLOOD_DURATION $TARGET_CPS 56 80"
 
     tx_pkts=$(json_val tx_pkts)
 

@@ -128,14 +128,16 @@ EOCFG
 }
 
 vaigai_reset() {
-    # Send reset command to clear all TCP state between tests
+    # Send stop + reset to clear all TCP state between tests
+    echo "stop" >&7
+    sleep 1
     echo "reset" >&7
     sleep 2  # Give RSTs time to reach VM and for state to stabilize
 }
 
 vaigai_cmd() {
     # Send a command + stats, then read output
-    # $1 = command to run (e.g. "flood tcp ...")
+    # $1 = command to run (e.g. "tps tcp ...")
     local cmd="$1"
 
     # Record current log size so we can extract only new output
@@ -145,9 +147,9 @@ vaigai_cmd() {
     # Send the command via the persistent fd
     printf '%s\n' "$cmd" >&7
 
-    # Wait for the command to finish (flood/throughput block for their duration).
+    # Wait for the command to finish (tps/throughput block for their duration).
     # Duration field position depends on command:
-    #   flood <proto> <ip> <duration> ...      → field 4
+    #   tps <proto> <ip> <duration> ...      → field 4
     #   throughput <dir> <ip> <port> <duration> ... → field 5
     local dur
     local cmd_type
@@ -333,7 +335,7 @@ vaigai_start
 # ══════════════════════════════════════════════════════════════════════════════
 run_t1() {
     info "T1: SYN flood CPS → ${VM_IP}:5000 (5s)"
-    vaigai_cmd "flood tcp $VM_IP 5 0 56 5000"
+    vaigai_cmd "tps tcp $VM_IP 5 0 56 5000"
 
     local syn_sent conn_open reset_rx drops
     syn_sent=$(json_val tcp_syn_sent)
