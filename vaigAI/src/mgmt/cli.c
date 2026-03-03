@@ -37,7 +37,7 @@
 #endif
 
 #define MAX_CMDS  64u
-#define MAX_ARGS  16u
+#define MAX_ARGS  32u
 
 typedef struct {
     char           name[64];
@@ -66,25 +66,6 @@ cmd_stats(int argc, char **argv)
     (void)argc; (void)argv;
     cli_print_stats();
 }
-
-static void
-cmd_load(int argc, char **argv)
-{
-    if (argc < 2) { printf("Usage: load <config.json>\n"); return; }
-    int rc = config_load_json(argv[1]);
-    if (rc < 0) printf("Load failed: %s\n", strerror(-rc));
-    else        printf("Config loaded from %s\n", argv[1]);
-}
-
-static void
-cmd_save(int argc, char **argv)
-{
-    if (argc < 2) { printf("Usage: save <config.json>\n"); return; }
-    int rc = config_save_json(argv[1]);
-    if (rc < 0) printf("Save failed: %s\n", strerror(-rc));
-    else        printf("Config saved to %s\n", argv[1]);
-}
-
 
 static void
 cmd_trace(int argc, char **argv)
@@ -141,102 +122,132 @@ cmd_ping(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
-/* tps / stop — timer-based TX generation on worker lcores              */
+/* start — unified traffic generation (replaces tps + throughput)       */
 /* ------------------------------------------------------------------ */
 
-/* Auto-detect protocol from config's "protocol" field. */
-static tx_gen_proto_t
-tps_detect_proto(void)
-{
-    if (strcmp(g_config.protocol, "http") == 0 ||
-        strcmp(g_config.protocol, "https") == 0)
-        return TX_GEN_PROTO_HTTP;
-    if (strcmp(g_config.protocol, "udp") == 0)
-        return TX_GEN_PROTO_UDP;
-    if (strcmp(g_config.protocol, "icmp") == 0)
-        return TX_GEN_PROTO_ICMP;
-    return TX_GEN_PROTO_TCP_SYN; /* tcp, tls */
-}
+/* Parsed flags for the start command */
+typedef struct {
+    const char *ip;
+    const char *proto;
+    const char *url;
+    const char *host;
+    uint16_t    port;
+    uint32_t    duration;
+    uint64_t    rate;
+    uint16_t    size;
+    uint32_t    streams;
+    bool        reuse;
+    bool        tls;
+    bool        has_ip;
+    bool        has_port;
+    bool        has_duration;
+} start_args_t;
 
 static const char *
-tps_proto_label(void)
+start_usage(void)
 {
-    return g_config.protocol;
+    return "Usage: start --ip <addr> --port <N> --duration <secs>\n"
+           "             [--proto tcp|http|https|udp|icmp|tls]\n"
+           "             [--rate <pps>] [--size <bytes>]\n"
+           "             [--reuse] [--streams <N>]\n"
+           "             [--url <path>] [--host <name>] [--tls]\n";
 }
 
-static void
-cmd_tps(int argc, char **argv)
+static int
+parse_start_args(int argc, char **argv, start_args_t *a)
 {
-    extern volatile int g_run;
-    if (argc < 3) {
-        printf("Usage: tps <dst_ip> <duration_s>"
-               " [rate=0] [size=56] [port=cfg]\n"
-               "  Protocol is set by \"protocol\" in config: "
-               "tcp, http, tls, https, udp, icmp\n");
-        return;
-    }
+    memset(a, 0, sizeof(*a));
+    a->proto = "tcp";
+    a->url   = "/";
+    a->size  = 56;
+    a->streams = 1;
 
-    /* ── Backward compat: skip legacy protocol keyword if present ──── */
-    int ip_idx = 1;
-    const char *cli_proto = NULL;
-    if (strcmp(argv[1], "tcp")  == 0 || strcmp(argv[1], "http") == 0 ||
-        strcmp(argv[1], "udp")  == 0 || strcmp(argv[1], "icmp") == 0 ||
-        strcmp(argv[1], "tls")  == 0 || strcmp(argv[1], "https") == 0) {
-        cli_proto = argv[1];
-        ip_idx = 2;
-        if (argc < 4) {
-            printf("Usage: tps <dst_ip> <duration_s>"
-                   " [rate=0] [size=56] [port=cfg]\n");
-            return;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--ip") == 0 && i + 1 < argc) {
+            a->ip = argv[++i]; a->has_ip = true;
+        } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
+            a->port = (uint16_t)strtoul(argv[++i], NULL, 10); a->has_port = true;
+        } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
+            a->duration = (uint32_t)strtoul(argv[++i], NULL, 10); a->has_duration = true;
+        } else if (strcmp(argv[i], "--proto") == 0 && i + 1 < argc) {
+            a->proto = argv[++i];
+        } else if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc) {
+            a->rate = strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
+            a->size = (uint16_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--streams") == 0 && i + 1 < argc) {
+            a->streams = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc) {
+            a->url = argv[++i];
+        } else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
+            a->host = argv[++i];
+        } else if (strcmp(argv[i], "--reuse") == 0) {
+            a->reuse = true;
+        } else if (strcmp(argv[i], "--tls") == 0) {
+            a->tls = true;
+        } else {
+            printf("Unknown flag: %s\n", argv[i]);
+            return -1;
         }
     }
 
-    /* CLI protocol keyword overrides config file */
-    tx_gen_proto_t proto;
-    if (cli_proto) {
-        if (strcmp(cli_proto, "icmp") == 0)
-            proto = TX_GEN_PROTO_ICMP;
-        else if (strcmp(cli_proto, "udp") == 0)
-            proto = TX_GEN_PROTO_UDP;
-        else if (strcmp(cli_proto, "http") == 0 || strcmp(cli_proto, "https") == 0)
-            proto = TX_GEN_PROTO_HTTP;
-        else
-            proto = TX_GEN_PROTO_TCP_SYN;
-    } else {
-        proto = tps_detect_proto();
+    /* Auto-enable TLS for https/tls protocols */
+    if (strcmp(a->proto, "https") == 0 || strcmp(a->proto, "tls") == 0)
+        a->tls = true;
+
+    /* Default host to IP if not specified */
+    if (!a->host)
+        a->host = a->ip;
+
+    return 0;
+}
+
+static tx_gen_proto_t
+start_resolve_proto(const start_args_t *a)
+{
+    if (a->reuse)
+        return TX_GEN_PROTO_THROUGHPUT;
+    if (strcmp(a->proto, "icmp") == 0)
+        return TX_GEN_PROTO_ICMP;
+    if (strcmp(a->proto, "udp") == 0)
+        return TX_GEN_PROTO_UDP;
+    if (strcmp(a->proto, "http") == 0 || strcmp(a->proto, "https") == 0)
+        return TX_GEN_PROTO_HTTP;
+    return TX_GEN_PROTO_TCP_SYN; /* tcp, tls */
+}
+
+static void
+cmd_start(int argc, char **argv)
+{
+    extern volatile int g_run;
+
+    if (argc < 2) { printf("%s", start_usage()); return; }
+
+    start_args_t a;
+    if (parse_start_args(argc, argv, &a) < 0) {
+        printf("%s", start_usage());
+        return;
     }
 
-    /* ── Parse destination IP ───────────────────────────────────────── */
+    /* Validate required flags */
+    if (!a.has_ip)       { printf("start: --ip is required\n%s",       start_usage()); return; }
+    if (!a.has_port)     { printf("start: --port is required\n%s",     start_usage()); return; }
+    if (!a.has_duration) { printf("start: --duration is required\n%s", start_usage()); return; }
+    if (a.duration == 0) { printf("start: --duration must be > 0\n");  return; }
+
+    /* Parse destination IP */
     uint32_t dst_ip;
-    if (tgen_parse_ipv4(argv[ip_idx], &dst_ip) < 0) {
-        printf("tps: invalid IP '%s'\n", argv[ip_idx]);
+    if (tgen_parse_ipv4(a.ip, &dst_ip) < 0) {
+        printf("start: invalid IP '%s'\n", a.ip);
         return;
     }
 
-    uint32_t duration_s = (uint32_t)strtoul(argv[ip_idx + 1], NULL, 10);
-    if (duration_s == 0) {
-        printf("tps: duration must be > 0\n");
-        return;
-    }
-    uint64_t rate_pps  = (ip_idx + 2 < argc) ? strtoull(argv[ip_idx + 2], NULL, 10) : 0;
-    uint16_t pkt_size  = (ip_idx + 3 < argc) ? (uint16_t)strtoul(argv[ip_idx + 3], NULL, 10) : 56;
-    uint16_t dst_port  = (ip_idx + 4 < argc) ? (uint16_t)strtoul(argv[ip_idx + 4], NULL, 10) : 9;
+    tx_gen_proto_t proto = start_resolve_proto(&a);
+    uint16_t port_id = 0;
 
-    /* Pull defaults from the flow config */
-    char http_url[64]  = "/";
-    char http_host[64] = "";
-    if (g_config.n_flows > 0) {
-        const flow_cfg_t *f = &g_config.flows[0];
-        if (ip_idx + 4 >= argc && f->dst_port != 0)
-            dst_port = f->dst_port;
-        if (f->http_url[0] != '\0')
-            strncpy(http_url, f->http_url, sizeof(http_url) - 1);
-        if (f->http_host[0] != '\0')
-            strncpy(http_host, f->http_host, sizeof(http_host) - 1);
-        else
-            strncpy(http_host, argv[ip_idx], sizeof(http_host) - 1);
-    }
-    uint16_t port_id   = 0;
+    /* Clamp streams */
+    if (a.streams > 16) a.streams = 16;
+    if (a.streams == 0) a.streams = 1;
 
     /* ── ARP-resolve destination ────────────────────────────────────── */
     struct rte_ether_addr dst_mac;
@@ -250,7 +261,7 @@ cmd_tps(int argc, char **argv)
         }
     }
     if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
-        printf("tps: ARP resolution failed for %s\n", argv[ip_idx]);
+        printf("start: ARP resolution failed for %s\n", a.ip);
         return;
     }
 
@@ -262,24 +273,22 @@ cmd_tps(int argc, char **argv)
     gcfg.src_ip     = g_arp[port_id].local_ip;
     gcfg.dst_mac    = dst_mac;
     gcfg.src_mac    = g_arp[port_id].local_mac;
-    gcfg.dst_port   = dst_port;
-    gcfg.src_port   = 12345;     /* ephemeral source port */
-    gcfg.pkt_size   = pkt_size;
+    gcfg.dst_port   = a.port;
+    gcfg.src_port   = 12345;
+    gcfg.pkt_size   = a.size;
     gcfg.port_id    = port_id;
-    gcfg.rate_pps   = rate_pps;
-    gcfg.duration_s = duration_s;
+    gcfg.rate_pps   = a.rate;
+    gcfg.duration_s = a.duration;
+    gcfg.enable_tls = a.tls;
 
-    /* Enable TLS for TCP connections if globally configured */
-    if (proto == TX_GEN_PROTO_TCP_SYN && g_config.tls_enabled)
-        gcfg.enable_tls = true;
+    if (a.reuse)
+        gcfg.throughput_streams = (uint8_t)a.streams;
 
-    /* HTTP-specific config (auto-detected from config) */
+    /* HTTP-specific config */
     if (proto == TX_GEN_PROTO_HTTP) {
         gcfg.http_method = 0; /* GET */
-        strncpy(gcfg.http_url,  http_url,  sizeof(gcfg.http_url) - 1);
-        strncpy(gcfg.http_host, http_host, sizeof(gcfg.http_host) - 1);
-        if (g_config.tls_enabled)
-            gcfg.enable_tls = true;
+        strncpy(gcfg.http_url,  a.url,  sizeof(gcfg.http_url) - 1);
+        strncpy(gcfg.http_host, a.host, sizeof(gcfg.http_host) - 1);
     }
 
     /* ── Reset counters & push to workers ───────────────────────────── */
@@ -293,16 +302,21 @@ cmd_tps(int argc, char **argv)
     memcpy(cmd.payload, &gcfg, sizeof(gcfg));
     tgen_ipc_broadcast(&cmd);
 
-    printf("TPS %s -> %s: %u-byte payload, %s, %u seconds\n",
-           tps_proto_label(), argv[ip_idx], pkt_size,
-           rate_pps ? "rate-limited" : "unlimited", duration_s);
+    if (a.reuse) {
+        printf("Traffic %s → %s:%u  streams=%u  duration=%us%s\n",
+               a.proto, a.ip, a.port, a.streams, a.duration,
+               a.tls ? " [TLS]" : "");
+        printf("[ ID]  Interval       Transfer     Throughput\n");
+    } else {
+        printf("Traffic %s → %s:%u  %u-byte payload, %s, %u seconds%s\n",
+               a.proto, a.ip, a.port, a.size,
+               a.rate ? "rate-limited" : "unlimited",
+               a.duration, a.tls ? " [TLS]" : "");
+    }
 
     /* ── Wait for duration (live progress on TTY) ───────────────────── */
     bool is_tty = isatty(STDOUT_FILENO);
-    for (uint32_t s = 0; s < duration_s; s++) {
-        /* Sleep in 100 ms slices, calling arp_mgmt_tick() each time so
-         * ARP requests from the remote side (e.g. VM resolving our IP
-         * to send SYN-ACKs) are answered promptly. */
+    for (uint32_t s = 0; s < a.duration; s++) {
         for (int tick = 0; tick < 10; tick++) {
             struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
             nanosleep(&ts, NULL);
@@ -310,184 +324,44 @@ cmd_tps(int argc, char **argv)
             if (!g_run) break;
         }
         if (!g_run) break;
-        if (is_tty) {
+        if (is_tty && !a.reuse) {
             metrics_snapshot_t snap;
             metrics_snapshot(&snap, n_workers);
             printf("\r  [%u/%us] %" PRIu64 " pkts",
-                   s + 1, duration_s, snap.total.tx_pkts);
+                   s + 1, a.duration, snap.total.tx_pkts);
             fflush(stdout);
         }
     }
-    /* Grace period for final TX drain */
-    struct timespec grace = { .tv_sec = 0, .tv_nsec = 100000000 };
+
+    /* Grace period */
+    struct timespec grace = { .tv_sec = a.reuse ? 1 : 0,
+                              .tv_nsec = a.reuse ? 0 : 100000000 };
     nanosleep(&grace, NULL);
-    if (is_tty) printf("\n");
+    if (is_tty && !a.reuse) printf("\n");
 
     /* ── Snapshot results ───────────────────────────────────────────── */
     metrics_snapshot_t snap;
     metrics_snapshot(&snap, n_workers);
 
-    printf("\n--- tps statistics ---\n"
-           "Protocol: %s, Duration: %us, Rate: %s\n"
-           "%" PRIu64 " packets transmitted\n",
-           tps_proto_label(), duration_s,
-           rate_pps ? "limited" : "unlimited",
-           snap.total.tx_pkts);
-    if (duration_s > 0 && snap.total.tx_pkts > 0) {
-        double pps = (double)snap.total.tx_pkts / (double)duration_s;
-        printf("Throughput: %.1f pps\n", pps);
-    }
-
-    /* Dump full telemetry JSON */
-    printf("\n--- telemetry ---\n");
-    cli_print_stats();
-}
-
-/* ------------------------------------------------------------------ */
-/* throughput — TCP data throughput measurement (iperf3-like)            */
-/* ------------------------------------------------------------------ */
-
-static void
-cmd_throughput(int argc, char **argv)
-{
-    extern volatile int g_run;
-    if (argc < 4) {
-        printf("Usage: throughput tx <dst_ip> <port> <duration_s> [streams=1]\n"
-               "       throughput rx <port> <duration_s>\n");
-        return;
-    }
-
-    bool tx_mode = (strcmp(argv[1], "tx") == 0);
-    bool rx_mode = (strcmp(argv[1], "rx") == 0);
-    if (!tx_mode && !rx_mode) {
-        printf("throughput: mode must be 'tx' or 'rx'\n");
-        return;
-    }
-
-    uint32_t n_workers = g_core_map.num_workers;
-    uint16_t port_id = 0;
-
-    if (tx_mode) {
-        /* throughput tx <dst_ip> <port> <duration_s> [streams] */
-        if (argc < 5) {
-            printf("Usage: throughput tx <dst_ip> <port> <duration_s> [streams=1]\n");
-            return;
-        }
-        uint32_t dst_ip;
-        if (tgen_parse_ipv4(argv[2], &dst_ip) < 0) {
-            printf("throughput: invalid IP '%s'\n", argv[2]);
-            return;
-        }
-        uint16_t dst_port   = (uint16_t)strtoul(argv[3], NULL, 10);
-        uint32_t duration_s = (uint32_t)strtoul(argv[4], NULL, 10);
-        uint32_t streams    = (argc >= 6) ? (uint32_t)strtoul(argv[5], NULL, 10) : 1;
-        if (duration_s == 0 || streams == 0) {
-            printf("throughput: duration and streams must be > 0\n");
-            return;
-        }
-        if (streams > 16) streams = 16;
-
-        /* ARP resolve */
-        struct rte_ether_addr dst_mac;
-        if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
-            arp_request(port_id, dst_ip);
-            uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
-            while (rte_rdtsc() < deadline) {
-                arp_mgmt_tick();
-                if (arp_lookup(port_id, dst_ip, &dst_mac)) break;
-                rte_delay_ms(10);
-            }
-        }
-        if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
-            printf("throughput: ARP failed for %s\n", argv[2]);
-            return;
-        }
-
-        /* Reset metrics */
-        metrics_reset(n_workers);
-
-        /* Build TX-gen config and dispatch to worker via IPC */
-        tx_gen_config_t gcfg;
-        memset(&gcfg, 0, sizeof(gcfg));
-        gcfg.proto              = TX_GEN_PROTO_THROUGHPUT;
-        gcfg.dst_ip             = dst_ip;
-        gcfg.src_ip             = g_arp[port_id].local_ip;
-        gcfg.dst_mac            = dst_mac;
-        gcfg.src_mac            = g_arp[port_id].local_mac;
-        gcfg.dst_port           = dst_port;
-        gcfg.port_id            = port_id;
-        gcfg.duration_s         = duration_s;
-        gcfg.enable_tls         = g_config.tls_enabled;
-        gcfg.throughput_streams  = (uint8_t)streams;
-
-        config_update_t cmd;
-        memset(&cmd, 0, sizeof(cmd));
-        cmd.cmd = CFG_CMD_START;
-        cmd.seq = 1;
-        memcpy(cmd.payload, &gcfg, sizeof(gcfg));
-        tgen_ipc_broadcast(&cmd);
-
-        printf("TCP throughput TX → %s:%u  streams=%u  duration=%us\n",
-               argv[2], dst_port, streams, duration_s);
-        printf("[ ID]  Interval       Transfer     Throughput\n");
-
-        /* Wait for duration, answering ARP */
-        for (uint32_t s = 0; s < duration_s && g_run; s++) {
-            for (int tick = 0; tick < 10; tick++) {
-                struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
-                nanosleep(&ts, NULL);
-                arp_mgmt_tick();
-                if (!g_run) break;
-            }
-        }
-        /* Grace period for worker to close connections */
-        struct timespec grace = { .tv_sec = 1, .tv_nsec = 0 };
-        nanosleep(&grace, NULL);
-
-        /* Report */
-        metrics_snapshot_t snap;
-        metrics_snapshot(&snap, n_workers);
+    if (a.reuse) {
         uint64_t total_bytes = snap.total.tcp_payload_tx;
-        double   mbps = (double)total_bytes * 8.0 / ((double)duration_s * 1e6);
+        double   mbps = (double)total_bytes * 8.0 / ((double)a.duration * 1e6);
         double   mb   = (double)total_bytes / (1024.0 * 1024.0);
         printf("[SUM]  0.00-%.2fs    %.0f MB       %.1f Mbps\n",
-               (double)duration_s, mb, mbps);
-
+               (double)a.duration, mb, mbps);
     } else {
-        /* throughput rx <port> <duration_s> */
-        uint16_t listen_port = (uint16_t)strtoul(argv[2], NULL, 10);
-        uint32_t duration_s  = (uint32_t)strtoul(argv[3], NULL, 10);
-        if (duration_s == 0) {
-            printf("throughput: duration must be > 0\n");
-            return;
+        printf("\n--- traffic statistics ---\n"
+               "Protocol: %s, Duration: %us, Rate: %s\n"
+               "%" PRIu64 " packets transmitted\n",
+               a.proto, a.duration,
+               a.rate ? "limited" : "unlimited",
+               snap.total.tx_pkts);
+        if (a.duration > 0 && snap.total.tx_pkts > 0) {
+            double pps = (double)snap.total.tx_pkts / (double)a.duration;
+            printf("Throughput: %.1f pps\n", pps);
         }
-
-        /* Reset metrics and start listening */
-        metrics_reset(n_workers);
-        for (uint32_t i = 0; i < n_workers; i++)
-            tcp_fsm_listen(i, listen_port);
-
-        printf("TCP throughput RX ← *:%u  duration=%us  (waiting for sender)\n",
-               listen_port, duration_s);
-
-        /* Wait for duration */
-        for (uint32_t s = 0; s < duration_s && g_run; s++) {
-            for (int tick = 0; tick < 10; tick++) {
-                struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
-                nanosleep(&ts, NULL);
-                arp_mgmt_tick();
-                if (!g_run) break;
-            }
-        }
-
-        /* Report */
-        metrics_snapshot_t snap;
-        metrics_snapshot(&snap, n_workers);
-        uint64_t total_bytes = snap.total.tcp_payload_rx;
-        double   mbps = (double)total_bytes * 8.0 / ((double)duration_s * 1e6);
-        double   mb   = (double)total_bytes / (1024.0 * 1024.0);
-        printf("[SUM]  0.00-%.2fs    %.0f MB       %.1f Mbps\n",
-               (double)duration_s, mb, mbps);
+        printf("\n--- telemetry ---\n");
+        cli_print_stats();
     }
 }
 
@@ -606,11 +480,8 @@ cli_run(void)
     /* Register built-ins */
     cli_register("help",     "Show this help",           cmd_help);
     cli_register("stats",    "Print current statistics", cmd_stats);
-    cli_register("load",     "Load config JSON file",    cmd_load);
-    cli_register("save",     "Save config JSON file",    cmd_save);
     cli_register("ping",     "ICMP ping: ping <ip> [count] [size] [ms]", cmd_ping);
-    cli_register("tps",      "TPS measurement: tps <ip> <secs> [rate] [size] [port]", cmd_tps);
-    cli_register("throughput", "TCP throughput: throughput tx/rx <args>",  cmd_throughput);
+    cli_register("start",    "Start traffic: start --ip <ip> --port <N> --duration <s> [flags]", cmd_start);
     cli_register("stop",     "Stop active traffic generation",          cmd_stop_gen);
     cli_register("reset",   "Reset all TCP state (connections, ports)", cmd_reset);
     cli_register("trace",    "Packet capture: trace start/stop/save",    cmd_trace);
@@ -631,7 +502,7 @@ cli_run(void)
         return;
     }
 
-    const char *prompt = g_config.cli_prompt[0] ? g_config.cli_prompt : "tgen> ";
+    const char *prompt = "vaigai> ";
     if (isatty(STDIN_FILENO))
         printf("vaigai CLI  (type 'help' for commands, 'quit' to exit)\n");
 

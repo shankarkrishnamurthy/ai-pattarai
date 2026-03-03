@@ -28,6 +28,11 @@ typedef struct {
      * These are passed directly to rte_eal_init() as extra EAL args. */
     const char *extra_eal_args[16];
     uint32_t    num_extra_eal_args;
+
+    /* Boot-time configuration (replaces config JSON) */
+    uint32_t    max_conn;           /* max concurrent connections per worker */
+
+    uint16_t    rest_port;          /* REST API port (0 = disabled) */
 } tgen_eal_args_t;
 
 /** Parse argv, populate tgen_eal_args_t, then call rte_eal_init().

@@ -121,23 +121,9 @@ json_val() {
 VAIGAI_FIFO=""
 VAIGAI_PID=""
 VAIGAI_LOG=""
-VAIGAI_CFG=""
 OUTPUT=""
 
 vaigai_start() {
-    VAIGAI_CFG=$(mktemp /tmp/vaigai_http_XXXXXX.json)
-    cat > "$VAIGAI_CFG" <<EOCFG
-{
-  "flows": [{
-    "src_ip_lo": "$VAIGAI_IP", "src_ip_hi": "$VAIGAI_IP",
-    "dst_ip": "$VM_IP", "dst_port": 80,
-    "http_url": "/$HTTP_RESP_SIZE",
-    "http_host": "$VM_IP",
-    "icmp_ping": false
-  }],
-  "load": { "max_concurrent": 8192, "target_cps": 0, "duration_secs": 0 }
-}
-EOCFG
     VAIGAI_FIFO=$(mktemp -u /tmp/vaigai_http_fifo_XXXXXX)
     mkfifo "$VAIGAI_FIFO"
     VAIGAI_LOG=$(mktemp /tmp/vaigai_http_out_XXXXXX.log)
@@ -156,10 +142,11 @@ EOCFG
     fi
     info "NIC $NIC_PCI_VAIGAI on NUMA node $nic_numa, socket-mem=$socket_mem"
 
-    VAIGAI_CONFIG="$VAIGAI_CFG" "$VAIGAI_BIN" \
+    "$VAIGAI_BIN" \
         -l "$DPDK_LCORES" -n 4 \
         --socket-mem "$socket_mem" \
         -a "$NIC_PCI_VAIGAI" -- \
+        --max-conn 1024 \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
 
@@ -209,10 +196,7 @@ vaigai_cmd() {
     local dur
     local cmd_type
     cmd_type=$(echo "$cmd" | awk '{print $1}')
-    if [[ "$cmd_type" == "throughput" ]]; then
-        # throughput tx <ip> <port> <duration_s> [streams]
-        dur=$(echo "$cmd" | awk '{print $5}')
-    elif [[ "$cmd_type" == "ping" ]]; then
+    if [[ "$cmd_type" == "ping" ]]; then
         # ping <ip> [count=5] [size=56] [interval_ms=1000]
         local p_count p_interval_ms
         p_count=$(echo "$cmd" | awk '{print $3}')
@@ -221,8 +205,8 @@ vaigai_cmd() {
         [[ "$p_interval_ms" =~ ^[0-9]+$ ]] || p_interval_ms=1000
         dur=$(( (p_count * p_interval_ms + 999) / 1000 ))
     else
-        # tps <proto> <ip> <duration_s> [rate] [size] [port]
-        dur=$(echo "$cmd" | awk '{print $4}')
+        # Extract --duration value from named flags
+        dur=$(echo "$cmd" | grep -oP '(?<=--duration )\d+' || echo "0")
     fi
     if [[ "$dur" =~ ^[0-9]+$ ]] && [[ "$dur" -gt 0 ]]; then
         sleep $((dur + 3))
@@ -276,7 +260,7 @@ vaigai_stop() {
     else
         exec 7>&- 2>/dev/null || true
     fi
-    rm -f "$VAIGAI_FIFO" "$VAIGAI_LOG" "$VAIGAI_CFG"
+    rm -f "$VAIGAI_FIFO" "$VAIGAI_LOG"
     VAIGAI_PID=""
 }
 
@@ -639,8 +623,9 @@ run_t1() {
     info "═══════════════════════════════════════════════════════"
 
     # ── T1a: Unlimited (flood) CPS ────────────────────────────────────
+    # T1a: SYN flood — unlimited rate to nginx:80
     info "T1a: Unlimited CPS → ${VM_IP}:80 (${FLOOD_DURATION}s, flood)"
-    vaigai_cmd "tps tcp $VM_IP $FLOOD_DURATION 0 56 80"
+    vaigai_cmd "start --proto tcp --ip $VM_IP --duration $FLOOD_DURATION --size 56 --port 80"
 
     local tx_pkts
     tx_pkts=$(json_val tx_pkts)
@@ -658,8 +643,9 @@ run_t1() {
     vaigai_reset
 
     # ── T1b: Rate-limited CPS ─────────────────────────────────────────
+    # T1b: SYN flood — rate-limited CPS to nginx:80
     info "T1b: Rate-limited CPS → ${VM_IP}:80 (${FLOOD_DURATION}s, target ${TARGET_CPS} cps)"
-    vaigai_cmd "tps tcp $VM_IP $FLOOD_DURATION $TARGET_CPS 56 80"
+    vaigai_cmd "start --proto tcp --ip $VM_IP --duration $FLOOD_DURATION --rate $TARGET_CPS --size 56 --port 80"
 
     tx_pkts=$(json_val tx_pkts)
 
@@ -695,8 +681,9 @@ run_t2() {
     info "T2: HTTP Throughput (TCP data) → ${VM_IP}:5001"
     info "═══════════════════════════════════════════════════════"
 
+    # T2: TCP throughput — multiple streams to VM discard server
     info "T2: Throughput TX → ${VM_IP}:5001 (${THROUGHPUT_DUR}s, ${THROUGHPUT_STREAMS} streams)"
-    vaigai_cmd "throughput tx $VM_IP 5001 $THROUGHPUT_DUR $THROUGHPUT_STREAMS"
+    vaigai_cmd "start --ip $VM_IP --port 5001 --duration $THROUGHPUT_DUR --reuse --streams $THROUGHPUT_STREAMS"
 
     local payload_tx retransmit conn_open conn_close mbps_line
     payload_tx=$(json_val tcp_payload_tx)

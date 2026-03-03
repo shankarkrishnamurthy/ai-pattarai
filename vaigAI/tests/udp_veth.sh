@@ -112,10 +112,8 @@ if [[ $XDP_MODE -eq 1 ]]; then
 fi
 
 # ── teardown (always runs on exit) ────────────────────────────────────────────
-CFG=$(mktemp /tmp/vaigai_udp_XXXXXX.json)
 teardown() {
     info "Tearing down"
-    rm -f "$CFG"
     ip link del "$HOST_IF" &>/dev/null || true
     podman stop "$CONTAINER_NAME" &>/dev/null || true
     podman rm   "$CONTAINER_NAME" &>/dev/null || true
@@ -155,23 +153,6 @@ nsenter -t "$CPID" -n ip link set "$PEER_IF" up
 nsenter -t "$CPID" -n ip addr add "$PEER_CIDR" dev "$PEER_IF"
 info "Container $PEER_IF configured: $PEER_CIDR"
 
-# ── write ephemeral config ────────────────────────────────────────────────────
-cat > "$CFG" <<EOF
-{
-  "protocol": "udp",
-  "flows": [{
-    "src_ip_lo": "$SRC_IP",
-    "src_ip_hi": "$SRC_IP",
-    "dst_ip":    "$PEER_IP",
-    "dst_port":  $DST_PORT,
-    "protocol":  "udp",
-    "icmp_ping": false
-  }],
-  "load": { "max_concurrent": 1, "target_cps": 0, "duration_s": 0 },
-  "tls": null
-}
-EOF
-
 # ── helper: read container UDP NoPorts counter ────────────────────────────────
 container_noports() {
     nsenter -t "$CPID" -n cat /proc/net/snmp \
@@ -193,16 +174,16 @@ info "Using DPDK vdev: $VDEV_ARG"
 
 if [[ $FLOOD_MODE -eq 1 ]]; then
     info "Flood UDP -> $PEER_IP:$DST_PORT for ${FLOOD_SECONDS}s (line rate)"
-    OUTPUT=$(printf 'tps %s %d 0 %d %d\nquit\n' \
+    OUTPUT=$(printf 'start --proto udp --ip %s --duration %d --size %d --port %d\nquit\n' \
                  "$PEER_IP" "$FLOOD_SECONDS" "$PKT_SIZE" "$DST_PORT" \
-             | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
+             | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
                    --vdev "$VDEV_ARG" -- 2>&1) || true
 else
     info "Rate-limited UDP -> $PEER_IP:$DST_PORT (1000 pps × 1s)"
-    OUTPUT=$(printf 'tps %s 1 1000 %d %d\nquit\n' \
+    OUTPUT=$(printf 'start --proto udp --ip %s --duration 1 --rate 1000 --size %d --port %d\nquit\n' \
                  "$PEER_IP" "$PKT_SIZE" "$DST_PORT" \
-             | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
+             | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
                    --vdev "$VDEV_ARG" -- 2>&1) || true
 fi

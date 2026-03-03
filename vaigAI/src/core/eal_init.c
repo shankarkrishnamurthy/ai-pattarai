@@ -32,6 +32,8 @@ static const struct option g_long_opts[] = {
     { "tx-descs",               required_argument, NULL, 't' },
     { "pipeline-depth",         required_argument, NULL, 'd' },
     { "max-chain-depth",        required_argument, NULL, 'C' },
+    { "max-conn",               required_argument, NULL, 'X' },
+    { "rest-port",              required_argument, NULL, 'R' },
     { NULL, 0, NULL, 0 },
 };
 
@@ -52,13 +54,15 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
     a->pipeline_depth         = DEFAULT_PIPELINE_DEPTH;
     a->max_chain_depth        = DEFAULT_CHAIN_DEPTH;
     a->num_extra_eal_args     = 0;
+    a->max_conn               = 5000;  /* default max connections per worker */
+    a->rest_port              = 0;
 
     /* We do not disturb optind for EAL — scan manually. */
     int saved_optind = optind;
     optind = 1;
     opterr = 0; /* suppress errors for unknown options (belong to EAL) */
 
-    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:", g_long_opts,
+    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:X:R:", g_long_opts,
                               &opt_idx)) != -1) {
         switch (opt) {
         case 'W': a->num_worker_cores = (uint32_t)atoi(optarg); break;
@@ -68,6 +72,8 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
         case 't': a->num_tx_desc      = (uint32_t)atoi(optarg); break;
         case 'd': a->pipeline_depth   = (uint32_t)atoi(optarg); break;
         case 'C': a->max_chain_depth  = (uint32_t)atoi(optarg); break;
+        case 'X': a->max_conn         = (uint32_t)atoi(optarg); break;
+        case 'R': a->rest_port        = (uint16_t)atoi(optarg); break;
         default:  break; /* unknown → EAL handles */
         }
     }

@@ -191,40 +191,22 @@ main(int argc, char **argv)
         goto fail_ports;
     }
 
-    /* ---- 7. Load configuration ---- */
-    const char *cfg_path = getenv("VAIGAI_CONFIG");
-    if (!cfg_path) {
-        RTE_LOG(ERR, USER1,
-            "No config specified. Set VAIGAI_CONFIG or pass --config <file>\n");
-        goto fail_ports;
-    }
-    rc = config_load_json(cfg_path);
-    if (rc < 0) {
-        RTE_LOG(WARNING, USER1,
-                "Config load failed (%s) — using defaults\n", cfg_path);
-        /* Set minimal default so validation passes */
-        g_config.flows[0].dst_ip   = rte_cpu_to_be_32(RTE_IPV4(127,0,0,1));
-        g_config.flows[0].dst_port = 80;
-        g_config.n_flows           = 1;
-    }
-    /* Push config to ARP local_ip now that ports are up */
-    config_push_to_workers();
+    /* ---- 7. Populate runtime config from binary args ---- */
+    g_config.max_concurrent = eal_args.max_conn;
+    g_config.rest_port      = eal_args.rest_port;
 
-    /* ---- 8. TLS contexts ---- */
-    if (g_config.tls_enabled) {
-        rc = cert_mgr_init(&g_config.cert, &g_tls_client, &g_tls_server);
-        if (rc < 0) {
-            RTE_LOG(WARNING, USER1, "TLS init failed — TLS disabled\n");
-            g_config.tls_enabled = false;
-        }
-        if (g_config.tls_enabled) {
-            rc = tls_session_store_init(&g_tls_client, &g_tls_server);
-            if (rc < 0) goto fail_ipc;
-        }
+    /* ---- 8. TLS client context (always available for --tls flag) ---- */
+    rc = cert_mgr_init(&g_config.cert, &g_tls_client, &g_tls_server);
+    if (rc < 0) {
+        RTE_LOG(WARNING, USER1, "TLS init failed — TLS disabled\n");
+    } else {
+        g_config.tls_enabled = true;
+        rc = tls_session_store_init(&g_tls_client, &g_tls_server);
+        if (rc < 0) goto fail_ipc;
     }
 
     /* ---- 9. TCP subsystem ---- */
-    rc = tcb_stores_init(g_config.load.max_concurrent);
+    rc = tcb_stores_init(g_config.max_concurrent);
     if (rc < 0) {
         RTE_LOG(ERR, USER1, "TCB store init failed\n");
         goto fail_tls;
@@ -258,8 +240,8 @@ main(int argc, char **argv)
             g_core_map.num_workers);
 
     /* ---- 12. Management servers ---- */
-    if (g_config.rest_port)
-        rest_server_start(g_config.rest_port);
+    if (eal_args.rest_port)
+        rest_server_start(eal_args.rest_port);
 
     /* ---- 13. CLI (blocks) ---- */
     cli_run();

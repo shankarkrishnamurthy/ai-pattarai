@@ -79,29 +79,18 @@ json_val() {
 VAIGAI_FIFO=""
 VAIGAI_PID=""
 VAIGAI_LOG=""
-VAIGAI_CFG=""
 
 vaigai_start() {
-    VAIGAI_CFG=$(mktemp /tmp/vaigai_tcp_XXXXXX.json)
-    cat > "$VAIGAI_CFG" <<EOCFG
-{
-  "flows": [{
-    "src_ip_lo": "$VAIGAI_IP", "src_ip_hi": "$VAIGAI_IP",
-    "dst_ip": "$VM_IP", "dst_port": 5000,
-    "icmp_ping": false
-  }],
-  "load": { "max_concurrent": 1024, "target_cps": 0, "duration_secs": 0 }
-}
-EOCFG
     VAIGAI_FIFO=$(mktemp -u /tmp/vaigai_fifo_XXXXXX)
     mkfifo "$VAIGAI_FIFO"
     VAIGAI_LOG=$(mktemp /tmp/vaigai_out_XXXXXX.log)
 
     # Launch vaigai reading from FIFO, writing to log.
     # DPDK TAP PMD creates tap-vaigai internally.
-    VAIGAI_CONFIG="$VAIGAI_CFG" "$VAIGAI_BIN" \
+    "$VAIGAI_BIN" \
         -l "$DPDK_LCORES" -n 1 --no-pci \
         --vdev "net_tap0,iface=$TAP_VAIGAI" -- \
+        --max-conn 1024 \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
 
@@ -137,7 +126,7 @@ vaigai_reset() {
 
 vaigai_cmd() {
     # Send a command + stats, then read output
-    # $1 = command to run (e.g. "tps tcp ...")
+    # $1 = command to run (e.g. "start --proto tcp ...")
     local cmd="$1"
 
     # Record current log size so we can extract only new output
@@ -147,19 +136,11 @@ vaigai_cmd() {
     # Send the command via the persistent fd
     printf '%s\n' "$cmd" >&7
 
-    # Wait for the command to finish (tps/throughput block for their duration).
-    # Duration field position depends on command:
-    #   tps <proto> <ip> <duration> ...      → field 4
-    #   throughput <dir> <ip> <port> <duration> ... → field 5
+    # Wait for the command to finish (start blocks for its --duration).
+    # Extract --duration value from named flags.
     local dur
-    local cmd_type
-    cmd_type=$(echo "$cmd" | awk '{print $1}')
-    if [[ "$cmd_type" == "throughput" ]]; then
-        dur=$(echo "$cmd" | awk '{print $5}')
-    else
-        dur=$(echo "$cmd" | awk '{print $4}')
-    fi
-    if [[ "$dur" =~ ^[0-9]+$ ]] && [[ "$dur" -gt 0 ]]; then
+    dur=$(echo "$cmd" | grep -oP '(?<=--duration )\d+' || echo "0")
+    if [[ "$dur" -gt 0 ]]; then
         sleep $((dur + 2))
     else
         sleep 3
@@ -214,7 +195,7 @@ vaigai_stop() {
     else
         exec 7>&- 2>/dev/null || true
     fi
-    rm -f "$VAIGAI_FIFO" "$VAIGAI_LOG" "$VAIGAI_CFG"
+    rm -f "$VAIGAI_FIFO" "$VAIGAI_LOG"
     VAIGAI_PID=""
 }
 
@@ -335,7 +316,7 @@ vaigai_start
 # ══════════════════════════════════════════════════════════════════════════════
 run_t1() {
     info "T1: SYN flood CPS → ${VM_IP}:5000 (5s)"
-    vaigai_cmd "tps tcp $VM_IP 5 0 56 5000"
+    vaigai_cmd "start --proto tcp --ip $VM_IP --duration 5 --size 56 --port 5000"
 
     local syn_sent conn_open reset_rx drops
     syn_sent=$(json_val tcp_syn_sent)
@@ -360,7 +341,7 @@ run_t1() {
 # ══════════════════════════════════════════════════════════════════════════════
 run_t2() {
     info "T2: Full lifecycle → ${VM_IP}:5000 (5s, 1 stream)"
-    vaigai_cmd "throughput tx $VM_IP 5000 5 1"
+    vaigai_cmd "start --ip $VM_IP --port 5000 --duration 5 --reuse --streams 1"
 
     local conn_open conn_close retransmit reset_rx
     conn_open=$(json_val tcp_conn_open)
@@ -386,7 +367,7 @@ run_t2() {
 run_t3() {
     # T3a: Forward — vaigAI → VM (discard :5001)
     info "T3a: Throughput TX → ${VM_IP}:5001 (10s, 4 streams)"
-    vaigai_cmd "throughput tx $VM_IP 5001 10 4"
+    vaigai_cmd "start --ip $VM_IP --port 5001 --duration 10 --reuse --streams 4"
 
     local payload_tx retransmit mbps_line
     payload_tx=$(json_val tcp_payload_tx)

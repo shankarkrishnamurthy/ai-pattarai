@@ -81,28 +81,17 @@ json_val() {
 VAIGAI_FIFO=""
 VAIGAI_PID=""
 VAIGAI_LOG=""
-VAIGAI_CFG=""
 OUTPUT=""
 
 vaigai_start() {
-    VAIGAI_CFG=$(mktemp /tmp/vaigai_arp_XXXXXX.json)
-    cat > "$VAIGAI_CFG" <<EOCFG
-{
-  "flows": [{
-    "src_ip_lo": "$VAIGAI_IP", "src_ip_hi": "$VAIGAI_IP",
-    "dst_ip": "$VM_IP", "dst_port": 9,
-    "icmp_ping": true
-  }],
-  "load": { "max_concurrent": 1024, "target_cps": 0, "duration_secs": 0 }
-}
-EOCFG
     VAIGAI_FIFO=$(mktemp -u /tmp/vaigai_arp_fifo_XXXXXX)
     mkfifo "$VAIGAI_FIFO"
     VAIGAI_LOG=$(mktemp /tmp/vaigai_arp_out_XXXXXX.log)
 
-    VAIGAI_CONFIG="$VAIGAI_CFG" "$VAIGAI_BIN" \
+    "$VAIGAI_BIN" \
         -l "$DPDK_LCORES" -n 1 --no-pci \
         --vdev "net_tap0,iface=$TAP_VAIGAI" -- \
+        --max-conn 1024 \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
 
@@ -138,10 +127,10 @@ vaigai_cmd() {
 
     printf '%s\n' "$cmd" >&7
 
-    # Wait based on command duration arg (field 4 for tps)
+    # Extract --duration value from named flags
     local dur
-    dur=$(echo "$cmd" | awk '{print $4}')
-    if [[ "$dur" =~ ^[0-9]+$ ]] && [[ "$dur" -gt 0 ]]; then
+    dur=$(echo "$cmd" | grep -oP '(?<=--duration )\d+' || echo "0")
+    if [[ "$dur" -gt 0 ]]; then
         sleep $((dur + 2))
     else
         sleep 3
@@ -190,7 +179,7 @@ vaigai_stop() {
     else
         exec 7>&- 2>/dev/null || true
     fi
-    rm -f "$VAIGAI_FIFO" "$VAIGAI_LOG" "$VAIGAI_CFG"
+    rm -f "$VAIGAI_FIFO" "$VAIGAI_LOG"
     VAIGAI_PID=""
 }
 
@@ -404,7 +393,7 @@ run_t1() {
     start_vaigai_trace "t1"
 
     # ── Run the flood command (triggers ARP) ──
-    vaigai_cmd "tps icmp $VM_IP 2 100 56"
+    vaigai_cmd "start --proto icmp --ip $VM_IP --duration 2 --rate 100 --size 56 --port 0"
 
     # ── Stop tracing and show captures ──
     stop_vaigai_trace "t1"
@@ -507,7 +496,7 @@ run_t3() {
     start_vaigai_trace "t3"
 
     # ── Run the flood ──
-    vaigai_cmd "tps icmp $VM_IP 3 50 56"
+    vaigai_cmd "start --proto icmp --ip $VM_IP --duration 3 --rate 50 --size 56 --port 0"
 
     # ── Stop tracing and show captures ──
     stop_vaigai_trace "t3"

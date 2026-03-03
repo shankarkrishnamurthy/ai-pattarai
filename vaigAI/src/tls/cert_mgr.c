@@ -11,7 +11,7 @@ cert_mgr_init(const cert_cfg_t *cfg,
 {
     int rc;
 
-    /* Client context (no cert/key required) */
+    /* Client context (no cert/key needed — we're a client) */
     rc = tls_ctx_init(client_out, NULL, NULL,
                       cfg->ca_pem[0] ? cfg->ca_pem : NULL, false);
     if (rc < 0) {
@@ -19,19 +19,8 @@ cert_mgr_init(const cert_cfg_t *cfg,
         return rc;
     }
 
-    /* Server context */
-    rc = tls_ctx_init(server_out,
-                      cfg->cert_pem[0] ? cfg->cert_pem : NULL,
-                      cfg->key_pem[0]  ? cfg->key_pem  : NULL,
-                      cfg->ca_pem[0]   ? cfg->ca_pem   : NULL,
-                      true);
-    if (rc < 0) {
-        TGEN_WARN(TGEN_LOG_TLS,
-                  "Failed to init server TLS context (rc=%d) — "
-                  "server TLS disabled\n", rc);
-        memset(server_out, 0, sizeof(*server_out));
-        /* Not fatal — server role may not be used */
-    }
+    /* No server context — vaigai is client-only */
+    memset(server_out, 0, sizeof(*server_out));
 
 #ifdef HAVE_OPENSSL
     if (cfg->enable_session_resumption && client_out->ssl_ctx) {

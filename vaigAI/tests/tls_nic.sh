@@ -12,7 +12,7 @@
 # The QEMU VM boots Alpine Linux with openssl s_server for raw TLS testing.
 #
 # Tests:
-#   T1 — TLS Handshake TPS: tps + rate-limited (peak TPS discovery)
+#   T1 — TLS Handshake TPS: start --proto tls + rate-limited (peak TPS discovery)
 #   T2 — TLS Bulk Throughput: encrypted data transfer rate (peak Mbps)
 #   T3 — TLS Handshake Latency: p50/p95/p99 under rate-limited load
 #   T4 — Crypto Matrix: QAT vs SW on vaigai × server (2×2 matrix)
@@ -221,31 +221,11 @@ generate_certs() {
 VAIGAI_FIFO=""
 VAIGAI_PID=""
 VAIGAI_LOG=""
-VAIGAI_CFG=""
 OUTPUT=""
 
 vaigai_start() {
     local crypto_mode="${1:-$VAIGAI_CRYPTO}"
 
-    VAIGAI_CFG=$(mktemp /tmp/vaigai_tls_XXXXXX.json)
-    cat > "$VAIGAI_CFG" <<EOCFG
-{
-  "protocol": "tls",
-  "flows": [{
-    "src_ip_lo": "$VAIGAI_IP", "src_ip_hi": "$VAIGAI_IP",
-    "dst_ip": "$VM_IP", "dst_port": $TLS_PORT,
-    "enable_tls": true,
-    "sni": "vaigai-test",
-    "icmp_ping": false
-  }],
-  "load": { "max_concurrent": 2048, "target_cps": 0, "duration_secs": 0 },
-  "tls": {
-    "cert": "$TLS_CERT",
-    "key": "$TLS_KEY",
-    "ca": "$TLS_CERT"
-  }
-}
-EOCFG
     VAIGAI_FIFO=$(mktemp -u /tmp/vaigai_tls_fifo_XXXXXX)
     mkfifo "$VAIGAI_FIFO"
     VAIGAI_LOG=$(mktemp /tmp/vaigai_tls_out_XXXXXX.log)
@@ -278,8 +258,9 @@ EOCFG
     # Clean stale DPDK runtime sockets
     rm -rf /var/run/dpdk/vaigai_tls* 2>/dev/null || true
 
-    VAIGAI_CONFIG="$VAIGAI_CFG" "$VAIGAI_BIN" \
+    "$VAIGAI_BIN" \
         $dpdk_args -- \
+        --max-conn 5000 \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
 
@@ -345,19 +326,16 @@ vaigai_cmd() {
     # Determine wait time from command
     local dur cmd_type
     cmd_type=$(echo "$cmd" | awk '{print $1}')
-    if [[ "$cmd_type" == "throughput" ]]; then
-        dur=$(echo "$cmd" | awk '{print $5}')
-    elif [[ "$cmd_type" == "ping" ]]; then
+    if [[ "$cmd_type" == "ping" ]]; then
         local p_count p_interval_ms
         p_count=$(echo "$cmd" | awk '{print $3}')
         p_interval_ms=$(echo "$cmd" | awk '{print $5}')
         [[ "$p_count" =~ ^[0-9]+$ ]] || p_count=5
         [[ "$p_interval_ms" =~ ^[0-9]+$ ]] || p_interval_ms=1000
         dur=$(( (p_count * p_interval_ms + 999) / 1000 ))
-    elif [[ "$cmd_type" == "tps" ]]; then
-        dur=$(echo "$cmd" | awk '{print $3}')
     else
-        dur=$(echo "$cmd" | awk '{print $4}')
+        # Extract --duration value from named flags
+        dur=$(echo "$cmd" | grep -oP '(?<=--duration )\d+' || echo "0")
     fi
     if [[ "$dur" =~ ^[0-9]+$ ]] && [[ "$dur" -gt 0 ]]; then
         sleep $((dur + 3))
@@ -418,7 +396,7 @@ vaigai_stop() {
     else
         exec 7>&- 2>/dev/null || true
     fi
-    rm -f "$VAIGAI_FIFO" "$VAIGAI_LOG" "$VAIGAI_CFG"
+    rm -f "$VAIGAI_FIFO" "$VAIGAI_LOG"
     VAIGAI_PID=""
 }
 
@@ -890,7 +868,7 @@ run_t1() {
 
     # ── T1a: Flood (peak discovery) ───────────────────────────────────
     info "T1a: Unlimited TLS handshake flood (${FLOOD_DURATION}s)"
-    vaigai_cmd "tps $VM_IP $FLOOD_DURATION 0 56 $TLS_PORT"
+    vaigai_cmd "start --proto tls --ip $VM_IP --duration $FLOOD_DURATION --size 56 --port $TLS_PORT --tls"
 
     local hs_ok hs_fail tx_pkts
     hs_ok=$(json_val tls_handshake_ok)
@@ -934,7 +912,7 @@ run_t1() {
     fi
 
     info "T1b: Rate-limited TLS handshake (${FLOOD_DURATION}s, target ${effective_target} cps)"
-    vaigai_cmd "tps $VM_IP $FLOOD_DURATION $effective_target 56 $TLS_PORT"
+    vaigai_cmd "start --proto tls --ip $VM_IP --duration $FLOOD_DURATION --rate $effective_target --size 56 --port $TLS_PORT --tls"
 
     hs_ok=$(json_val tls_handshake_ok)
     info "  tls_handshake_ok=$hs_ok"
@@ -965,7 +943,7 @@ run_t2() {
 
     # ── T2a: Flood (peak discovery) ───────────────────────────────────
     info "T2a: Unlimited TLS throughput (${THROUGHPUT_DUR}s, ${THROUGHPUT_STREAMS} streams)"
-    vaigai_cmd "throughput tx $VM_IP $TLS_PORT $THROUGHPUT_DUR $THROUGHPUT_STREAMS"
+    vaigai_cmd "start --ip $VM_IP --port $TLS_PORT --duration $THROUGHPUT_DUR --reuse --streams $THROUGHPUT_STREAMS --tls"
 
     local payload_tx tls_tx tls_rx retransmit hs_ok hs_fail
     payload_tx=$(json_val tcp_payload_tx)
@@ -995,7 +973,7 @@ run_t2() {
     vaigai_reset || true
 
     info "T2b: Rate-limited TLS throughput (${THROUGHPUT_DUR}s, target ${TARGET_CPS} cps)"
-    vaigai_cmd "throughput tx $VM_IP $TLS_PORT $THROUGHPUT_DUR $THROUGHPUT_STREAMS"
+    vaigai_cmd "start --ip $VM_IP --port $TLS_PORT --duration $THROUGHPUT_DUR --reuse --streams $THROUGHPUT_STREAMS --tls"
 
     payload_tx=$(json_val tcp_payload_tx)
     info "  payload_tx=$payload_tx"
@@ -1016,7 +994,7 @@ run_t3() {
     [[ "$lat_cps" -gt 0 ]] || lat_cps=1000
 
     info "T3: Rate-limited at ${lat_cps} cps for ${LATENCY_DUR}s"
-    vaigai_cmd "tps $VM_IP $LATENCY_DUR $lat_cps 56 $TLS_PORT"
+    vaigai_cmd "start --proto tls --ip $VM_IP --duration $LATENCY_DUR --rate $lat_cps --size 56 --port $TLS_PORT --tls"
 
     local hs_ok p50 p95 p99
     hs_ok=$(json_val tls_handshake_ok)
@@ -1097,22 +1075,22 @@ run_t4() {
             continue
         fi
 
-        # TPS tps (short)
+        # TPS test (short)
         vaigai_reset || true
-        if vaigai_cmd "tps $VM_IP 5 0 56 $TLS_PORT"; then
+        if vaigai_cmd "start --proto tls --ip $VM_IP --duration 5 --size 56 --port $TLS_PORT --tls"; then
             local hs_ok
             hs_ok=$(json_val tls_handshake_ok)
             local tps=0
             [[ "$hs_ok" -gt 0 ]] && tps=$((hs_ok / 5))
             matrix_tps["$combo"]="$tps"
         else
-            warn "T4 ($v_crypto/$s_crypto): vaigai died during tps"
+            warn "T4 ($v_crypto/$s_crypto): vaigai died during TPS test"
             matrix_tps["$combo"]="N/A"
         fi
 
         # Throughput flood (short)
         vaigai_reset || true
-        if vaigai_cmd "throughput tx $VM_IP $TLS_PORT 5 $THROUGHPUT_STREAMS"; then
+        if vaigai_cmd "start --ip $VM_IP --port $TLS_PORT --duration 5 --reuse --streams $THROUGHPUT_STREAMS --tls"; then
             local ptx
             ptx=$(json_val tcp_payload_tx)
             local mbps=0
@@ -1205,7 +1183,7 @@ run_t5() {
         sleep 1
 
         info "  Concurrency=$conc — flooding 5s..."
-        vaigai_cmd "tps $VM_IP 5 0 56 $TLS_PORT"
+        vaigai_cmd "start --proto tls --ip $VM_IP --duration 5 --size 56 --port $TLS_PORT --tls"
 
         local hs_ok
         hs_ok=$(json_val tls_handshake_ok)

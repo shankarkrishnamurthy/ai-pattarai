@@ -114,10 +114,8 @@ if [[ $XDP_MODE -eq 1 ]]; then
 fi
 
 # ── teardown (always runs on exit) ────────────────────────────────────────────
-CFG=$(mktemp /tmp/vaigai_ping_XXXXXX.json)
 teardown() {
     info "Tearing down"
-    rm -f "$CFG"
     ip link del "$HOST_IF" &>/dev/null || true
     podman stop "$CONTAINER_NAME" &>/dev/null || true
     podman rm   "$CONTAINER_NAME" &>/dev/null || true
@@ -159,37 +157,20 @@ nsenter -t "$CPID" -n ip link set "$PEER_IF" up
 nsenter -t "$CPID" -n ip addr add "$PEER_CIDR" dev "$PEER_IF"
 info "Container $PEER_IF configured: $PEER_CIDR"
 
-# ── write ephemeral config ────────────────────────────────────────────────────
-cat > "$CFG" <<EOF
-{
-  "protocol": "icmp",
-  "flows": [{
-    "src_ip_lo": "$SRC_IP",
-    "src_ip_hi": "$SRC_IP",
-    "dst_ip":    "$PEER_IP",
-    "dst_port":  0,
-    "protocol":  "icmp",
-    "icmp_ping": true
-  }],
-  "load": { "max_concurrent": 1, "target_cps": 0, "duration_s": 0 },
-  "tls": null
-}
-EOF
-
 # ── run ───────────────────────────────────────────────────────────────────────
 info "Using DPDK vdev: $VDEV_ARG"
 if [[ $FLOOD_MODE -eq 1 ]]; then
     info "Flood ICMP -> $PEER_IP for ${FLOOD_SECONDS}s (workers generate at line rate)"
-    OUTPUT=$(printf 'tps %s %d 0 %d\nquit\n' \
+    OUTPUT=$(printf 'start --proto icmp --ip %s --duration %d --size %d --port 0\nquit\n' \
                  "$PEER_IP" "$FLOOD_SECONDS" "$PING_SIZE" \
-             | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
+             | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
                    --vdev "$VDEV_ARG" -- 2>&1) || true
 else
     info "Pinging $PEER_IP ($PING_COUNT packets, interval=${PING_INTERVAL_MS}ms)"
     OUTPUT=$(printf 'ping %s %d %d %d\nquit\n' \
                  "$PEER_IP" "$PING_COUNT" "$PING_SIZE" "$PING_INTERVAL_MS" \
-             | VAIGAI_CONFIG="$CFG" "$VAIGAI_BIN" \
+             | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
                    --vdev "$VDEV_ARG" -- 2>&1) || true
 fi

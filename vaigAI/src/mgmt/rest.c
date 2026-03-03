@@ -90,14 +90,9 @@ handle_request(void *cls,
     }
 
     if (strcmp(url, "/api/v1/config") == 0 && strcmp(method, "PUT") == 0) {
-        if (*upload_data_size > 0) {
-            config_apply_patch(upload_data);
-            *upload_data_size = 0;
-            return MHD_YES;
-        }
-        const char *ok = "{\"status\":\"applied\"}";
-        return send_text(connection, MHD_HTTP_OK, "application/json",
-                         ok, strlen(ok));
+        const char *err = "{\"error\":\"config endpoint removed — use CLI\"}";
+        return send_text(connection, MHD_HTTP_GONE, "application/json",
+                         err, strlen(err));
     }
 
     if (strcmp(url, "/api/v1/start") == 0 && strcmp(method, "POST") == 0) {

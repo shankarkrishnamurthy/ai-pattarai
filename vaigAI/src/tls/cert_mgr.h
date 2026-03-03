@@ -14,8 +14,6 @@ extern "C" {
 #define CERT_PATH_MAX 512
 
 typedef struct {
-    char cert_pem[CERT_PATH_MAX];
-    char key_pem[CERT_PATH_MAX];
     char ca_pem[CERT_PATH_MAX];
     bool verify_peer;
     bool enable_session_resumption;  /* TLS session tickets */
