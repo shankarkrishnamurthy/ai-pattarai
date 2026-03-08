@@ -4,6 +4,7 @@
 #include "arp.h"
 #include "ethernet.h"
 #include "../core/core_assign.h"
+#include "../port/port_init.h"
 #include "../common/util.h"
 #include "../telemetry/metrics.h"
 
@@ -168,7 +169,8 @@ void arp_mgmt_process(uint16_t port_id, struct rte_mbuf *m)
         struct rte_mempool *mp = g_worker_mempools[0];
         struct rte_mbuf *reply = build_arp_reply(port_id, arp, mp);
         if (reply) {
-            rte_eth_tx_burst(port_id, 0, &reply, 1);
+            uint16_t txq = g_port_caps[port_id].mgmt_tx_q;
+            rte_eth_tx_burst(port_id, txq, &reply, 1);
             worker_metrics_add_arp_reply_tx(0);
         }
     } else if (op == RTE_ARP_OP_REQUEST) {
@@ -186,7 +188,8 @@ void arp_mgmt_process(uint16_t port_id, struct rte_mbuf *m)
             e->fail_count = 0;
             /* Flush hold queue */
             for (uint32_t i = 0; i < e->hold_count; i++) {
-                rte_eth_tx_burst(port_id, 0, &e->hold[i], 1);
+                uint16_t txq = g_port_caps[port_id].mgmt_tx_q;
+                rte_eth_tx_burst(port_id, txq, &e->hold[i], 1);
             }
             e->hold_count = 0;
         }
@@ -267,7 +270,8 @@ int arp_request(uint16_t port_id, uint32_t ip_net)
     struct rte_mempool *mp = g_worker_mempools[0];
     struct rte_mbuf *m = build_arp_request(port_id, ip_net, mp);
     if (!m) return -1;
-    int nb = rte_eth_tx_burst(port_id, 0, &m, 1);
+    uint16_t txq = g_port_caps[port_id].mgmt_tx_q;
+    int nb = rte_eth_tx_burst(port_id, txq, &m, 1);
     if (!nb) rte_pktmbuf_free(m);
     else     worker_metrics_add_arp_request_tx(0);
     return 0;

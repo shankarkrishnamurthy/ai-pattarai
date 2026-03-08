@@ -4,6 +4,7 @@
 #include "icmp.h"
 #include "arp.h"
 #include "../core/mempool.h"
+#include "../port/port_init.h"
 #include "../common/util.h"
 #include "../telemetry/metrics.h"
 
@@ -151,7 +152,8 @@ void icmp_mgmt_process(uint16_t port_id, struct rte_mbuf *m)
     if (icmp->icmp_type == RTE_ICMP_TYPE_ECHO_REQUEST) {
         struct rte_mbuf *reply = build_echo_reply(port_id, ip, icmp);
         if (reply) {
-            rte_eth_tx_burst(port_id, 0, &reply, 1);
+            uint16_t txq = g_port_caps[port_id].mgmt_tx_q;
+            rte_eth_tx_burst(port_id, txq, &reply, 1);
             worker_metrics_add_icmp_echo_tx(0);
         }
     }
@@ -271,7 +273,8 @@ int icmp_ping_start(uint16_t port_id, uint32_t dst_ip_net,
         icmp->icmp_cksum = (ck_req == 0xFFFF) ? ck_req : (uint16_t)~ck_req;
 
         uint64_t t0 = rte_rdtsc();
-        uint16_t nb = rte_eth_tx_burst(port_id, 0, &m, 1);
+        uint16_t txq = g_port_caps[port_id].mgmt_tx_q;
+        uint16_t nb = rte_eth_tx_burst(port_id, txq, &m, 1);
         if (nb == 0) { rte_pktmbuf_free(m); continue; }
         sent++;
 

@@ -134,9 +134,11 @@ int tgen_eal_init(int argc, char **argv, tgen_eal_args_t *out_args)
 
     /* Parse tgen-specific options from the remaining arguments.
      * rte_eal_init() consumed [0 .. eal_consumed-1]; application args follow.
+     * Use eal_argv/eal_argc (not the original argv/argc) because we may have
+     * injected --file-prefix, shifting indices by 2.
      * getopt expects argv[0] to be the program name so we prepend a placeholder. */
-    int    app_argc  = argc - eal_consumed;
-    char **app_raw   = argv + eal_consumed;
+    int    app_argc  = eal_argc - eal_consumed;
+    char **app_raw   = eal_argv + eal_consumed;
 
     /* Build a wrapped argv with a fake program name at [0] */
     char *wrapped[64];
