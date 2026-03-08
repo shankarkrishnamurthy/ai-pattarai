@@ -9,7 +9,7 @@
 #    0. Common Pre-Setup  (hugepages, modules — run once per boot)
 #    1. Server + vaigai Pairs (5 topologies, pick one)
 #    2. Traffic Commands  (common to all topologies)
-#    3. Monitoring & Debug Commands (common to all topologies)
+#    3. Monitoring & Debug (common to all topologies)
 #    4. Cleanup
 #
 #  Conventions:
@@ -70,18 +70,7 @@ for DEV in $NIC_VM $QAT_PF_VM $QAT_PF_VAIGAI; do
     echo "$DEV" > /sys/bus/pci/drivers/vfio-pci/bind
 done
 
-# -- Server: QEMU VM (without QAT) --
-qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
-    -kernel /boot/vmlinuz-$(uname -r) \
-    -initrd /boot/initramfs-$(uname -r).img \
-    -append "console=ttyS0,115200 root=/dev/vda rw quiet net.ifnames=0 biosdevname=0 vaigai_mode=all" \
-    -drive "file=/work/firecracker/rootfs.ext4,format=raw,if=virtio,cache=unsafe" \
-    -nic user,model=virtio,hostfwd=tcp::2222-:22 \
-    -device "vfio-pci,host=$NIC_VM" \
-    -nographic
-# ↳ vaigai: ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -- -I 10.0.0.1
-
-# -- OR: Server: QEMU VM with QAT PF --
+# -- Server --
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -kernel /boot/vmlinuz-$(uname -r) \
     -initrd /boot/initramfs-$(uname -r).img \
@@ -91,15 +80,15 @@ qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -device "vfio-pci,host=$NIC_VM" \
     -device "vfio-pci,host=$QAT_PF_VM" \
     -nographic
-# ↳ vaigai: ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
-# ↳ fallback (if DPDK ignores PF):
-#    ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -a 0000:0b:01.0 -- -I 10.0.0.1
 
 # -- Post-boot setup --
 sleep 15
 ssh -o StrictHostKeyChecking=no -p 2222 root@localhost 'ip addr add 10.0.0.2/24 dev eth0 && ip link set eth0 up'
 ssh -p 2222 root@localhost 'nginx -t && rc-service nginx start; ss -tlnp'
 ssh -p 2222 root@localhost 'lspci | grep Co-pro && dmesg | grep -i qat | tail -3'
+
+# -- vaigai --
+./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
 # SERVER_IP=10.0.0.2
 
 
@@ -124,18 +113,7 @@ for DEV in $NIC_VAIGAI $NIC_VM $QAT_PF_VM $QAT_PF_VAIGAI; do
     echo "$DEV" > /sys/bus/pci/drivers/vfio-pci/bind
 done
 
-# -- Server: QEMU VM (without QAT) --
-qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
-    -kernel /boot/vmlinuz-$(uname -r) \
-    -initrd /boot/initramfs-$(uname -r).img \
-    -append "console=ttyS0,115200 root=/dev/vda rw quiet net.ifnames=0 biosdevname=0 vaigai_mode=all" \
-    -drive "file=/work/firecracker/rootfs.ext4,format=raw,if=virtio,cache=unsafe" \
-    -nic user,model=virtio,hostfwd=tcp::2222-:22 \
-    -device "vfio-pci,host=$NIC_VM" \
-    -nographic
-# ↳ vaigai: ./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -- -I 10.0.0.1
-
-# -- OR: Server: QEMU VM with QAT PF --
+# -- Server --
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -kernel /boot/vmlinuz-$(uname -r) \
     -initrd /boot/initramfs-$(uname -r).img \
@@ -145,15 +123,15 @@ qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -device "vfio-pci,host=$NIC_VM" \
     -device "vfio-pci,host=$QAT_PF_VM" \
     -nographic
-# ↳ vaigai: ./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
-# ↳ fallback (if DPDK ignores PF):
-#    ./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -a 0000:0b:01.0 -- -I 10.0.0.1
 
 # -- Post-boot setup --
 sleep 15
 ssh -o StrictHostKeyChecking=no -p 2222 root@localhost 'ip addr add 10.0.0.2/24 dev eth0 && ip link set eth0 up'
 ssh -p 2222 root@localhost 'nginx -t && rc-service nginx start; ss -tlnp'
 ssh -p 2222 root@localhost 'lspci | grep Co-pro && dmesg | grep -i qat | tail -3'
+
+# -- vaigai --
+./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
 # SERVER_IP=10.0.0.2
 
 
@@ -217,9 +195,10 @@ curl -s --unix-socket "$FC_SOCKET" -X PUT http://localhost/actions \
 sleep 5
 ping -c 1 "$VM_IP"
 
-# ↳ vaigai: ./build/vaigai -l 0-1 --no-pci --vdev "net_tap0,iface=tap-vaigai" -- -I 192.168.204.1
+# -- vaigai --
 # IMPORTANT: After vaigai starts, attach tap-vaigai to bridge:
 #   ip link set tap-vaigai master br-vaigai && ip link set tap-vaigai up
+./build/vaigai -l 0-1 --no-pci --vdev "net_tap0,iface=tap-vaigai" -- -I 192.168.204.1
 # SERVER_IP=192.168.204.2
 
 
@@ -263,7 +242,8 @@ podman exec vaigai-server sh -c '
 '
 podman exec vaigai-server ss -tlnp
 
-# ↳ vaigai (AF_XDP): ./build/vaigai -l 0-1 --no-pci --vdev "net_af_xdp0,iface=veth-vaigai" -- -I 192.168.200.1
+# -- vaigai (AF_XDP) --
+./build/vaigai -l 0-1 --no-pci --vdev "net_af_xdp0,iface=veth-vaigai" -- -I 192.168.200.1
 # SERVER_IP=192.168.200.2
 
 
@@ -320,7 +300,8 @@ socat TCP-LISTEN:5001,bind=192.168.201.2,fork,reuseaddr /dev/null &
 
 ss -tlnp | grep -E ':(80|443|4433|5000|5001)\b'
 
-# ↳ vaigai: ./build/vaigai -l 0-1 --no-pci --vdev "net_af_packet0,iface=veth-vaigai" -- -I 192.168.201.1
+# -- vaigai --
+./build/vaigai -l 0-1 --no-pci --vdev "net_af_packet0,iface=veth-vaigai" -- -I 192.168.201.1
 # SERVER_IP=192.168.201.2
 
 
