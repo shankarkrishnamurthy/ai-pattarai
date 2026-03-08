@@ -165,12 +165,14 @@ int tgen_worker_loop(void *arg)
             }
             if (cmd.cmd == CFG_CMD_START) {
                 tx_gen_config_t *gcfg = (tx_gen_config_t *)cmd.payload;
-                /* Reset stale TCP state from any previous test so
-                 * the new test starts with a clean TCB store and
-                 * fully available port pool.  Sends RST for all
-                 * active connections before clearing. */
+                /* Reset stale TCP state from any previous test.
+                 * Sends RST for all active connections, frees TCBs
+                 * and returns ports to the pool.  Do NOT call
+                 * tcp_port_pool_reset() here — the management core
+                 * already reset the pool AND applied the RSS queue-
+                 * affinity filter before broadcasting this command.
+                 * A second reset would destroy that filter. */
                 tcp_fsm_reset_all(ctx->worker_idx);
-                tcp_port_pool_reset(ctx->worker_idx);
                 /* Clear pre-built HTTP request for this worker */
                 if (gcfg->proto == TX_GEN_PROTO_HTTP)
                     g_http_req[ctx->worker_idx].hdr_len = 0;

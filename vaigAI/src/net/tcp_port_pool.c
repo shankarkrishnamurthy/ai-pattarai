@@ -139,9 +139,10 @@ ip_pool_get(worker_pool_t *wp, uint32_t src_ip)
         if (p->src_ip == src_ip)
             return p;
         if (p->src_ip == 0) {
-            /* Empty slot: claim it */
+            /* Empty slot: claim it — inherit shared pool's bitmap
+             * so RSS queue affinity filtering is preserved. */
             p->src_ip = src_ip;
-            memset(p->map, 0xff, sizeof(p->map));
+            memcpy(p->map, wp->shared.map, sizeof(p->map));
             p->cursor = 0;
             return p;
         }
@@ -193,12 +194,15 @@ tcp_port_pool_reset(uint32_t worker_idx)
 {
     worker_pool_t *wp = g_pools[worker_idx];
     if (!wp) return;
-    /* Mark all ports available but preserve cursor to avoid port reuse */
+    /* Mark all ports available */
     memset(wp->shared.map, 0xff, sizeof(wp->shared.map));
-    /* Keep wp->shared.cursor and src_ip as-is */
+    wp->shared.cursor = 0;
+    /* Clear per-IP pools so they reinitialize from shared.map
+     * (which may have RSS filtering applied after this reset). */
     for (uint32_t s = 0; s < N_IP_SLOTS; s++) {
-        memset(wp->ip_pools[s].map, 0xff, sizeof(wp->ip_pools[s].map));
-        /* Keep ip_pools[s].cursor and src_ip as-is */
+        wp->ip_pools[s].src_ip = 0;
+        memset(wp->ip_pools[s].map, 0, sizeof(wp->ip_pools[s].map));
+        wp->ip_pools[s].cursor = 0;
     }
     /* Drain TIME_WAIT ring */
     wp->tw_head = 0;
@@ -272,5 +276,103 @@ tcp_port_pool_tick(uint32_t worker_idx, uint64_t now_tsc)
         ip_pool_t *ip = ip_pool_get(wp, e->src_ip);
         bm_set(ip->map, e->port - TGEN_EPHEM_LO);
         wp->tw_head = (wp->tw_head + 1) & TW_RING_MASK;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* RSS queue affinity filter                                            */
+/* ------------------------------------------------------------------ */
+#include <rte_thash.h>
+#include <rte_ethdev.h>
+
+void
+tcp_port_pool_apply_rss_filter(uint32_t n_workers,
+                               uint32_t src_ip, uint32_t dst_ip,
+                               uint16_t dst_port,
+                               const uint8_t *rss_key,
+                               uint8_t rss_key_len,
+                               uint16_t n_rxq)
+{
+    if (n_rxq <= 1 || n_workers <= 1)
+        return;  /* no filtering needed */
+
+    (void)rss_key_len;
+
+    /* Query the actual RETA from port 0 to match NIC behavior exactly */
+    uint16_t port_id = 0;
+    struct rte_eth_dev_info dev_info;
+    int ri = rte_eth_dev_info_get(port_id, &dev_info); (void)ri;
+    uint16_t reta_size = dev_info.reta_size;
+    if (reta_size == 0) reta_size = 128; /* fallback */
+
+    /* Read the RETA from device */
+    uint16_t n_reta_groups = (reta_size + RTE_ETH_RETA_GROUP_SIZE - 1) /
+                             RTE_ETH_RETA_GROUP_SIZE;
+    struct rte_eth_rss_reta_entry64 reta_conf[8]; /* max 512 entries */
+    memset(reta_conf, 0, sizeof(reta_conf));
+    for (uint16_t i = 0; i < n_reta_groups && i < 8; i++)
+        reta_conf[i].mask = UINT64_MAX;
+
+    int ret = rte_eth_dev_rss_reta_query(port_id, reta_conf, reta_size);
+    bool have_reta = (ret == 0);
+
+    RTE_LOG(INFO, TGEN_PP,
+            "RSS filter: reta_size=%u, n_rxq=%u, have_reta=%d\n",
+            reta_size, n_rxq, have_reta);
+
+    uint32_t ports_per_worker[TGEN_MAX_WORKERS];
+    memset(ports_per_worker, 0, sizeof(ports_per_worker));
+
+    for (uint32_t bit = 0; bit < TGEN_EPHEM_CNT; bit++) {
+        uint16_t sport = (uint16_t)(TGEN_EPHEM_LO + bit);
+
+        /* rte_softrss() takes host byte order values + original key.
+         * src_ip/dst_ip are stored as network byte order (from inet_pton),
+         * so convert to host byte order for the hash. */
+        uint32_t tuple[3];
+        tuple[0] = rte_be_to_cpu_32(src_ip);     /* host byte order */
+        tuple[1] = rte_be_to_cpu_32(dst_ip);     /* host byte order */
+        tuple[2] = ((uint32_t)sport << 16) | (uint32_t)dst_port;
+
+        uint32_t hash = rte_softrss(tuple, 3, rss_key);
+
+        /* Map hash to queue using RETA (matches NIC behavior) */
+        uint16_t reta_idx = hash & (reta_size - 1);
+        uint16_t target_q;
+        if (have_reta) {
+            uint16_t group = reta_idx / RTE_ETH_RETA_GROUP_SIZE;
+            uint16_t entry = reta_idx % RTE_ETH_RETA_GROUP_SIZE;
+            target_q = reta_conf[group].reta[entry];
+        } else {
+            target_q = reta_idx % n_rxq;
+        }
+
+        if (target_q >= n_workers)
+            target_q = target_q % n_workers;
+
+        /* Clear this port from every worker except the target */
+        for (uint32_t w = 0; w < n_workers; w++) {
+            worker_pool_t *wp = g_pools[w];
+            if (!wp) continue;
+            if (w == target_q) {
+                ports_per_worker[w]++;
+                bm_set(wp->shared.map, bit);
+            } else {
+                bm_clear(wp->shared.map, bit);
+            }
+            /* Also filter per-IP pools */
+            for (uint32_t s = 0; s < N_IP_SLOTS; s++) {
+                if (wp->ip_pools[s].src_ip == 0) continue;
+                if (w == target_q)
+                    bm_set(wp->ip_pools[s].map, bit);
+                else
+                    bm_clear(wp->ip_pools[s].map, bit);
+            }
+        }
+    }
+
+    for (uint32_t w = 0; w < n_workers; w++) {
+        RTE_LOG(INFO, TGEN_PP, "RSS filter: worker %u → %u ports\n",
+                w, ports_per_worker[w]);
     }
 }

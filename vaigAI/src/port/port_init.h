@@ -25,6 +25,8 @@ typedef struct {
     bool          has_scatter_rx;
     bool          has_multi_seg_tx;
     bool          has_rss;
+    uint64_t      rss_offloads;    /* supported RSS hash functions */
+    uint8_t       rss_key_size;   /* required RSS key length */
     bool          has_vlan_offload;
     uint32_t      max_rx_queues;
     uint32_t      max_tx_queues;
@@ -40,6 +42,10 @@ typedef struct {
 /** Per-port caps array, indexed by DPDK port_id. */
 extern port_caps_t g_port_caps[TGEN_MAX_PORTS];
 extern uint32_t    g_n_ports;
+
+/** RSS key used for all ports (Toeplitz symmetric). */
+const uint8_t *tgen_rss_key(void);
+uint8_t        tgen_rss_key_max_len(void);
 
 /** Initialise all DPDK ports: probe capabilities, configure queues,
  *  set RSS, enable promiscuous mode, start device.

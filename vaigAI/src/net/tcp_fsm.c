@@ -334,6 +334,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
     /* Try to find existing TCB (look up as "our" connection — swap src/dst) */
     tcb_t *tcb = tcb_lookup(store, dst_ip, dst_port, src_ip, src_port);
 
+
     uint8_t flags = tcp->tcp_flags;
 
     /* Parse TCP options */

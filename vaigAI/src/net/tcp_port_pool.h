@@ -57,6 +57,21 @@ void tcp_port_pool_tick(uint32_t worker_idx, uint64_t now_tsc);
  */
 void tcp_port_pool_reset(uint32_t worker_idx);
 
+/**
+ * Filter each worker's port pool to only contain ports whose RSS hash
+ * maps to that worker's RX queue.  Required for multi-worker TCP so
+ * that response packets (SYN-ACK etc.) arrive at the correct worker.
+ *
+ * Call from management thread after destination is known but before
+ * traffic starts.  Only needed when n_rxq > 1.
+ */
+void tcp_port_pool_apply_rss_filter(uint32_t n_workers,
+                                    uint32_t src_ip, uint32_t dst_ip,
+                                    uint16_t dst_port,
+                                    const uint8_t *rss_key,
+                                    uint8_t rss_key_len,
+                                    uint16_t n_rxq);
+
 #ifdef __cplusplus
 }
 #endif

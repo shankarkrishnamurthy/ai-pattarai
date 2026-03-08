@@ -38,7 +38,7 @@
  * microseconds when the server can keep up, so a modest limit
  * doesn't reduce sustained CPS — it just prevents the initial burst
  * from causing mass SYN drops and 200 ms RTO retransmit storms. */
-#define TCP_MAX_INFLIGHT   16
+#define TCP_MAX_INFLIGHT   32
 
 static uint8_t g_tp_zero_buf[1400]; /* zero-filled plaintext for throughput
                                       * Keep small enough that TLS record

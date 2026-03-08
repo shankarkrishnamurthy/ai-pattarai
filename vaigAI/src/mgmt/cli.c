@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 #include <poll.h>
 #include <arpa/inet.h>
+#include <rte_ethdev.h>
 
 #ifdef HAVE_READLINE
 # include <readline/readline.h>
@@ -297,6 +298,25 @@ cmd_start(int argc, char **argv)
     /* ── Reset counters & push to workers ───────────────────────────── */
     uint32_t n_workers = g_core_map.num_workers;
     metrics_reset(n_workers);
+    rte_eth_stats_reset(port_id);
+
+    /* Apply RSS queue affinity so responses land on the correct worker */
+    if (proto == TX_GEN_PROTO_TCP_SYN || proto == TX_GEN_PROTO_HTTP ||
+        proto == TX_GEN_PROTO_THROUGHPUT) {
+        struct rte_eth_dev_info dev_info;
+        int _ri = rte_eth_dev_info_get(port_id, &dev_info); (void)_ri;
+        uint16_t n_rxq = dev_info.nb_rx_queues;
+        port_caps_t *pcap = &g_port_caps[port_id];
+        uint8_t key_len = pcap->rss_key_size;
+        if (key_len == 0 || key_len > tgen_rss_key_max_len())
+            key_len = 40;
+        /* Reset pools first then filter */
+        for (uint32_t w = 0; w < n_workers; w++)
+            tcp_port_pool_reset(w);
+        tcp_port_pool_apply_rss_filter(n_workers, gcfg.src_ip, dst_ip,
+                                       a.port, tgen_rss_key(), key_len,
+                                       n_rxq);
+    }
 
     config_update_t cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -369,6 +389,34 @@ cmd_start(int argc, char **argv)
     char summary[8192];
     export_summary(&snap, a.duration, a.proto, summary, sizeof(summary));
     puts(summary);
+
+    /* NIC-level stats for diagnosis */
+    struct rte_eth_stats nic;
+    if (rte_eth_stats_get(port_id, &nic) == 0) {
+        printf("\n--- NIC stats (port %u) ---\n", port_id);
+        printf("  opackets: %" PRIu64 "  ipackets: %" PRIu64 "\n",
+               nic.opackets, nic.ipackets);
+        printf("  obytes:   %" PRIu64 "  ibytes:   %" PRIu64 "\n",
+               nic.obytes, nic.ibytes);
+        printf("  imissed:  %" PRIu64 "  ierrors:  %" PRIu64
+               "  oerrors:  %" PRIu64 "\n",
+               nic.imissed, nic.ierrors, nic.oerrors);
+        for (uint32_t q = 0; q < n_workers; q++)
+            printf("  q%u: rx=%" PRIu64 " tx=%" PRIu64 "\n",
+                   q, nic.q_ipackets[q], nic.q_opackets[q]);
+    }
+
+    /* Per-worker TCP counters */
+    if (n_workers > 1) {
+        printf("\n--- per-worker TCP ---\n");
+        for (uint32_t w = 0; w < n_workers; w++) {
+            const worker_metrics_t *wm = &snap.per_worker[w];
+            printf("  w%u: syn=%"PRIu64" open=%"PRIu64" retx=%"PRIu64
+                   " tx=%"PRIu64" rx=%"PRIu64"\n",
+                   w, wm->tcp_syn_sent, wm->tcp_conn_open,
+                   wm->tcp_retransmit, wm->tx_pkts, wm->rx_pkts);
+        }
+    }
 }
 
 static void

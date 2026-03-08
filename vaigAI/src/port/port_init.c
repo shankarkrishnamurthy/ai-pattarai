@@ -18,17 +18,22 @@
 #include <rte_flow.h>
 
 /* ── Symmetric Toeplitz RSS key (40 bytes) ────────────────────────────────── */
-static const uint8_t g_rss_key_sym[40] = {
+static const uint8_t g_rss_key_sym[52] = {
     0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
     0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
     0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
     0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
     0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
+    0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a, 0x6d, 0x5a,
+    0x6d, 0x5a, 0x6d, 0x5a,
 };
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
 port_caps_t g_port_caps[TGEN_MAX_PORTS];
 uint32_t    g_n_ports;
+
+const uint8_t *tgen_rss_key(void) { return g_rss_key_sym; }
+uint8_t        tgen_rss_key_max_len(void) { return sizeof(g_rss_key_sym); }
 
 /* ── Probe & populate port_caps_t ─────────────────────────────────────────── */
 static void probe_caps(uint16_t port_id, port_caps_t *caps)
@@ -51,6 +56,8 @@ static void probe_caps(uint16_t port_id, port_caps_t *caps)
     caps->has_scatter_rx         = !!(rx_ol & RTE_ETH_RX_OFFLOAD_SCATTER);
     caps->has_multi_seg_tx       = !!(tx_ol & RTE_ETH_TX_OFFLOAD_MULTI_SEGS);
     caps->has_rss                = (info.flow_type_rss_offloads != 0);
+    caps->rss_offloads           = info.flow_type_rss_offloads;
+    caps->rss_key_size           = info.hash_key_size;
     caps->has_vlan_offload       = !!(tx_ol & RTE_ETH_TX_OFFLOAD_VLAN_INSERT);
 
     caps->max_rx_queues  = info.max_rx_queues;
@@ -105,10 +112,14 @@ static int port_setup(uint16_t port_id,
     /* Enable RSS if supported */
     if (caps->has_rss && n_rxq > 1) {
         port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+        uint8_t key_sz = caps->rss_key_size;
+        if (key_sz == 0 || key_sz > sizeof(g_rss_key_sym))
+            key_sz = 40;  /* fallback to standard Toeplitz key size */
         port_conf.rx_adv_conf.rss_conf.rss_key     = (uint8_t *)g_rss_key_sym;
-        port_conf.rx_adv_conf.rss_conf.rss_key_len = sizeof(g_rss_key_sym);
+        port_conf.rx_adv_conf.rss_conf.rss_key_len = key_sz;
         port_conf.rx_adv_conf.rss_conf.rss_hf =
-            RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP;
+            (RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP)
+            & caps->rss_offloads;
     }
 
     /* TX offloads */
