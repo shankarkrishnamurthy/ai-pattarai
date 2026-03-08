@@ -60,7 +60,7 @@ STEP="all"
 usage() {
     sed -n '/^# ║/s/^# ║ *//p' "$0" | sed 's/ *║$//'
     echo ""
-    echo "Steps: all | host-packages | dpdk | firecracker | kernel | rootfs | qemu-rootfs | qat-host | vaigai | verify"
+    echo "Steps: all | host-packages | dpdk | firecracker | kernel | rootfs | qemu-rootfs | vm-initramfs | qat-host | vaigai | verify"
     exit 0
 }
 while [[ $# -gt 0 ]]; do
@@ -786,6 +786,26 @@ QATINITEOF
     ok "QEMU Rootfs: $QEMU_ROOTFS ($(du -h "$QEMU_ROOTFS" | cut -f1))"
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  VM-specific initramfs (avoids host initramfs bloat / stale firmware)
+# ─────────────────────────────────────────────────────────────────────────────
+build_vm_initramfs() {
+    banner "Step 5c: VM Initramfs"
+    local kver
+    kver=$(uname -r)
+    local out="$FC_DIR/initramfs-vm.img"
+
+    info "Building minimal VM initramfs for kernel $kver"
+    dracut --no-hostonly --force \
+        --modules "base rootfs-block kernel-modules" \
+        --omit "plymouth rdma multipath iscsi fcoe fcoe-uefi nfs nbd lunmask crypt dm lvm btrfs network network-manager" \
+        --drivers "virtio_blk virtio_pci virtio_net virtio_scsi ext4 vfio-pci vfio vfio_iommu_type1 mlx5_core mlx5_ib i40e" \
+        --no-hostonly-cmdline \
+        "$out" "$kver"
+
+    ok "VM Initramfs: $out ($(du -h "$out" | cut -f1))"
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
 #
@@ -932,8 +952,8 @@ verify_env() {
     check "Guest kernel"              "test -f '$FC_DIR/vmlinux'"
     check "Rootfs"                    "test -f '$ROOTFS'"
     check "QEMU Rootfs"               "test -f '$QEMU_ROOTFS'"
+    check "VM initramfs"              "test -f '$FC_DIR/initramfs-vm.img'"
     check "Host vmlinuz"              "test -f '/boot/vmlinuz-$(uname -r)'"
-    check "Host initramfs"            "test -f '/boot/initramfs-$(uname -r).img'"
     check "QEMU"                      "command -v qemu-system-x86_64"
     check "KVM"                       "test -c /dev/kvm"
     check "vfio-pci module"           "modprobe vfio-pci"
@@ -1005,6 +1025,7 @@ should_run "firecracker"   && install_firecracker
 should_run "kernel"        && build_guest_kernel
 should_run "rootfs"        && build_rootfs
 should_run "qemu-rootfs"   && build_qemu_rootfs
+should_run "vm-initramfs" && build_vm_initramfs
 should_run "qat-host"      && setup_qat_host
 should_run "vaigai"        && build_vaigai
 should_run "verify"        && verify_env
