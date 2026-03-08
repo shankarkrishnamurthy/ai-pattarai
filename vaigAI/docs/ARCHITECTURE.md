@@ -734,7 +734,7 @@ calls per iteration (~10 ns overhead):
 `Busy% = (1 - idle/total) × 100`. Useful because DPDK poll loops always
 show 100% in `top`. The management core reads these via `cpu_stats_snapshot()`.
 
-### 3.8 Memory Stats
+### 3.8 Memory Stats (no per-worker instrumentation)
 
 Read-only queries with no per-worker instrumentation:
 
@@ -745,7 +745,7 @@ Read-only queries with no per-worker instrumentation:
 | TCP connections | `g_tcb_stores[w].count` / `.capacity` | Active TCBs per worker |
 | Hugepages | `/sys/kernel/mm/hugepages/` | System hugepage counters |
 
-### 3.7 Structured Logging
+### 3.9 Structured Logging
 
 Eight log domains mapped to `RTE_LOGTYPE_USER1..8`:
 
@@ -1050,7 +1050,8 @@ tests/
 ├── tcp_tap.sh              # TCP SYN/data/FIN over TAP + Firecracker
 ├── http_nic.sh             # HTTP RPS + throughput over NIC + QEMU
 ├── tls_nic.sh              # TLS handshake/throughput over NIC + QEMU + QAT
-└── https_nic.sh            # HTTPS (nginx SSL) over NIC + QEMU + QAT
+├── https_nic.sh            # HTTPS (nginx SSL) over NIC + QEMU + QAT
+└── manual-tests.sh         # Cut-and-paste reference for all topologies
 ```
 
 ### 5.2 Topology Tiers
