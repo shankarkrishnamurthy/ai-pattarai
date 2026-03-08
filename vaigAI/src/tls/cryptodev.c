@@ -4,6 +4,7 @@
 #include "cryptodev.h"
 #include "../telemetry/log.h"
 #include <rte_malloc.h>
+#include <stdbool.h>
 #include <string.h>
 #include <errno.h>
 
@@ -25,12 +26,29 @@ cryptodev_init(void)
         return 0;
     }
 
-    g_cdev_id = 0; /* use device 0 */
-
+    /* Find first symmetric crypto device (needed for TLS bulk cipher).
+     * QAT VFs create both asym and sym devices; we must skip asym ones. */
     struct rte_cryptodev_info dev_info;
+    bool found_sym = false;
+    for (uint8_t i = 0; i < g_n_cdevs; i++) {
+        rte_cryptodev_info_get(i, &dev_info);
+        TGEN_INFO(TGEN_LOG_TLS, "Crypto device %u: driver=%s max_qp=%u\n",
+                  i, dev_info.driver_name, dev_info.max_nb_queue_pairs);
+        if (!found_sym &&
+            (dev_info.feature_flags & RTE_CRYPTODEV_FF_SYMMETRIC_CRYPTO)) {
+            g_cdev_id = i;
+            found_sym = true;
+        }
+    }
+    if (!found_sym) {
+        TGEN_WARN(TGEN_LOG_TLS,
+                  "No symmetric crypto device found — TLS uses SW path\n");
+        g_n_cdevs = 0;
+        return 0;
+    }
     rte_cryptodev_info_get(g_cdev_id, &dev_info);
-    TGEN_INFO(TGEN_LOG_TLS, "Crypto device 0: driver=%s max_qp=%u\n",
-              dev_info.driver_name, dev_info.max_nb_queue_pairs);
+    TGEN_INFO(TGEN_LOG_TLS, "Selected crypto device %u: %s\n",
+              g_cdev_id, dev_info.driver_name);
 
     /* Cap queue pairs to what the device supports */
     uint16_t nb_qps = (uint16_t)TGEN_MAX_WORKERS;
@@ -76,7 +94,8 @@ cryptodev_init(void)
         return -EIO;
     }
 
-    TGEN_INFO(TGEN_LOG_TLS, "Crypto device 0 started (%u QPs)\n", nb_qps);
+    TGEN_INFO(TGEN_LOG_TLS, "Crypto device %u started (%u QPs)\n",
+              g_cdev_id, nb_qps);
     return (int)g_n_cdevs;
 }
 
