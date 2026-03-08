@@ -47,18 +47,29 @@ ninja -C build
 # ─────────────────────────────────────────────────────────────────────────────
 #  Topology: vaigai (DPDK mlx5, port0) ←loopback→ QEMU VM (vfio passthrough, port1)
 #  Network:  10.0.0.1 (vaigai) ↔ 10.0.0.2 (VM)
-#  NICs:     95:00.0 → vaigai (bifurcated mlx5, stays on mlx5_core)
-#            95:00.1 → VM     (passthrough, must bind to vfio-pci)
+#  NICs:     95:00.0 → vaigai  (bifurcated mlx5, stays on mlx5_core)
+#            95:00.1 → VM      (PF passthrough, bind to vfio-pci)
+#  QAT:     PF 0d:00.0 → VM    (PF passthrough, kernel qat_dh895xcc inside VM)
+#           PF 0e:00.0 → vaigai (PF passthrough, DPDK crypto_qat PMD)
+#
+#  NOTE: DPDK crypto_qat PMD only has VF device ID 0x0443 in its PCI ID table,
+#  not PF 0x0435. If vaigai ignores the QAT PF, use a VF instead:
+#    QAT_VF=0000:0b:01.0  (VF of PF 0b:00.0 — different device from 0d/0e)
 
-# -- Per-test setup: bind VM NIC to vfio-pci --
+# -- Per-test setup: bind VM NIC + QAT PFs to vfio-pci --
 NIC_VM=0000:95:00.1
 NIC_IFACE=ens30f1np1   # kernel interface name before unbinding
-ip link set "$NIC_IFACE" down 2>/dev/null
-echo "$NIC_VM" > /sys/bus/pci/devices/$NIC_VM/driver/unbind 2>/dev/null
-echo "vfio-pci" > /sys/bus/pci/devices/$NIC_VM/driver_override
-echo "$NIC_VM" > /sys/bus/pci/drivers/vfio-pci/bind
+QAT_PF_VM=0000:0d:00.0     # → QEMU VM (server-side crypto)
+QAT_PF_VAIGAI=0000:0e:00.0 # → vaigai  (client-side crypto)
 
-# -- Start QEMU VM --
+ip link set "$NIC_IFACE" down 2>/dev/null
+for DEV in $NIC_VM $QAT_PF_VM $QAT_PF_VAIGAI; do
+    echo "$DEV" > /sys/bus/pci/devices/$DEV/driver/unbind 2>/dev/null
+    echo "vfio-pci" > /sys/bus/pci/devices/$DEV/driver_override
+    echo "$DEV" > /sys/bus/pci/drivers/vfio-pci/bind
+done
+
+# -- Start QEMU VM (without QAT) --
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -kernel /boot/vmlinuz-$(uname -r) \
     -initrd /boot/initramfs-$(uname -r).img \
@@ -66,15 +77,29 @@ qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -drive "file=/work/firecracker/rootfs.ext4,format=raw,if=virtio,cache=unsafe" \
     -nic user,model=virtio,hostfwd=tcp::2222-:22 \
     -device "vfio-pci,host=$NIC_VM" \
-    -serial file:/tmp/vaigai-serial.log -monitor none -display none </dev/null &
-QEMU_PID=$!
+    -nographic
+
+# -- OR: Start QEMU VM with QAT PF (for TLS/HTTPS crypto offload) --
+qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
+    -kernel /boot/vmlinuz-$(uname -r) \
+    -initrd /boot/initramfs-$(uname -r).img \
+    -append "console=ttyS0,115200 root=/dev/vda rw quiet net.ifnames=0 biosdevname=0 vaigai_mode=all" \
+    -drive "file=/work/firecracker/rootfs.ext4,format=raw,if=virtio,cache=unsafe" \
+    -nic user,model=virtio,hostfwd=tcp::2222-:22 \
+    -device "vfio-pci,host=$NIC_VM" \
+    -device "vfio-pci,host=$QAT_PF_VM" \
+    -nographic
+# ↳ Pair with: ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -a $QAT_PF_VAIGAI -- -I 10.0.0.1
 
 # -- Wait for boot, then configure VM networking --
 sleep 15
 ssh -o StrictHostKeyChecking=no -p 2222 root@localhost 'ip addr add 10.0.0.2/24 dev eth0 && ip link set eth0 up'
 
-# -- Verify services (from host) --
+# -- Verify services --
 ssh -p 2222 root@localhost 'nginx -t && rc-service nginx start; ss -tlnp'
+
+# -- Verify QAT inside VM (QAT variant only) --
+ssh -p 2222 root@localhost 'lspci | grep Co-pro && dmesg | grep -i qat | tail -3'
 
 # CLIENT_IP=10.0.0.1  SERVER_IP=10.0.0.2
 # See section 2A for matching vaigai command.
@@ -85,19 +110,25 @@ ssh -p 2222 root@localhost 'nginx -t && rc-service nginx start; ss -tlnp'
 # ─────────────────────────────────────────────────────────────────────────────
 #  Topology: vaigai (DPDK i40e, port0) ←loopback→ QEMU VM (vfio passthrough, port1)
 #  Network:  10.0.0.1 (vaigai) ↔ 10.0.0.2 (VM)
-#  NICs:     83:00.0 → vaigai (must bind to vfio-pci)
-#            83:00.1 → VM     (must bind to vfio-pci)
+#  NICs:     83:00.0 → vaigai  (PF passthrough, bind to vfio-pci)
+#            83:00.1 → VM      (PF passthrough, bind to vfio-pci)
+#  QAT:     PF 0d:00.0 → VM    (PF passthrough, kernel qat_dh895xcc inside VM)
+#           PF 0e:00.0 → vaigai (PF passthrough, DPDK crypto_qat PMD)
+#
+#  NOTE: Same DPDK QAT PF limitation as 1A — see note there.
 
-# -- Per-test setup: bind both NICs to vfio-pci --
+# -- Per-test setup: bind NICs + QAT PFs to vfio-pci --
 NIC_VAIGAI=0000:83:00.0
 NIC_VM=0000:83:00.1
-for PCI in $NIC_VAIGAI $NIC_VM; do
-    echo "$PCI" > /sys/bus/pci/devices/$PCI/driver/unbind 2>/dev/null
-    echo "vfio-pci" > /sys/bus/pci/devices/$PCI/driver_override
-    echo "$PCI" > /sys/bus/pci/drivers/vfio-pci/bind
+QAT_PF_VM=0000:0d:00.0     # → QEMU VM
+QAT_PF_VAIGAI=0000:0e:00.0 # → vaigai
+for DEV in $NIC_VAIGAI $NIC_VM $QAT_PF_VM $QAT_PF_VAIGAI; do
+    echo "$DEV" > /sys/bus/pci/devices/$DEV/driver/unbind 2>/dev/null
+    echo "vfio-pci" > /sys/bus/pci/devices/$DEV/driver_override
+    echo "$DEV" > /sys/bus/pci/drivers/vfio-pci/bind
 done
 
-# -- Start QEMU VM --
+# -- Start QEMU VM (without QAT) --
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -kernel /boot/vmlinuz-$(uname -r) \
     -initrd /boot/initramfs-$(uname -r).img \
@@ -105,12 +136,24 @@ qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -drive "file=/work/firecracker/rootfs.ext4,format=raw,if=virtio,cache=unsafe" \
     -nic user,model=virtio,hostfwd=tcp::2222-:22 \
     -device "vfio-pci,host=$NIC_VM" \
-    -serial file:/tmp/vaigai-serial.log -monitor none -display none </dev/null &
-QEMU_PID=$!
+    -nographic
+
+# -- OR: Start QEMU VM with QAT PF (for TLS/HTTPS crypto offload) --
+qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
+    -kernel /boot/vmlinuz-$(uname -r) \
+    -initrd /boot/initramfs-$(uname -r).img \
+    -append "console=ttyS0,115200 root=/dev/vda rw quiet net.ifnames=0 biosdevname=0 vaigai_mode=all" \
+    -drive "file=/work/firecracker/rootfs.ext4,format=raw,if=virtio,cache=unsafe" \
+    -nic user,model=virtio,hostfwd=tcp::2222-:22 \
+    -device "vfio-pci,host=$NIC_VM" \
+    -device "vfio-pci,host=$QAT_PF_VM" \
+    -nographic
+# ↳ Pair with: ./build/vaigai -l 0-1 -n 4 -a $NIC_VAIGAI -a $QAT_PF_VAIGAI -- -I 10.0.0.1
 
 sleep 15
 ssh -o StrictHostKeyChecking=no -p 2222 root@localhost 'ip addr add 10.0.0.2/24 dev eth0 && ip link set eth0 up'
 ssh -p 2222 root@localhost 'nginx -t && rc-service nginx start; ss -tlnp'
+ssh -p 2222 root@localhost 'lspci | grep Co-pro && dmesg | grep -i qat | tail -3'
 
 # CLIENT_IP=10.0.0.1  SERVER_IP=10.0.0.2
 # See section 2B for matching vaigai command.
@@ -316,21 +359,19 @@ ss -tlnp | grep -E ':(80|443|4433|5000|5001)\b'
 # Use lcores on same NUMA node as the NIC.
 ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -- -I 10.0.0.1
 
-# With QAT VFs (for TLS/HTTPS crypto offload):
-./build/vaigai -l 14-17 -n 4 \
-    -a 0000:95:00.0 \
-    -a 0000:0b:01.0 -a 0000:0b:01.1 -a 0000:0b:01.2 -a 0000:0b:01.3 \
-    -- -I 10.0.0.1
+# With QAT PF (pairs with 1A QAT variant — PF 0e:00.0 for vaigai, PF 0d:00.0 in VM):
+./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
+# NOTE: If DPDK ignores PF 0x0435, use VF 0b:01.0 instead (from PF 0b:00.0):
+# ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -a 0000:0b:01.0 -- -I 10.0.0.1
 
 # ─── 2B. vaigai for i40e NIC (pairs with 1B) ───
 # i40e NIC must be bound to vfio-pci (done in 1B setup).
 ./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -- -I 10.0.0.1
 
-# With QAT VFs:
-./build/vaigai -l 0-3 -n 4 \
-    -a 0000:83:00.0 \
-    -a 0000:0b:01.0 -a 0000:0b:01.1 -a 0000:0b:01.2 -a 0000:0b:01.3 \
-    -- -I 10.0.0.1
+# With QAT PF (pairs with 1B QAT variant — PF 0e:00.0 for vaigai, PF 0d:00.0 in VM):
+./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
+# NOTE: If DPDK ignores PF 0x0435, use VF 0b:01.0 instead:
+# ./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -a 0000:0b:01.0 -- -I 10.0.0.1
 
 # ─── 2C. vaigai for Firecracker TAP (pairs with 1C) ───
 # IMPORTANT: After vaigai starts, attach tap-vaigai to bridge:
@@ -474,32 +515,25 @@ rm -rf /tmp/vaigai-native-tls /tmp/vaigai-native-www /tmp/vaigai-native-nginx.co
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  6. QAT CRYPTO OFFLOAD (optional, for TLS/HTTPS tests)                     ║
+# ║  6. QAT CRYPTO OFFLOAD NOTES                                               ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
-
-# -- Host: load QAT modules and create VFs for vaigai --
+#
+#  QAT setup is integrated into sections 1A/1B (PF binding + QEMU passthrough)
+#  and sections 2A/2B (vaigai with QAT PF or VF).
+#
+#  Device allocation (1 QAT per side):
+#    PF 0d:00.0 → QEMU VM  (kernel qat_dh895xcc driver for server-side offload)
+#    PF 0e:00.0 → vaigai   (DPDK crypto_qat PMD for client-side offload)
+#
+#  DPDK limitation: crypto_qat PMD PCI ID table has VF 0x0443 but NOT PF 0x0435.
+#  If vaigai doesn't probe the PF, use a VF from a third PF (0b:00.0):
+#    VF 0b:01.0 → vaigai   (bind to vfio-pci, add -a 0000:0b:01.0 to EAL)
+#
+#  Host pre-requisites (included in section 0):
 modprobe intel_qat
 modprobe qat_dh895xcc
-# VFs are auto-created; bind them to vfio-pci
-for VF in 0000:0b:01.0 0000:0b:01.1 0000:0b:01.2 0000:0b:01.3; do
-    echo "$VF" > /sys/bus/pci/devices/$VF/driver/unbind 2>/dev/null
-    echo "vfio-pci" > /sys/bus/pci/devices/$VF/driver_override
-    echo "$VF" > /sys/bus/pci/drivers/vfio-pci/bind
-done
-
-# -- QEMU VM: pass QAT PFs for server-side offload --
-# Add these -device flags to your QEMU command (section 1A/1B):
-#   -device "vfio-pci,host=0000:0d:00.0"
-#   -device "vfio-pci,host=0000:0e:00.0"
-#   -device "vfio-pci,host=0000:11:00.0"
-#   -device "vfio-pci,host=0000:12:00.0"
-# Then inside VM:
-#   ssh -p 2222 root@localhost 'sh /etc/vaigai/qat-setup.sh'
-
-# -- vaigai: add QAT VF BDFs to EAL args --
-# Add -a flags: -a 0000:0b:01.0 -a 0000:0b:01.1 -a 0000:0b:01.2 -a 0000:0b:01.3
-# See section 2A/2B "With QAT VFs" examples.
 
 # -- Verify QAT inside VM --
-# ssh -p 2222 root@localhost 'lspci | grep Co-pro'
-# ssh -p 2222 root@localhost 'cat /sys/bus/pci/drivers/qat_dh895xcc/*/qat/state'
+ssh -p 2222 root@localhost 'lspci | grep Co-pro'
+ssh -p 2222 root@localhost 'dmesg | grep -i qat | tail -5'
+ssh -p 2222 root@localhost 'cat /sys/bus/pci/drivers/qat_dh895xcc/*/qat/state 2>/dev/null'
