@@ -34,6 +34,7 @@ static const struct option g_long_opts[] = {
     { "max-chain-depth",        required_argument, NULL, 'C' },
     { "max-conn",               required_argument, NULL, 'X' },
     { "rest-port",              required_argument, NULL, 'R' },
+    { "src-ip",                 required_argument, NULL, 'I' },
     { NULL, 0, NULL, 0 },
 };
 
@@ -56,13 +57,14 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
     a->num_extra_eal_args     = 0;
     a->max_conn               = 5000;  /* default max connections per worker */
     a->rest_port              = 0;
+    a->src_ip                 = 0;
 
     /* We do not disturb optind for EAL — scan manually. */
     int saved_optind = optind;
     optind = 1;
     opterr = 0; /* suppress errors for unknown options (belong to EAL) */
 
-    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:X:R:", g_long_opts,
+    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:X:R:I:", g_long_opts,
                               &opt_idx)) != -1) {
         switch (opt) {
         case 'W': a->num_worker_cores = (uint32_t)atoi(optarg); break;
@@ -74,6 +76,12 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
         case 'C': a->max_chain_depth  = (uint32_t)atoi(optarg); break;
         case 'X': a->max_conn         = (uint32_t)atoi(optarg); break;
         case 'R': a->rest_port        = (uint16_t)atoi(optarg); break;
+        case 'I':
+            if (tgen_parse_ipv4(optarg, &a->src_ip) < 0) {
+                fprintf(stderr, "[TGEN] invalid --src-ip: %s\n", optarg);
+                return -1;
+            }
+            break;
         default:  break; /* unknown → EAL handles */
         }
     }

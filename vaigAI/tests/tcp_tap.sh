@@ -90,7 +90,7 @@ vaigai_start() {
     "$VAIGAI_BIN" \
         -l "$DPDK_LCORES" -n 1 --no-pci \
         --vdev "net_tap0,iface=$TAP_VAIGAI" -- \
-        --max-conn 1024 \
+        --max-conn 1024 --src-ip "$VAIGAI_IP" \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
 

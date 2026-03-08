@@ -154,6 +154,7 @@ main()
   ├─4── tgen_ports_init()            Configure ports, RSS, queues, start NICs
   ├─5── arp_init() / icmp_init()     Protocol subsystem init
   │     udp_init() / pktrace_init()
+  │     Apply --src-ip to all ports  Set g_arp[p].local_ip for ARP + TX
   ├─6── tgen_ipc_init()              Create SPSC rings (cmd + ACK)
   ├─7── config_load_json()           Load JSON config from $VAIGAI_CONFIG
   │                                  Top-level `"protocol"` field selects TCP/UDP/ICMP/TLS/HTTP/HTTPS

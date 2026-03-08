@@ -178,14 +178,14 @@ if [[ $FLOOD_MODE -eq 1 ]]; then
                  "$PEER_IP" "$FLOOD_SECONDS" "$PKT_SIZE" "$DST_PORT" \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "$VDEV_ARG" -- 2>&1) || true
+                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
 else
     info "Rate-limited UDP -> $PEER_IP:$DST_PORT (1000 pps × 1s)"
     OUTPUT=$(printf 'start --proto udp --ip %s --duration 1 --rate 1000 --size %d --port %d\nquit\n' \
                  "$PEER_IP" "$PKT_SIZE" "$DST_PORT" \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "$VDEV_ARG" -- 2>&1) || true
+                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
 fi
 
 # Extract vaigai counters

@@ -146,7 +146,7 @@ vaigai_start() {
         -l "$DPDK_LCORES" -n 4 \
         --socket-mem "$socket_mem" \
         -a "$NIC_PCI_VAIGAI" -- \
-        --max-conn 1024 \
+        --max-conn 1024 --src-ip "$VAIGAI_IP" \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
 

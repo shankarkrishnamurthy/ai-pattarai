@@ -260,7 +260,7 @@ vaigai_start() {
 
     "$VAIGAI_BIN" \
         $dpdk_args -- \
-        --max-conn 5000 \
+        --max-conn 5000 --src-ip "$VAIGAI_IP" \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
 

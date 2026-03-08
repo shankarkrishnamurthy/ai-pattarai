@@ -165,14 +165,14 @@ if [[ $FLOOD_MODE -eq 1 ]]; then
                  "$PEER_IP" "$FLOOD_SECONDS" "$PING_SIZE" \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "$VDEV_ARG" -- 2>&1) || true
+                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
 else
     info "Pinging $PEER_IP ($PING_COUNT packets, interval=${PING_INTERVAL_MS}ms)"
     OUTPUT=$(printf 'ping %s %d %d %d\nquit\n' \
                  "$PEER_IP" "$PING_COUNT" "$PING_SIZE" "$PING_INTERVAL_MS" \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "$VDEV_ARG" -- 2>&1) || true
+                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
 fi
 
 # ── assert ────────────────────────────────────────────────────────────────────

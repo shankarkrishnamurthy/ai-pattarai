@@ -170,6 +170,15 @@ main(int argc, char **argv)
         RTE_LOG(ERR, USER1, "ARP init failed\n");
         goto fail_ports;
     }
+
+    /* Apply --src-ip to all ports so ARP and TX use the correct address */
+    if (eal_args.src_ip) {
+        for (uint32_t p = 0; p < rte_eth_dev_count_avail() &&
+                             p < TGEN_MAX_PORTS; p++)
+            g_arp[p].local_ip = eal_args.src_ip;
+        RTE_LOG(INFO, USER1, "Source IP set on %u port(s)\n",
+                rte_eth_dev_count_avail());
+    }
     rc = icmp_init();
     if (rc < 0) {
         RTE_LOG(ERR, USER1, "ICMP init failed\n");

@@ -33,6 +33,8 @@ typedef struct {
     uint32_t    max_conn;           /* max concurrent connections per worker */
 
     uint16_t    rest_port;          /* REST API port (0 = disabled) */
+
+    uint32_t    src_ip;             /* local IPv4 in network byte order (--src-ip) */
 } tgen_eal_args_t;
 
 /** Parse argv, populate tgen_eal_args_t, then call rte_eal_init().
