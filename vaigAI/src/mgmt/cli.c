@@ -66,8 +66,9 @@ cmd_help(int argc, char **argv)
         printf("  %-24s  %s\n", g_cmds[i].name, g_cmds[i].help);
 }
 
-/* Forward declaration for stat dispatcher */
+/* Forward declarations */
 static void cmd_stat(int argc, char **argv);
+static void dispatch(char *line);
 
 static void
 cmd_stats(int argc, char **argv)

@@ -456,7 +456,6 @@ export_mem_text(const mem_stats_snapshot_t *snap, int core,
                 char *buf, size_t len)
 {
     int p = 0;
-    char tmp1[32];
 
     /* ── Packet buffers ────────────────────────────────────────────── */
     p = append(buf, len, p,
