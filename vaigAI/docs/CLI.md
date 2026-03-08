@@ -29,6 +29,12 @@ vaigai accepts DPDK EAL arguments followed by `--` and then app-level arguments:
 | `--max-conn <N>` | `-X` | Max concurrent connections per worker |
 | `--rest-port <port>` | `-R` | REST API listen port (0 = disabled) |
 
+### Special Modes
+
+| Flag | Description |
+|------|-------------|
+| `--attach [path]` | Connect to a running vaigai as a remote CLI client (no EAL init) |
+
 ### Environment Variables
 
 | Variable | Description |
@@ -169,14 +175,144 @@ vaigai> reset
 
 ---
 
-## stats
+## stat
 
-Print a JSON telemetry snapshot of all counters (TX/RX packets, TCP, HTTP,
-TLS, latency percentiles).
+Unified statistics command with sub-commands and shared flags.
 
 ```
-vaigai> stats
+stat [cpu|mem|net|port] [--rate] [--watch] [--core N]
 ```
+
+Without a sub-command, `stat` prints a brief summary of all domains.
+
+### Shared Flags
+
+| Flag | Description |
+|------|-------------|
+| `--rate` | Take two snapshots 1 second apart and show rates (pps, Mbps, %) |
+| `--watch` | Continuous refresh every 1 second (implies `--rate`; Ctrl+C stops) |
+| `--core N` | Filter output to a single worker (W*N*) |
+
+### stat cpu
+
+Per-core CPU utilisation breakdown. Shows what fraction of cycles each worker
+spends in RX, TX generation, timer ticks, and idle polling.
+
+```
+vaigai> stat cpu
+──────────────────────────────────────────────────────────────────
+Core   Lcore  Socket  Role     Busy%   RX%    TX%   Timer%  Idle%
+──────────────────────────────────────────────────────────────────
+W0     1      0       worker   62.3    45.1   12.8   4.4    37.7
+W1     2      0       worker   58.9    40.2   14.3   4.4    41.1
+──────────────────────────────────────────────────────────────────
+
+vaigai> stat cpu --rate           # 1-second sample
+vaigai> stat cpu --core 0         # single worker
+vaigai> stat cpu --rate --watch   # live monitor
+```
+
+### stat mem
+
+Memory usage: packet buffers (mbufs), DPDK heap, TCP connections, hugepages.
+
+```
+vaigai> stat mem
+--- packet buffers ---
+Pool         Total    In-Use   Avail    Use%
+pool_w0      8192     1247     6945     15.2%
+pool_w1      8192     892      7300     10.9%
+
+--- dpdk heap ---
+Socket   Heap Size    Allocated    Free         Use%
+0        512.0 MB     127.3 MB     384.7 MB     24.9%
+
+--- connections ---
+Worker   Active   Capacity   Use%
+W0       423      1000000     0.0%
+
+--- hugepages ---
+Size     Total   Free   In-Use   Use%
+2 MB     256     128    128      50.0%
+
+vaigai> stat mem --core 0         # single worker pools & connections
+vaigai> stat mem --rate           # mbuf churn and conn delta/s
+```
+
+### stat net
+
+Network packet counters. Same content as the old `stats` command.
+
+```
+vaigai> stat net                  # JSON counter dump (aggregate)
+vaigai> stat net --core 0         # per-worker breakdown + TCP state dist
+vaigai> stat net --rate           # pps, Mbps, conn/s over 1-second window
+```
+
+With `--core N`, also shows TCP connection state distribution:
+
+```
+vaigai> stat net --core 0
+--- worker 0 (lcore 1) ---
+  tx_pkts: 542301       tx_bytes: 45.3 MB
+  ...
+--- tcp connections (W0) ---
+State          Count
+ESTABLISHED    312
+SYN_SENT       88
+TIME_WAIT      23
+TOTAL          423 / 1000000
+```
+
+### stat port
+
+Per-NIC hardware statistics from the DPDK driver.
+
+```
+vaigai> stat port
+─────────────────────────────────────────────────────────────────────
+Port  Driver     Link       RX pkts     RX bytes   RX miss  RX err
+                            TX pkts     TX bytes   TX err
+─────────────────────────────────────────────────────────────────────
+0     net_tap    UP 10G     892301      33.1 MB    0        0
+                            1.2M        45.3 MB    0
+─────────────────────────────────────────────────────────────────────
+
+vaigai> stat port --rate          # live pps and Mbps per port
+vaigai> stat port --rate --watch  # continuous refresh
+```
+
+### Backward Compatibility
+
+The old `stats` command continues to work as an alias for `stat net`.
+
+---
+
+## Remote CLI Attach
+
+Connect additional CLI terminals to a running vaigai process using Unix
+domain sockets.
+
+```bash
+# From another terminal while vaigai is running:
+$ vaigai --attach
+Connected to vaigai via /var/run/vaigai/vaigai.sock
+vaigai(remote)> stat cpu --rate
+...
+vaigai(remote)> stat mem
+...
+vaigai(remote)> disconnect
+Disconnected.
+```
+
+The `--attach` flag is detected **before** DPDK EAL initialisation, so
+no hugepages or NIC bindings are needed on the client side.
+
+- Default socket path: `/var/run/vaigai/vaigai.sock`
+- Fallback: `/tmp/vaigai.sock`
+- Specify a path: `vaigai --attach /tmp/vaigai.sock`
+- Max concurrent clients: 8
+- `quit` / `exit` / `disconnect` closes the remote session (vaigai keeps running)
 
 ---
 

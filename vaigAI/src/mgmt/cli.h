@@ -29,6 +29,14 @@ void cli_register(const char *name, const char *help, cli_cmd_fn_t fn);
 /** Print current statistics to stdout. */
 void cli_print_stats(void);
 
+/**
+ * Connect to a running vaigai process as a remote CLI client.
+ * Called when `vaigai --attach` is used (no EAL init).
+ * @param sock_path  Socket path, or NULL for auto-detect.
+ * @return Exit code (0 = clean disconnect, 1 = error).
+ */
+int cli_attach_client(const char *sock_path);
+
 #ifdef __cplusplus
 }
 #endif

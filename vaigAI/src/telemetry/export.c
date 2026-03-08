@@ -3,10 +3,17 @@
  */
 #include "export.h"
 #include "histogram.h"
+#include "cpu_stats.h"
+#include "mem_stats.h"
+#include "../core/core_assign.h"
+#include "../core/worker_loop.h"
+#include "../net/tcp_tcb.h"
+#include "../port/port_init.h"
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
 #include <inttypes.h>
+#include <rte_ethdev.h>
 
 /* ------------------------------------------------------------------ */
 /* JSON export (compact, for REST API / machine consumption)            */
@@ -329,6 +336,404 @@ export_summary(const metrics_snapshot_t *snap, uint32_t duration_s,
                        fmt_lat(avg, tmp2, sizeof(tmp2)),
                        fmt_lat(snap->latency.max_us, tmp3, sizeof(tmp3)),
                        snap->latency.total_count);
+        }
+    }
+
+    return p;
+}
+
+/* ================================================================== */
+/* CPU stats — human-readable text                                     */
+/* ================================================================== */
+static const char *
+fmt_loops(uint64_t loops, char *tmp, size_t sz)
+{
+    if (loops >= 1000000000ULL)
+        snprintf(tmp, sz, "%.1fG", (double)loops / 1e9);
+    else if (loops >= 1000000ULL)
+        snprintf(tmp, sz, "%.1fM", (double)loops / 1e6);
+    else if (loops >= 1000ULL)
+        snprintf(tmp, sz, "%.1fK", (double)loops / 1e3);
+    else
+        snprintf(tmp, sz, "%"PRIu64, loops);
+    return tmp;
+}
+
+int
+export_cpu_text(const cpu_stats_snapshot_t *snap, int core,
+                char *buf, size_t len)
+{
+    int p = 0;
+    uint64_t hz = snap->tsc_hz ? snap->tsc_hz : 1;
+
+    p = append(buf, len, p,
+        "──────────────────────────────────────────────────────────────────\n"
+        "Core   Lcore  Socket  Role     Busy%%   RX%%    TX%%   Timer%%  Idle%%\n"
+        "──────────────────────────────────────────────────────────────────\n");
+
+    uint32_t start = 0, end = snap->n_workers;
+    if (core >= 0 && (uint32_t)core < snap->n_workers) {
+        start = (uint32_t)core;
+        end   = start + 1;
+    }
+
+    uint64_t tot_busy = 0, tot_idle = 0, tot_total = 0;
+    uint64_t tot_rx = 0, tot_tx = 0, tot_timer = 0;
+    uint32_t active = 0;
+
+    for (uint32_t w = start; w < end; w++) {
+        const cpu_stats_t *cs = &snap->per_worker[w];
+        if (cs->cycles_total == 0) {
+            p = append(buf, len, p,
+                "W%-5u %-6u %-7u worker   --      --     --    --      --\n",
+                w, g_worker_ctx[w].lcore_id, g_worker_ctx[w].socket_id);
+            continue;
+        }
+        active++;
+        double total = (double)cs->cycles_total;
+        double busy_pct = (1.0 - (double)cs->cycles_idle / total) * 100.0;
+        double rx_pct   = (double)cs->cycles_rx    / total * 100.0;
+        double tx_pct   = (double)cs->cycles_tx    / total * 100.0;
+        double tmr_pct  = (double)cs->cycles_timer / total * 100.0;
+        double idle_pct = (double)cs->cycles_idle  / total * 100.0;
+
+        p = append(buf, len, p,
+            "W%-5u %-6u %-7u worker   %5.1f   %5.1f  %5.1f  %5.1f   %5.1f\n",
+            w, g_worker_ctx[w].lcore_id, g_worker_ctx[w].socket_id,
+            busy_pct, rx_pct, tx_pct, tmr_pct, idle_pct);
+
+        tot_busy  += cs->cycles_total - cs->cycles_idle;
+        tot_idle  += cs->cycles_idle;
+        tot_total += cs->cycles_total;
+        tot_rx    += cs->cycles_rx;
+        tot_tx    += cs->cycles_tx;
+        tot_timer += cs->cycles_timer;
+    }
+
+    p = append(buf, len, p,
+        "──────────────────────────────────────────────────────────────────\n");
+
+    if (active > 1 && core < 0) {
+        double t = (double)tot_total;
+        if (t > 0) {
+            p = append(buf, len, p,
+                "Total (workers)                %5.1f   %5.1f  %5.1f  %5.1f   %5.1f\n",
+                (double)tot_busy / t * 100.0,
+                (double)tot_rx / t * 100.0,
+                (double)tot_tx / t * 100.0,
+                (double)tot_timer / t * 100.0,
+                (double)tot_idle / t * 100.0);
+        }
+    }
+
+    /* Loop rate line */
+    p = append(buf, len, p, "\nLoop rate: ");
+    char tmp[32];
+    for (uint32_t w = start; w < end; w++) {
+        const cpu_stats_t *cs = &snap->per_worker[w];
+        if (cs->cycles_total == 0) continue;
+        double secs = (double)cs->cycles_total / (double)hz;
+        uint64_t lps = secs > 0 ? (uint64_t)((double)cs->loop_count / secs) : 0;
+        p = append(buf, len, p, " W%u=%s/s", w, fmt_loops(lps, tmp, sizeof(tmp)));
+    }
+
+    /* Uptime */
+    const cpu_stats_t *first = &snap->per_worker[start];
+    if (first->cycles_total > 0) {
+        uint64_t uptime_s = first->cycles_total / hz;
+        p = append(buf, len, p, "   Uptime: %"PRIu64"s", uptime_s);
+    }
+    p = append(buf, len, p, "\n");
+
+    return p;
+}
+
+/* ================================================================== */
+/* Memory stats — human-readable text                                  */
+/* ================================================================== */
+int
+export_mem_text(const mem_stats_snapshot_t *snap, int core,
+                char *buf, size_t len)
+{
+    int p = 0;
+    char tmp1[32];
+
+    /* ── Packet buffers ────────────────────────────────────────────── */
+    p = append(buf, len, p,
+        "\n--- packet buffers ---\n"
+        "Pool         Total    In-Use   Avail    Use%%\n");
+
+    uint32_t pool_total = 0, pool_inuse = 0;
+    for (uint32_t i = 0; i < snap->n_pools; i++) {
+        if (core >= 0 && (int)i != core) continue;
+        const mempool_info_t *pi = &snap->pools[i];
+        double pct = pi->total > 0 ? (double)pi->in_use * 100.0 / (double)pi->total : 0;
+        p = append(buf, len, p, "%-12s %-8u %-8u %-8u %5.1f%%\n",
+                   pi->name, pi->total, pi->in_use, pi->avail, pct);
+        pool_total += pi->total;
+        pool_inuse += pi->in_use;
+    }
+    if (core < 0 && snap->n_pools > 1) {
+        double pct = pool_total > 0 ? (double)pool_inuse * 100.0 / (double)pool_total : 0;
+        p = append(buf, len, p,
+            "                                        ─────\n"
+            "Total        %-8u %-8u %-8u %5.1f%%\n",
+            pool_total, pool_inuse, pool_total - pool_inuse, pct);
+    }
+
+    /* ── DPDK heap (only in aggregate view) ────────────────────────── */
+    if (core < 0 && snap->n_heaps > 0) {
+        p = append(buf, len, p,
+            "\n--- dpdk heap ---\n"
+            "Socket   Heap Size    Allocated    Free         Use%%\n");
+        for (uint32_t i = 0; i < snap->n_heaps; i++) {
+            const heap_info_t *hi = &snap->heaps[i];
+            double pct = hi->heap_size > 0
+                ? (double)hi->alloc_size * 100.0 / (double)hi->heap_size : 0;
+            char h1[32], h2[32], h3[32];
+            p = append(buf, len, p, "%-8d %-12s %-12s %-12s %5.1f%%\n",
+                       hi->socket_id,
+                       fmt_bytes(hi->heap_size,  h1, sizeof(h1)),
+                       fmt_bytes(hi->alloc_size, h2, sizeof(h2)),
+                       fmt_bytes(hi->free_size,  h3, sizeof(h3)),
+                       pct);
+        }
+    }
+
+    /* ── Connections ───────────────────────────────────────────────── */
+    p = append(buf, len, p, "\n--- connections ---\n");
+    if (core >= 0 && (uint32_t)core < snap->n_tcbs) {
+        const tcb_info_t *ti = &snap->tcbs[core];
+        double pct = ti->capacity > 0
+            ? (double)ti->active * 100.0 / (double)ti->capacity : 0;
+        p = append(buf, len, p, "Active: %u / %u (%.1f%%)\n",
+                   ti->active, ti->capacity, pct);
+    } else {
+        p = append(buf, len, p, "Worker   Active   Capacity   Use%%\n");
+        for (uint32_t i = 0; i < snap->n_tcbs; i++) {
+            const tcb_info_t *ti = &snap->tcbs[i];
+            double pct = ti->capacity > 0
+                ? (double)ti->active * 100.0 / (double)ti->capacity : 0;
+            p = append(buf, len, p, "W%-7u %-8u %-10u %5.1f%%\n",
+                       i, ti->active, ti->capacity, pct);
+        }
+    }
+
+    /* ── Hugepages (only in aggregate view) ────────────────────────── */
+    if (core < 0 && snap->n_hugepages > 0) {
+        p = append(buf, len, p,
+            "\n--- hugepages ---\n"
+            "Size     Total   Free   In-Use   Use%%\n");
+        for (uint32_t i = 0; i < snap->n_hugepages; i++) {
+            const hugepage_info_t *hp = &snap->hugepages[i];
+            const char *sz_str = hp->size_kb >= 1048576 ? "1 GB" : "2 MB";
+            if (hp->total == 0) {
+                p = append(buf, len, p, "%-8s %-7"PRIu64" %-6"PRIu64" %-8"PRIu64"  --\n",
+                           sz_str, hp->total, hp->free, hp->in_use);
+            } else {
+                double pct = (double)hp->in_use * 100.0 / (double)hp->total;
+                p = append(buf, len, p, "%-8s %-7"PRIu64" %-6"PRIu64" %-8"PRIu64" %5.1f%%\n",
+                           sz_str, hp->total, hp->free, hp->in_use, pct);
+            }
+        }
+    }
+
+    return p;
+}
+
+/* ================================================================== */
+/* Port stats — human-readable text                                    */
+/* ================================================================== */
+int
+export_port_text(char *buf, size_t len)
+{
+    int p = 0;
+    uint32_t n_ports = g_n_ports;
+
+    p = append(buf, len, p,
+        "─────────────────────────────────────────────────────────────────────\n"
+        "Port  Driver     Link       RX pkts     RX bytes   RX miss  RX err\n"
+        "                            TX pkts     TX bytes   TX err\n"
+        "─────────────────────────────────────────────────────────────────────\n");
+
+    char tmp[32];
+    for (uint32_t i = 0; i < n_ports; i++) {
+        struct rte_eth_link link;
+        int link_rc = rte_eth_link_get_nowait(i, &link);
+        if (link_rc < 0)
+            memset(&link, 0, sizeof(link));
+
+        struct rte_eth_stats stats;
+        rte_eth_stats_get(i, &stats);
+
+        char link_str[32];
+        if (link.link_status)
+            snprintf(link_str, sizeof(link_str), "UP %uG",
+                     link.link_speed / 1000);
+        else
+            snprintf(link_str, sizeof(link_str), "DOWN");
+
+        p = append(buf, len, p,
+            "%-5u %-10s %-10s %-11"PRIu64" %-10s %-8"PRIu64" %"PRIu64"\n",
+            i, g_port_caps[i].driver_name, link_str,
+            stats.ipackets, fmt_bytes(stats.ibytes, tmp, sizeof(tmp)),
+            stats.imissed, stats.ierrors);
+        p = append(buf, len, p,
+            "                            %-11"PRIu64" %-10s %"PRIu64"\n",
+            stats.opackets, fmt_bytes(stats.obytes, tmp, sizeof(tmp)),
+            stats.oerrors);
+    }
+
+    p = append(buf, len, p,
+        "─────────────────────────────────────────────────────────────────────\n");
+
+    return p;
+}
+
+/* ================================================================== */
+/* Stat summary — brief one-liner from each domain                     */
+/* ================================================================== */
+int
+export_stat_summary(const cpu_stats_snapshot_t *cpu,
+                    const mem_stats_snapshot_t *mem,
+                    const metrics_snapshot_t *net,
+                    char *buf, size_t len)
+{
+    int p = 0;
+    char tmp1[32], tmp2[32];
+    uint64_t hz = cpu->tsc_hz ? cpu->tsc_hz : 1;
+
+    /* CPU summary */
+    uint64_t tot_busy = 0, tot_total = 0;
+    uint32_t active = 0;
+    for (uint32_t w = 0; w < cpu->n_workers; w++) {
+        const cpu_stats_t *cs = &cpu->per_worker[w];
+        if (cs->cycles_total == 0) continue;
+        active++;
+        tot_busy += cs->cycles_total - cs->cycles_idle;
+        tot_total += cs->cycles_total;
+    }
+    double avg_busy = tot_total > 0 ? (double)tot_busy / (double)tot_total * 100.0 : 0;
+    uint64_t uptime = tot_total > 0
+        ? cpu->per_worker[0].cycles_total / hz : 0;
+
+    p = append(buf, len, p,
+        "\n--- cpu ---\n"
+        "Workers: %u   Avg Busy: %.1f%%   Avg Idle: %.1f%%   Uptime: %"PRIu64"s\n",
+        active, avg_busy, 100.0 - avg_busy, uptime);
+
+    /* Memory summary */
+    uint32_t pool_total = 0, pool_inuse = 0;
+    for (uint32_t i = 0; i < mem->n_pools; i++) {
+        pool_total += mem->pools[i].total;
+        pool_inuse += mem->pools[i].in_use;
+    }
+    uint64_t heap_alloc = 0, heap_total = 0;
+    for (uint32_t i = 0; i < mem->n_heaps; i++) {
+        heap_alloc += mem->heaps[i].alloc_size;
+        heap_total += mem->heaps[i].heap_size;
+    }
+    double pool_pct = pool_total > 0
+        ? (double)pool_inuse * 100.0 / (double)pool_total : 0;
+    double heap_pct = heap_total > 0
+        ? (double)heap_alloc * 100.0 / (double)heap_total : 0;
+
+    p = append(buf, len, p,
+        "\n--- mem ---\n"
+        "Packet buffers: %u/%u (%.1f%%)   DPDK heap: %s/%s (%.1f%%)\n",
+        pool_inuse, pool_total, pool_pct,
+        fmt_bytes(heap_alloc, tmp1, sizeof(tmp1)),
+        fmt_bytes(heap_total, tmp2, sizeof(tmp2)),
+        heap_pct);
+
+    /* Net summary */
+    const worker_metrics_t *t = &net->total;
+    p = append(buf, len, p,
+        "\n--- net ---\n"
+        "TX: %"PRIu64" pkts (%s)   RX: %"PRIu64" pkts (%s)   Errors: %"PRIu64"\n",
+        t->tx_pkts, fmt_bytes(t->tx_bytes, tmp1, sizeof(tmp1)),
+        t->rx_pkts, fmt_bytes(t->rx_bytes, tmp2, sizeof(tmp2)),
+        t->tcp_bad_cksum + t->ip_bad_cksum + t->http_parse_err);
+
+    /* Port summary */
+    p = append(buf, len, p, "\n--- port ---\n");
+    for (uint32_t i = 0; i < g_n_ports; i++) {
+        struct rte_eth_link link;
+        int link_rc = rte_eth_link_get_nowait(i, &link);
+        if (link_rc < 0)
+            memset(&link, 0, sizeof(link));
+        struct rte_eth_stats stats;
+        rte_eth_stats_get(i, &stats);
+        p = append(buf, len, p,
+            "Port %u: %s  RX %s  TX %s  miss %"PRIu64"  err %"PRIu64"\n",
+            i, link.link_status ? "UP" : "DOWN",
+            fmt_loops(stats.ipackets, tmp1, sizeof(tmp1)),
+            fmt_loops(stats.opackets, tmp2, sizeof(tmp2)),
+            stats.imissed, stats.ierrors);
+    }
+
+    return p;
+}
+
+/* ================================================================== */
+/* Per-worker net stats + TCP state distribution                       */
+/* ================================================================== */
+int
+export_net_core_text(const metrics_snapshot_t *snap, uint32_t core,
+                     char *buf, size_t len)
+{
+    int p = 0;
+    if (core >= snap->n_workers) {
+        p = append(buf, len, p, "Worker %u does not exist\n", core);
+        return p;
+    }
+    char tmp[32];
+    const worker_metrics_t *wm = &snap->per_worker[core];
+
+    p = append(buf, len, p,
+        "\n--- worker %u (lcore %u) ---\n",
+        core, g_worker_ctx[core].lcore_id);
+    p = append(buf, len, p, "  tx_pkts: %-12"PRIu64"  tx_bytes: %s\n",
+               wm->tx_pkts, fmt_bytes(wm->tx_bytes, tmp, sizeof(tmp)));
+    p = append(buf, len, p, "  rx_pkts: %-12"PRIu64"  rx_bytes: %s\n",
+               wm->rx_pkts, fmt_bytes(wm->rx_bytes, tmp, sizeof(tmp)));
+
+    if (wm->tcp_conn_open || wm->tcp_syn_sent) {
+        p = append(buf, len, p,
+            "  tcp_conn_open: %-6"PRIu64"  tcp_conn_close: %"PRIu64"\n",
+            wm->tcp_conn_open, wm->tcp_conn_close);
+        p = append(buf, len, p,
+            "  tcp_syn_sent:  %-6"PRIu64"  tcp_retransmit: %"PRIu64"\n",
+            wm->tcp_syn_sent, wm->tcp_retransmit);
+    }
+
+    /* TCP connection state distribution */
+    if (core < TGEN_MAX_WORKERS) {
+        tcb_store_t *store = &g_tcb_stores[core];
+        uint32_t n_est = 0, n_syn = 0, n_tw = 0, n_fin = 0, n_other = 0;
+        for (uint32_t i = 0; i < store->capacity; i++) {
+            if (!store->tcbs[i].in_use) continue;
+            switch (store->tcbs[i].state) {
+            case TCP_ESTABLISHED: n_est++;   break;
+            case TCP_SYN_SENT:    n_syn++;   break;
+            case TCP_TIME_WAIT:   n_tw++;    break;
+            case TCP_FIN_WAIT_1:
+            case TCP_FIN_WAIT_2:  n_fin++;   break;
+            default:                    n_other++; break;
+            }
+        }
+        uint32_t total = store->count;
+        if (total > 0 || wm->tcp_conn_open > 0) {
+            p = append(buf, len, p,
+                "\n--- tcp connections (W%u) ---\n"
+                "State          Count\n", core);
+            if (n_est)   p = append(buf, len, p, "ESTABLISHED    %u\n", n_est);
+            if (n_syn)   p = append(buf, len, p, "SYN_SENT       %u\n", n_syn);
+            if (n_tw)    p = append(buf, len, p, "TIME_WAIT      %u\n", n_tw);
+            if (n_fin)   p = append(buf, len, p, "FIN_WAIT       %u\n", n_fin);
+            if (n_other) p = append(buf, len, p, "OTHER          %u\n", n_other);
+            p = append(buf, len, p, "TOTAL          %u / %u\n",
+                       total, store->capacity);
         }
     }
 

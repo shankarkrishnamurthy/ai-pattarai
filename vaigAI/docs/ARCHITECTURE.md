@@ -102,13 +102,17 @@ src/
 │   └── http11.h/c             # HTTP/1.1 request builder + response parser
 │
 ├── mgmt/                      ── Management plane ──
-│   ├── cli.h/c                # readline-based interactive CLI
+│   ├── cli.h/c                # readline-based interactive CLI + stat dispatcher
+│   ├── cli_server.h/c         # Unix domain socket server for remote CLI attach
+│   ├── cli_client.c           # Thin readline client for `vaigai --attach`
 │   ├── rest.h/c               # libmicrohttpd REST API (JSON)
 │   └── config_mgr.h/c         # JSON config load/save/validate/push
 │
 └── telemetry/                 ── Observability ──
     ├── metrics.h/c            # Per-worker lock-free counter slabs
-    ├── export.h/c             # JSON export
+    ├── cpu_stats.h/c          # Per-worker TSC cycle accounting (RX/TX/timer/idle)
+    ├── mem_stats.h/c          # Mempool, DPDK heap, TCB, hugepage queries
+    ├── export.h/c             # JSON + text export (cpu/mem/net/port formatters)
     ├── histogram.h/c          # HDR-style latency histogram (log₂ buckets)
     ├── pktrace.h/c            # Per-packet capture trace buffer
     └── log.h/c                # Structured log macros (wraps rte_log)
@@ -624,7 +628,7 @@ The management core **pulls on demand** — only when a human or HTTP client ask
                                │                       │
                                │  Trigger      Action  │
                                │  ─────────────────────│
-                               │  CLI "stats"  snapshot │
+                               │  CLI "stat"   snapshot │
                                │  GET /stats   snapshot │
                                │  start loop   1 Hz    │
                                └───────┬───────────────┘
@@ -642,9 +646,11 @@ Management never writes to `g_metrics[]`. Ownership is strict and one-directiona
 
 | Trigger | Who runs it | Frequency |
 |---------|-------------|-----------|
-| CLI `stats` command | mgmt core (readline thread) | once per keystroke |
-| REST `GET /api/v1/stats` | libmicrohttpd thread on mgmt core | once per HTTP request |
+| CLI `stat` command | mgmt core (readline thread) | once per keystroke |
+| CLI `stat --watch` | mgmt core in loop | 1 Hz continuous |
+| REST `GET /api/v1/stats/*` | libmicrohttpd thread on mgmt core | once per HTTP request |
 | `start` live progress | mgmt core in sleep loop | 1 Hz for the start duration |
+| Remote CLI `stat` | mgmt core via socket poll | once per remote command |
 
 There is **no periodic background scrape** and **no metric log file**.
 If nobody asks, nobody reads — worker slabs accumulate silently.
@@ -696,9 +702,48 @@ Bucket 63: [2⁶³, ∞) µs  percentile: walk until seen ≥ p% × count
 
 ### 3.6 Export Format
 
-Single endpoint: **`/api/v1/stats`** — flat JSON with all aggregate counters
-plus latency percentiles (p50, p95, p99) from the HDR histogram.
-CLI `stats` calls the same `export_json()` path → identical output to stdout.
+Endpoints:
+
+| Endpoint | Format | Content |
+|----------|--------|---------|
+| `/api/v1/stats` | JSON | Aggregate packet/protocol counters + latency |
+| `/api/v1/stats/cpu` | Text | Per-core CPU cycle breakdown |
+| `/api/v1/stats/mem` | Text | Mempool, DPDK heap, TCB, hugepage usage |
+| `/api/v1/stats/port` | Text | Per-NIC hardware stats |
+
+CLI `stat net` calls `export_json()`. CLI `stat cpu|mem|port` call their
+respective `export_*_text()` functions. All formatters are in `export.c`.
+
+### 3.7 CPU Cycle Accounting
+
+```c
+cpu_stats_t g_cpu_stats[TGEN_MAX_WORKERS] __rte_cache_aligned;
+```
+
+Each worker accumulates TSC cycles per poll-loop phase using 5 × `rte_rdtsc()`
+calls per iteration (~10 ns overhead):
+
+| Phase | Field | What it measures |
+|-------|-------|-----------------|
+| IPC drain | `cycles_ipc` | Processing commands from mgmt core |
+| RX + classify | `cycles_rx` | Receive burst, protocol classification, replies |
+| TX generation | `cycles_tx` | Packet generation bursts |
+| Timer tick | `cycles_timer` | TCP timers + port pool tick |
+| Idle detection | `cycles_idle` | Iterations with no RX and no active TX gen |
+
+`Busy% = (1 - idle/total) × 100`. Useful because DPDK poll loops always
+show 100% in `top`. The management core reads these via `cpu_stats_snapshot()`.
+
+### 3.8 Memory Stats
+
+Read-only queries with no per-worker instrumentation:
+
+| Source | API | Info |
+|--------|-----|------|
+| Packet buffers | `rte_mempool_avail_count()` / `rte_mempool_in_use_count()` | Free vs in-flight mbufs per worker |
+| DPDK heap | `rte_malloc_get_socket_stats()` | Allocated/free/total per NUMA socket |
+| TCP connections | `g_tcb_stores[w].count` / `.capacity` | Active TCBs per worker |
+| Hugepages | `/sys/kernel/mm/hugepages/` | System hugepage counters |
 
 ### 3.7 Structured Logging
 
@@ -810,24 +855,48 @@ vaigai> help
 | Command | Syntax | Description |
 |---------|--------|-------------|
 | `help` | `help` | List available commands |
-| `stats` | `stats` | Print metrics snapshot (JSON) |
+| `stat` | `stat [cpu\|mem\|net\|port] [--rate] [--watch] [--core N]` | Unified statistics (see CLI.md) |
+| `stats` | `stats` | Alias for `stat net` (backward compat) |
 | `ping` | `ping <ip> [count] [size] [interval_ms]` | ICMP echo request |
 | `start` | `start --proto <proto> --ip <ip> --duration <s> [--rate <pps>] [--size <bytes>] [--port <port>] [--tls] [--reuse] [--streams <n>]` | Start traffic generation |
 | `stop` | `stop` | Stop active traffic generation |
 | `reset` | `reset` | RST all TCBs, reset port pools + metrics |
-| `trace` | `trace start [port] [queue] [count]` | Start packet capture |
+| `trace` | `trace start <file.pcapng> [port] [queue]` | Start packet capture |
 | | `trace stop` | Stop capture |
-| | `trace save <file.pcapng>` | Save capture to pcapng |
+| `show` | `show interface [port_id]` | Show DPDK interface details |
 | `quit` | `quit` | Graceful shutdown |
 
 ### 4.4 REST API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/v1/stats` | `GET` | Metrics snapshot (same JSON as CLI `stats`) |
+| `/api/v1/stats` | `GET` | Metrics snapshot (same JSON as CLI `stat net`) |
+| `/api/v1/stats/cpu` | `GET` | CPU cycle breakdown (text) |
+| `/api/v1/stats/mem` | `GET` | Memory usage (text) |
+| `/api/v1/stats/port` | `GET` | Per-port NIC stats (text) |
 | `/api/v1/config` | `GET` | Current configuration |
 | `/api/v1/start` | `POST` | Start traffic generation |
 | `/api/v1/stop` | `POST` | Stop traffic generation |
+
+### 4.5 Remote CLI Attach
+
+Multiple CLI clients can connect to a running vaigai process via Unix
+domain socket:
+
+```
+vaigai process (mgmt core)
+├── stdin local CLI (readline or fgets)
+└── Unix socket listener (/var/run/vaigai/vaigai.sock)
+    ├── Remote client 1 (vaigai --attach)
+    ├── Remote client 2
+    └── ... (max 8)
+```
+
+- Server: `cli_server_init()` creates the socket; `cli_server_poll()` is
+  called in the mgmt tick loop (readline event hook, fgets poll, daemon loop)
+- Output capture: `open_memstream()` + temporary `stdout` redirect
+- Wire protocol: command `\n` → response `\0` (NUL-terminated)
+- Client: `vaigai --attach [path]` — runs without DPDK EAL init
 
 All responses are JSON with CORS headers (`Access-Control-Allow-Origin: *`).
 REST server runs on the management core via `libmicrohttpd`.

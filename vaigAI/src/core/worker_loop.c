@@ -25,6 +25,7 @@
 #include "../net/tcp_timer.h"
 #include "../net/tcp_port_pool.h"
 #include "../telemetry/metrics.h"
+#include "../telemetry/cpu_stats.h"
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
 volatile int      g_run = 0;
@@ -154,7 +155,12 @@ int tgen_worker_loop(void *arg)
     struct rte_mbuf *tx_pkts[TGEN_MAX_TX_BURST];
     uint32_t n_tx = 0;
 
+    cpu_stats_t *cstats = &g_cpu_stats[ctx->worker_idx];
+    cstats->window_start_tsc = rte_rdtsc();
+
     while (__atomic_load_n(&g_run, __ATOMIC_RELAXED)) {
+
+        uint64_t t0 = rte_rdtsc();
 
         /* ── 1. Drain IPC ring from management ─────────────────────────── */
         config_update_t cmd;
@@ -197,13 +203,17 @@ int tgen_worker_loop(void *arg)
             tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
         }
 
+        uint64_t t1 = rte_rdtsc();
+
         /* ── 2. RX + classify + flush replies ────────────────────────── */
+        uint16_t nb_rx_total = 0;
         n_tx = 0;
         for (uint32_t p = 0; p < ctx->num_ports; p++) {
             uint16_t nb_rx = rte_eth_rx_burst(ctx->ports[p],
                                                ctx->rx_queues[p],
                                                rx_pkts, TGEN_MAX_RX_BURST);
             if (nb_rx == 0) continue;
+            nb_rx_total += nb_rx;
 
             uint64_t rx_total_bytes = 0;
             for (uint16_t bi = 0; bi < nb_rx; bi++)
@@ -230,16 +240,32 @@ int tgen_worker_loop(void *arg)
             n_tx = 0;
         }
 
+        uint64_t t2 = rte_rdtsc();
+
         /* ── 3. TX generation (tps / sustained traffic) ─────────────── */
         if (ctx->tx_gen.active) {
             tx_gen_burst(&ctx->tx_gen, ctx->mempool, ctx->worker_idx);
         }
+
+        uint64_t t3 = rte_rdtsc();
 
         /* ── 4. Timer wheel tick ─────────────────────────────────────────── */
         tcp_timer_tick(ctx->worker_idx);
 
         /* ── 5. Port pool tick — drain TIME_WAIT ring ────────────────── */
         tcp_port_pool_tick(ctx->worker_idx, rte_rdtsc());
+
+        uint64_t t4 = rte_rdtsc();
+
+        /* ── CPU cycle accounting ────────────────────────────────────── */
+        cstats->cycles_ipc   += (t1 - t0);
+        cstats->cycles_rx    += (t2 - t1);
+        cstats->cycles_tx    += (t3 - t2);
+        cstats->cycles_timer += (t4 - t3);
+        cstats->cycles_total += (t4 - t0);
+        if (nb_rx_total == 0 && !ctx->tx_gen.active)
+            cstats->cycles_idle += (t4 - t0);
+        cstats->loop_count++;
     }
 
 done:

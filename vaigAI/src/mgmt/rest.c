@@ -7,6 +7,8 @@
 #include "../core/worker_loop.h"
 #include "../telemetry/metrics.h"
 #include "../telemetry/export.h"
+#include "../telemetry/cpu_stats.h"
+#include "../telemetry/mem_stats.h"
 #include "../telemetry/log.h"
 #include <string.h>
 #include <stdlib.h>
@@ -109,6 +111,30 @@ handle_request(void *cls,
         const char *ok = "{\"status\":\"stopped\"}";
         return send_text(connection, MHD_HTTP_OK, "application/json",
                          ok, strlen(ok));
+    }
+
+    if (strcmp(url, "/api/v1/stats/cpu") == 0 && strcmp(method, "GET") == 0) {
+        uint32_t nw = g_core_map.num_workers ? g_core_map.num_workers : 1;
+        cpu_stats_snapshot_t snap;
+        cpu_stats_snapshot(&snap, nw);
+        n = export_cpu_text(&snap, -1, buf, sizeof(buf));
+        return send_text(connection, MHD_HTTP_OK, "text/plain", buf,
+                         n > 0 ? (size_t)n : 0);
+    }
+
+    if (strcmp(url, "/api/v1/stats/mem") == 0 && strcmp(method, "GET") == 0) {
+        uint32_t nw = g_core_map.num_workers ? g_core_map.num_workers : 1;
+        mem_stats_snapshot_t snap;
+        mem_stats_snapshot(&snap, nw);
+        n = export_mem_text(&snap, -1, buf, sizeof(buf));
+        return send_text(connection, MHD_HTTP_OK, "text/plain", buf,
+                         n > 0 ? (size_t)n : 0);
+    }
+
+    if (strcmp(url, "/api/v1/stats/port") == 0 && strcmp(method, "GET") == 0) {
+        n = export_port_text(buf, sizeof(buf));
+        return send_text(connection, MHD_HTTP_OK, "text/plain", buf,
+                         n > 0 ? (size_t)n : 0);
     }
 
     const char *not_found = "{\"error\":\"not found\"}";

@@ -2,6 +2,7 @@
  * vaigAI: CLI implementation (readline when available, fallback fgets).
  */
 #include "cli.h"
+#include "cli_server.h"
 #include "config_mgr.h"
 #include "../net/icmp.h"
 #include "../net/udp.h"
@@ -13,6 +14,8 @@
 #include "../common/util.h"
 #include "../telemetry/metrics.h"
 #include "../telemetry/export.h"
+#include "../telemetry/cpu_stats.h"
+#include "../telemetry/mem_stats.h"
 #include "../telemetry/log.h"
 #include "../core/ipc.h"
 #include "../core/tx_gen.h"
@@ -63,11 +66,309 @@ cmd_help(int argc, char **argv)
         printf("  %-24s  %s\n", g_cmds[i].name, g_cmds[i].help);
 }
 
+/* Forward declaration for stat dispatcher */
+static void cmd_stat(int argc, char **argv);
+
 static void
 cmd_stats(int argc, char **argv)
 {
+    /* Legacy alias: bare "stats" → "stat net" */
+    char *stat_argv[] = { (char *)"stat", (char *)"net" };
     (void)argc; (void)argv;
-    cli_print_stats();
+    cmd_stat(2, stat_argv);
+}
+
+/* ── Shared stat flags ────────────────────────────────────────────────────── */
+typedef struct {
+    bool rate;      /* --rate: 1-second delta */
+    bool watch;     /* --watch: continuous refresh (implies rate) */
+    int  core;      /* --core N (-1 = all) */
+} stat_opts_t;
+
+static void
+stat_parse_opts(int argc, char **argv, int start, stat_opts_t *opts)
+{
+    opts->rate  = false;
+    opts->watch = false;
+    opts->core  = -1;
+    for (int i = start; i < argc; i++) {
+        if (strcmp(argv[i], "--rate") == 0)
+            opts->rate = true;
+        else if (strcmp(argv[i], "--watch") == 0) {
+            opts->watch = true;
+            opts->rate  = true;
+        } else if (strcmp(argv[i], "--core") == 0 && i + 1 < argc) {
+            opts->core = atoi(argv[++i]);
+        }
+    }
+}
+
+/* ── stat cpu ──────────────────────────────────────────────────────────────── */
+static void
+stat_cpu(const stat_opts_t *opts)
+{
+    uint32_t nw = g_core_map.num_workers;
+    char buf[8192];
+
+    if (opts->rate) {
+        cpu_stats_snapshot_t s1, s2;
+        cpu_stats_snapshot(&s1, nw);
+        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+        cpu_stats_snapshot(&s2, nw);
+
+        /* Compute delta */
+        cpu_stats_snapshot_t delta;
+        memset(&delta, 0, sizeof(delta));
+        delta.n_workers = nw;
+        delta.tsc_hz = s2.tsc_hz;
+        for (uint32_t w = 0; w < nw; w++) {
+            delta.per_worker[w].cycles_rx    = s2.per_worker[w].cycles_rx    - s1.per_worker[w].cycles_rx;
+            delta.per_worker[w].cycles_tx    = s2.per_worker[w].cycles_tx    - s1.per_worker[w].cycles_tx;
+            delta.per_worker[w].cycles_timer = s2.per_worker[w].cycles_timer - s1.per_worker[w].cycles_timer;
+            delta.per_worker[w].cycles_ipc   = s2.per_worker[w].cycles_ipc   - s1.per_worker[w].cycles_ipc;
+            delta.per_worker[w].cycles_idle  = s2.per_worker[w].cycles_idle  - s1.per_worker[w].cycles_idle;
+            delta.per_worker[w].cycles_total = s2.per_worker[w].cycles_total - s1.per_worker[w].cycles_total;
+            delta.per_worker[w].loop_count   = s2.per_worker[w].loop_count   - s1.per_worker[w].loop_count;
+        }
+        export_cpu_text(&delta, opts->core, buf, sizeof(buf));
+        printf("%s(1-second sample)\n", buf);
+    } else {
+        cpu_stats_snapshot_t snap;
+        cpu_stats_snapshot(&snap, nw);
+        export_cpu_text(&snap, opts->core, buf, sizeof(buf));
+        puts(buf);
+    }
+}
+
+/* ── stat mem ──────────────────────────────────────────────────────────────── */
+static void
+stat_mem(const stat_opts_t *opts)
+{
+    uint32_t nw = g_core_map.num_workers;
+    char buf[8192];
+
+    if (opts->rate) {
+        mem_stats_snapshot_t s1, s2;
+        mem_stats_snapshot(&s1, nw);
+        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+        mem_stats_snapshot(&s2, nw);
+
+        /* Print delta for in-use mbufs and connections */
+        printf("--- memory rates (1-second delta) ---\n");
+        for (uint32_t i = 0; i < s2.n_pools; i++) {
+            if (opts->core >= 0 && (int)i != opts->core) continue;
+            int32_t d = (int32_t)s2.pools[i].in_use - (int32_t)s1.pools[i].in_use;
+            printf("  %-12s mbuf churn: %+d/s\n", s2.pools[i].name, d);
+        }
+        for (uint32_t i = 0; i < s2.n_tcbs; i++) {
+            if (opts->core >= 0 && (int)i != opts->core) continue;
+            int32_t d = (int32_t)s2.tcbs[i].active - (int32_t)s1.tcbs[i].active;
+            printf("  W%-11u conn churn: %+d/s\n", i, d);
+        }
+    } else {
+        mem_stats_snapshot_t snap;
+        mem_stats_snapshot(&snap, nw);
+        export_mem_text(&snap, opts->core, buf, sizeof(buf));
+        puts(buf);
+    }
+}
+
+/* ── stat net ──────────────────────────────────────────────────────────────── */
+static void
+stat_net(const stat_opts_t *opts)
+{
+    uint32_t nw = g_core_map.num_workers;
+    char buf[16384];
+
+    if (opts->core >= 0) {
+        /* Per-worker breakdown with TCP state */
+        if (opts->rate) {
+            metrics_snapshot_t s1, s2;
+            metrics_snapshot(&s1, nw);
+            struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+            nanosleep(&ts, NULL);
+            metrics_snapshot(&s2, nw);
+
+            uint32_t c = (uint32_t)opts->core;
+            if (c < nw) {
+                const worker_metrics_t *w1 = &s1.per_worker[c];
+                const worker_metrics_t *w2 = &s2.per_worker[c];
+                printf("--- worker %u rates (1-second sample) ---\n", c);
+                printf("  TX: %"PRIu64" pps   %.1f Mbps\n",
+                       w2->tx_pkts - w1->tx_pkts,
+                       (double)(w2->tx_bytes - w1->tx_bytes) * 8.0 / 1e6);
+                printf("  RX: %"PRIu64" pps   %.1f Mbps\n",
+                       w2->rx_pkts - w1->rx_pkts,
+                       (double)(w2->rx_bytes - w1->rx_bytes) * 8.0 / 1e6);
+                if (w2->tcp_conn_open > w1->tcp_conn_open)
+                    printf("  TCP conn/s: %"PRIu64"\n",
+                           w2->tcp_conn_open - w1->tcp_conn_open);
+            }
+        } else {
+            metrics_snapshot_t snap;
+            metrics_snapshot(&snap, nw);
+            export_net_core_text(&snap, (uint32_t)opts->core, buf, sizeof(buf));
+            puts(buf);
+        }
+    } else if (opts->rate) {
+        metrics_snapshot_t s1, s2;
+        metrics_snapshot(&s1, nw);
+        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+        metrics_snapshot(&s2, nw);
+
+        const worker_metrics_t *t1 = &s1.total;
+        const worker_metrics_t *t2 = &s2.total;
+        printf("--- rates (1-second sample) ---\n");
+        printf("  TX: %"PRIu64" pps   %.1f Mbps\n",
+               t2->tx_pkts - t1->tx_pkts,
+               (double)(t2->tx_bytes - t1->tx_bytes) * 8.0 / 1e6);
+        printf("  RX: %"PRIu64" pps   %.1f Mbps\n",
+               t2->rx_pkts - t1->rx_pkts,
+               (double)(t2->rx_bytes - t1->rx_bytes) * 8.0 / 1e6);
+        if (t2->tcp_conn_open > t1->tcp_conn_open)
+            printf("  TCP conn/s: %"PRIu64"   close/s: %"PRIu64"\n",
+                   t2->tcp_conn_open - t1->tcp_conn_open,
+                   t2->tcp_conn_close - t1->tcp_conn_close);
+        if (t2->http_req_tx > t1->http_req_tx)
+            printf("  HTTP req/s: %"PRIu64"   rsp/s: %"PRIu64"\n",
+                   t2->http_req_tx - t1->http_req_tx,
+                   t2->http_rsp_rx - t1->http_rsp_rx);
+    } else {
+        /* Same as old "stats" — JSON dump */
+        cli_print_stats();
+    }
+}
+
+/* ── stat port ─────────────────────────────────────────────────────────────── */
+static void
+stat_port(const stat_opts_t *opts)
+{
+    char buf[8192];
+
+    if (opts->rate) {
+        struct rte_eth_stats s1[TGEN_MAX_PORTS], s2[TGEN_MAX_PORTS];
+        uint32_t np = g_n_ports;
+        for (uint32_t i = 0; i < np; i++)
+            rte_eth_stats_get(i, &s1[i]);
+
+        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+
+        for (uint32_t i = 0; i < np; i++)
+            rte_eth_stats_get(i, &s2[i]);
+
+        printf("─────────────────────────────────────────────────────────────────────\n"
+               "Port  Link       RX pps     RX Mbps    RX miss/s   TX pps    TX Mbps\n"
+               "─────────────────────────────────────────────────────────────────────\n");
+        for (uint32_t i = 0; i < np; i++) {
+            struct rte_eth_link link;
+            int link_rc = rte_eth_link_get_nowait(i, &link);
+            if (link_rc < 0)
+                memset(&link, 0, sizeof(link));
+
+            char link_str[32];
+            if (link.link_status)
+                snprintf(link_str, sizeof(link_str), "UP %uG",
+                         link.link_speed / 1000);
+            else
+                snprintf(link_str, sizeof(link_str), "DOWN");
+
+            uint64_t rx_pps = s2[i].ipackets - s1[i].ipackets;
+            double rx_mbps = (double)(s2[i].ibytes - s1[i].ibytes) * 8.0 / 1e6;
+            uint64_t rx_miss = s2[i].imissed - s1[i].imissed;
+            uint64_t tx_pps = s2[i].opackets - s1[i].opackets;
+            double tx_mbps = (double)(s2[i].obytes - s1[i].obytes) * 8.0 / 1e6;
+
+            printf("%-5u %-10s %-10"PRIu64" %-10.1f %-11"PRIu64" %-9"PRIu64" %.1f\n",
+                   i, link_str, rx_pps, rx_mbps, rx_miss, tx_pps, tx_mbps);
+        }
+        printf("─────────────────────────────────────────────────────────────────────\n"
+               "(1-second sample)\n");
+    } else {
+        export_port_text(buf, sizeof(buf));
+        puts(buf);
+    }
+}
+
+/* ── stat (dispatcher) ─────────────────────────────────────────────────────── */
+static void
+cmd_stat(int argc, char **argv)
+{
+    stat_opts_t opts;
+
+    if (argc < 2) {
+        /* Bare "stat" → summary */
+        stat_parse_opts(argc, argv, 2, &opts);
+
+        uint32_t nw = g_core_map.num_workers;
+        cpu_stats_snapshot_t cpu;
+        mem_stats_snapshot_t mem;
+        metrics_snapshot_t   net;
+
+        cpu_stats_snapshot(&cpu, nw);
+        mem_stats_snapshot(&mem, nw);
+        metrics_snapshot(&net, nw);
+
+        char buf[8192];
+        export_stat_summary(&cpu, &mem, &net, buf, sizeof(buf));
+        puts(buf);
+        return;
+    }
+
+    const char *sub = argv[1];
+
+    /* Check for flags directly after "stat" (no sub-command) */
+    if (sub[0] == '-') {
+        /* Treat as "stat" with flags */
+        stat_parse_opts(argc, argv, 1, &opts);
+        uint32_t nw = g_core_map.num_workers;
+        cpu_stats_snapshot_t cpu;
+        mem_stats_snapshot_t mem;
+        metrics_snapshot_t   net;
+        cpu_stats_snapshot(&cpu, nw);
+        mem_stats_snapshot(&mem, nw);
+        metrics_snapshot(&net, nw);
+        char buf[8192];
+        export_stat_summary(&cpu, &mem, &net, buf, sizeof(buf));
+        puts(buf);
+        return;
+    }
+
+    stat_parse_opts(argc, argv, 2, &opts);
+
+    /* --watch wraps in a loop */
+    if (opts.watch) {
+        if (!isatty(STDOUT_FILENO)) {
+            printf("--watch requires a TTY\n");
+            return;
+        }
+        /* Non-blocking stdin check for Ctrl+C */
+        while (g_run) {
+            printf("\033[H\033[2J"); /* clear screen */
+            if (strcmp(sub, "cpu") == 0)       stat_cpu(&opts);
+            else if (strcmp(sub, "mem") == 0)  stat_mem(&opts);
+            else if (strcmp(sub, "net") == 0)  stat_net(&opts);
+            else if (strcmp(sub, "port") == 0) stat_port(&opts);
+            else { printf("Unknown stat sub-command: %s\n", sub); return; }
+            fflush(stdout);
+
+            /* Check for key press to break */
+            struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
+            if (poll(&pfd, 1, 100) > 0) break;
+        }
+        return;
+    }
+
+    if (strcmp(sub, "cpu") == 0)       stat_cpu(&opts);
+    else if (strcmp(sub, "mem") == 0)  stat_mem(&opts);
+    else if (strcmp(sub, "net") == 0)  stat_net(&opts);
+    else if (strcmp(sub, "port") == 0) stat_port(&opts);
+    else printf("Unknown stat sub-command: %s\n"
+                "Usage: stat [cpu|mem|net|port] [--rate] [--watch] [--core N]\n",
+                sub);
 }
 
 static void
@@ -556,12 +857,13 @@ cmd_show(int argc, char **argv)
     }
 }
 
-/* ── Management tick: runs ARP + pktrace flush ────────────────────────────── */
+/* ── Management tick: runs ARP + pktrace flush + remote CLI ───────────────── */
 static int
 mgmt_tick(void)
 {
     arp_mgmt_tick();
     pktrace_flush();
+    cli_server_poll(dispatch);
     return 0;
 }
 
@@ -617,13 +919,17 @@ cli_run(void)
 
     /* Register built-ins */
     cli_register("help",     "Show this help",           cmd_help);
-    cli_register("stats",    "Print current statistics", cmd_stats);
+    cli_register("stat",     "Statistics: stat [cpu|mem|net|port] [--rate] [--watch] [--core N]", cmd_stat);
+    cli_register("stats",    "Alias for 'stat net'",     cmd_stats);
     cli_register("ping",     "ICMP ping: ping <ip> [count] [size] [ms]", cmd_ping);
     cli_register("start",    "Start traffic: start --ip <ip> --port <N> --duration <s> [flags]", cmd_start);
     cli_register("stop",     "Stop active traffic generation",          cmd_stop_gen);
     cli_register("reset",   "Reset all TCP state (connections, ports)", cmd_reset);
     cli_register("trace",    "Packet capture: trace start/stop",          cmd_trace);
     cli_register("show",     "Show interface details: show interface [port]", cmd_show);
+
+    /* Start CLI socket server for remote attach */
+    cli_server_init(NULL);
 
     /* Detect daemon mode: stdin is /dev/null (char device, non-tty).
      * When launched as a background daemon (nohup ... </dev/null),
@@ -634,10 +940,15 @@ cli_run(void)
         !isatty(STDIN_FILENO)) {
         TGEN_INFO(TGEN_LOG_MGMT,
                   "stdin is /dev/null — running in headless mode "
-                  "(send SIGTERM to stop)\n");
-        while (g_run) {            arp_mgmt_tick();            pktrace_flush();            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100 ms */
+                  "(send SIGTERM to stop, or use vaigai --attach)\n");
+        while (g_run) {
+            arp_mgmt_tick();
+            pktrace_flush();
+            cli_server_poll(dispatch);
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100 ms */
             nanosleep(&ts, NULL);
         }
+        cli_server_destroy();
         return;
     }
 
@@ -647,7 +958,7 @@ cli_run(void)
 
 #ifdef HAVE_READLINE
     rl_bind_key('\t', rl_complete);
-    /* Process ARP while readline waits for input */
+    /* Process ARP + remote clients while readline waits for input */
     rl_event_hook = (rl_hook_func_t *)mgmt_tick;
     char *line;
     while ((line = readline(prompt)) != NULL) {
@@ -670,6 +981,7 @@ cli_run(void)
         while (poll(&pfd, 1, 10 /* ms */) == 0) {
             arp_mgmt_tick();
             pktrace_flush();
+            cli_server_poll(dispatch);
         }
         if (!fgets(buf, sizeof(buf), stdin)) break;
         buf[strcspn(buf, "\n")] = '\0';
@@ -677,4 +989,6 @@ cli_run(void)
         dispatch(buf);
     }
 #endif
+
+    cli_server_destroy();
 }

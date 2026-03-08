@@ -126,6 +126,15 @@ main(int argc, char **argv)
 {
     int rc;
 
+    /* Check for --attach BEFORE EAL init — lightweight client mode */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--attach") == 0) {
+            const char *sock = (i + 1 < argc && argv[i+1][0] != '-')
+                             ? argv[i + 1] : NULL;
+            return cli_attach_client(sock);
+        }
+    }
+
     /* ---- 1. EAL + custom argument parsing ---- */
     tgen_eal_args_t eal_args;
     rc = tgen_eal_init(argc, argv, &eal_args);

@@ -119,6 +119,8 @@ app_src = files(
 mgmt_src = files(
   'src/mgmt/config_mgr.c',
   'src/mgmt/cli.c',
+  'src/mgmt/cli_server.c',
+  'src/mgmt/cli_client.c',
   'src/mgmt/rest.c',
 )
 
@@ -128,6 +130,8 @@ telemetry_src = files(
   'src/telemetry/histogram.c',
   'src/telemetry/export.c',
   'src/telemetry/pktrace.c',
+  'src/telemetry/cpu_stats.c',
+  'src/telemetry/mem_stats.c',
 )
 
 main_src = files('src/main.c')
