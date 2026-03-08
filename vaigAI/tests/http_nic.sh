@@ -389,6 +389,7 @@ IFACES
     local kcmd="console=ttyS0 root=/dev/vda rw quiet"
     kcmd+=" net.ifnames=0 biosdevname=0"
     kcmd+=" vaigai_mode=all"
+    kcmd+=" modprobe.blacklist=qat_dh895xcc,intel_qat"
     kcmd+=" ip=${VM_IP}:::255.255.255.0::eth0:off"
 
     # Kill any leftover QEMU using the same vfio device

@@ -74,7 +74,7 @@ done
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -kernel /boot/vmlinuz-$(uname -r) \
     -initrd /boot/initramfs-$(uname -r).img \
-    -append "console=ttyS0,115200 root=/dev/vda rw quiet net.ifnames=0 biosdevname=0 vaigai_mode=all" \
+    -append "console=ttyS0,115200 root=/dev/vda rw quiet net.ifnames=0 biosdevname=0 vaigai_mode=all modprobe.blacklist=qat_dh895xcc,intel_qat" \
     -drive "file=/work/firecracker/rootfs.ext4,format=raw,if=virtio,cache=unsafe" \
     -nic user,model=virtio,hostfwd=tcp::2222-:22 \
     -device "vfio-pci,host=$NIC_VM" \
@@ -117,7 +117,7 @@ done
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -kernel /boot/vmlinuz-$(uname -r) \
     -initrd /boot/initramfs-$(uname -r).img \
-    -append "console=ttyS0,115200 root=/dev/vda rw quiet net.ifnames=0 biosdevname=0 vaigai_mode=all" \
+    -append "console=ttyS0,115200 root=/dev/vda rw quiet net.ifnames=0 biosdevname=0 vaigai_mode=all modprobe.blacklist=qat_dh895xcc,intel_qat" \
     -drive "file=/work/firecracker/rootfs.ext4,format=raw,if=virtio,cache=unsafe" \
     -nic user,model=virtio,hostfwd=tcp::2222-:22 \
     -device "vfio-pci,host=$NIC_VM" \

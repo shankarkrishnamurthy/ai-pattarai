@@ -709,16 +709,74 @@ OSSL_EOF
     # ── QAT setup script ──
     cat > "$mnt/etc/vaigai/qat-setup.sh" << 'QAT_EOF'
 #!/bin/sh
-# Load QAT modules and firmware
-cp /usr/lib/firmware/qat_895xcc*.bin /lib/firmware/ 2>/dev/null
-modprobe intel_qat 2>/dev/null
-modprobe qat_dh895xcc 2>/dev/null
-modprobe af_alg 2>/dev/null
-modprobe algif_skcipher 2>/dev/null
-modprobe algif_aead 2>/dev/null
-modprobe algif_hash 2>/dev/null
+# QAT PF initialization for vaigAI VM (full PF passthrough).
+set -e
+echo "[QAT] Loading kernel modules..."
+modprobe crc8            2>/dev/null || true
+modprobe intel_qat       2>/dev/null || true
+modprobe qat_dh895xcc    2>/dev/null || true
+sleep 2
+
+QAT_DEV=$(lspci -d 8086:0435 2>/dev/null | head -1)
+if [ -z "$QAT_DEV" ]; then
+    echo "[QAT] No QAT PF (8086:0435) detected — software crypto"
+    exit 1
+fi
+
+QAT_COUNT=$(lspci -d 8086:0435 2>/dev/null | wc -l)
+echo "[QAT] Found $QAT_COUNT QAT PF device(s):"
+lspci -d 8086:0435 2>/dev/null
+
+for dev in $(lspci -d 8086:0435 2>/dev/null | awk '{print $1}'); do
+    QAT_DRV=$(basename "$(readlink "/sys/bus/pci/devices/0000:$dev/driver" 2>/dev/null)" 2>/dev/null || echo "none")
+    echo "[QAT] PF 0000:$dev  driver: $QAT_DRV"
+done
+
+if [ -f /proc/crypto ]; then
+    echo "[QAT] Algorithms: $(grep -c 'driver.*qat' /proc/crypto 2>/dev/null || echo 0) QAT-accelerated"
+fi
+echo "[QAT] PFs ready"
 QAT_EOF
     chmod +x "$mnt/etc/vaigai/qat-setup.sh"
+
+    # ── QAT modprobe blacklist ──
+    # Prevent automatic QAT module loading via PCI alias during initramfs
+    # phase which carries stale firmware. Modules are loaded explicitly by
+    # the qat init service after the rootfs (with correct firmware) is mounted.
+    info "Adding QAT modprobe blacklist"
+    cat > "$mnt/etc/modprobe.d/qat-blacklist.conf" << 'BLEOF'
+# Prevent automatic QAT module loading via PCI alias.
+# The initramfs may carry stale firmware; we load explicitly
+# from /etc/vaigai/qat-setup.sh after the rootfs is mounted
+# so the correct firmware in /lib/firmware/ is used.
+blacklist qat_dh895xcc
+blacklist intel_qat
+BLEOF
+
+    # ── QAT OpenRC init service ──
+    info "Installing QAT init service"
+    cat > "$mnt/etc/init.d/qat" << 'QATINITEOF'
+#!/sbin/openrc-run
+description="QAT firmware and module loader"
+depend() { need localmount; before vaigai; }
+start() {
+    # Only load if a QAT PF is present (vfio-pci passthrough)
+    if ! lspci -d 8086:0435 >/dev/null 2>&1; then
+        einfo "No QAT PF detected — skipping"
+        return 0
+    fi
+    ebegin "Loading QAT modules (rootfs firmware)"
+    if [ -x /etc/vaigai/qat-setup.sh ]; then
+        /etc/vaigai/qat-setup.sh
+    else
+        modprobe intel_qat    2>/dev/null || true
+        modprobe qat_dh895xcc 2>/dev/null || true
+    fi
+    eend $?
+}
+QATINITEOF
+    chmod 755 "$mnt/etc/init.d/qat"
+    ln -sf /etc/init.d/qat "$mnt/etc/runlevels/default/qat"
 
     # ── Finalize ──
     sync

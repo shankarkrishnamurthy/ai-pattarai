@@ -660,6 +660,7 @@ TLSSCRIPT
     local kcmd="console=ttyS0 root=/dev/vda rw quiet"
     kcmd+=" net.ifnames=0 biosdevname=0"
     kcmd+=" vaigai_mode=tls"
+    kcmd+=" modprobe.blacklist=qat_dh895xcc,intel_qat"
     kcmd+=" ip=${VM_IP}:::255.255.255.0::eth0:off"
 
     # Kill stale QEMU
