@@ -21,7 +21,8 @@
 # ║  Result:                                                                     ║
 # ║    /work/dpdk-stable-24.11.1/          DPDK source + build                   ║
 # ║    /work/firecracker/vmlinux           Guest kernel (Firecracker)            ║
-# ║    /work/firecracker/alpine.ext4       Rootfs (all test types)               ║
+# ║    /work/firecracker/alpine.ext4       Rootfs (Firecracker TCP/ARP tests)    ║
+# ║    /work/firecracker/rootfs.ext4      Rootfs (QEMU HTTP/HTTPS/TLS tests)    ║
 # ║    vaigAI/build/vaigai                 Traffic generator binary              ║
 # ║                                                                              ║
 # ║  Hardware Requirements:                                                      ║
@@ -42,6 +43,8 @@ KERNEL_VER="6.1.163"
 ALPINE_VER="3.23"
 ROOTFS="$FC_DIR/alpine.ext4"
 ROOTFS_SIZE_MB=128
+QEMU_ROOTFS="$FC_DIR/rootfs.ext4"
+QEMU_ROOTFS_SIZE_MB=256
 VAIGAI_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
@@ -57,7 +60,7 @@ STEP="all"
 usage() {
     sed -n '/^# ║/s/^# ║ *//p' "$0" | sed 's/ *║$//'
     echo ""
-    echo "Steps: all | host-packages | dpdk | firecracker | kernel | rootfs | qat-host | vaigai | verify"
+    echo "Steps: all | host-packages | dpdk | firecracker | kernel | rootfs | qemu-rootfs | qat-host | vaigai | verify"
     exit 0
 }
 while [[ $# -gt 0 ]]; do
@@ -595,7 +598,137 @@ INITSCRIPT
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STEP 6: QAT Host Setup
+#  STEP 5b: QEMU Rootfs (256 MB ext4 — extends alpine.ext4 with QAT support)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  The QEMU rootfs is used by http_nic.sh, https_nic.sh, and tls_nic.sh.
+#  It extends alpine.ext4 with QAT firmware, kernel modules, nginx TLS config,
+#  SSL certificates, and OpenSSL afalg engine configuration for QAT offload.
+#
+build_qemu_rootfs() {
+    banner "Step 5b: QEMU Rootfs ($QEMU_ROOTFS_SIZE_MB MB)"
+
+    [[ -f "$ROOTFS" ]] || die "alpine.ext4 must be built first (run --step rootfs)"
+
+    local mnt
+    mnt=$(mktemp -d /tmp/vaigai-qemu-rootfs-XXXXXX)
+
+    info "Creating ${QEMU_ROOTFS_SIZE_MB}MB ext4 image from alpine.ext4"
+    dd if=/dev/zero of="$QEMU_ROOTFS" bs=1M count=$QEMU_ROOTFS_SIZE_MB status=none
+    mkfs.ext4 -q -F -L vaigai-qemu-rootfs "$QEMU_ROOTFS"
+    mount -o loop "$QEMU_ROOTFS" "$mnt"
+
+    # Copy contents from alpine.ext4
+    local alpine_mnt
+    alpine_mnt=$(mktemp -d /tmp/vaigai-alpine-mnt-XXXXXX)
+    mount -o loop,ro "$ROOTFS" "$alpine_mnt"
+    cp -a "$alpine_mnt"/. "$mnt"/
+    umount "$alpine_mnt"
+    rmdir "$alpine_mnt"
+
+    # ── QAT firmware ──
+    info "Installing QAT DH895XCC firmware"
+    mkdir -p "$mnt/lib/firmware" "$mnt/usr/lib/firmware"
+    for fw in qat_895xcc.bin qat_895xcc_mmp.bin; do
+        if [[ -f "/usr/lib/firmware/$fw" ]]; then
+            cp "/usr/lib/firmware/$fw" "$mnt/lib/firmware/"
+            cp "/usr/lib/firmware/$fw" "$mnt/usr/lib/firmware/"
+        elif [[ -f "/lib/firmware/$fw" ]]; then
+            cp "/lib/firmware/$fw" "$mnt/lib/firmware/"
+            cp "/lib/firmware/$fw" "$mnt/usr/lib/firmware/"
+        else
+            warn "QAT firmware $fw not found on host — skipping"
+        fi
+    done
+
+    # ── QAT kernel modules ──
+    local kver
+    kver=$(uname -r)
+    info "Installing QAT kernel modules ($kver)"
+    local moddir="/lib/modules/$kver"
+    local dst="$mnt/lib/modules/$kver"
+    mkdir -p "$dst/kernel/drivers/crypto/intel/qat"
+    for mod in intel_qat.ko qat_dh895xcc.ko qat_dh895xccvf.ko; do
+        local src
+        src=$(find "$moddir" -name "$mod" -o -name "${mod}.xz" -o -name "${mod}.zst" 2>/dev/null | head -1)
+        if [[ -n "$src" ]]; then
+            cp "$src" "$dst/kernel/drivers/crypto/intel/qat/"
+        fi
+    done
+    # Copy modules.dep so modprobe works
+    for f in modules.dep modules.dep.bin modules.alias modules.alias.bin modules.symbols modules.symbols.bin modules.builtin modules.builtin.bin modules.order; do
+        [[ -f "$moddir/$f" ]] && cp "$moddir/$f" "$dst/" 2>/dev/null || true
+    done
+
+    # ── SSL certificates ──
+    info "Generating SSL certificates"
+    mkdir -p "$mnt/etc/nginx/ssl"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+        -keyout "$mnt/etc/nginx/ssl/server.key" \
+        -out "$mnt/etc/nginx/ssl/server.crt" \
+        -subj "/CN=vaigai-test" 2>/dev/null
+
+    # ── nginx TLS vhost ──
+    info "Configuring nginx TLS vhost"
+    mkdir -p "$mnt/etc/nginx/http.d"
+    cat > "$mnt/etc/nginx/http.d/vaigai-tls.conf" << 'NGINX_EOF'
+server {
+    listen       443 ssl reuseport;
+    server_name  _;
+    ssl_certificate     /etc/nginx/ssl/server.crt;
+    ssl_certificate_key /etc/nginx/ssl/server.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_session_cache   shared:SSL_QEMU:10m;
+    ssl_session_timeout 5m;
+    location / {
+        root /var/www/html;
+        try_files $uri $uri/ =404;
+    }
+}
+NGINX_EOF
+
+    # ── Static test files ──
+    mkdir -p "$mnt/var/www/html"
+    dd if=/dev/urandom of="$mnt/var/www/html/100k.bin" bs=1024 count=100 status=none 2>/dev/null || true
+
+    # ── OpenSSL afalg engine config for QAT ──
+    info "Installing OpenSSL afalg engine config"
+    mkdir -p "$mnt/etc/vaigai"
+    cat > "$mnt/etc/vaigai/openssl-qat.cnf" << 'OSSL_EOF'
+openssl_conf = openssl_init
+[openssl_init]
+engines = engine_section
+[engine_section]
+afalg = afalg_section
+[afalg_section]
+default_algorithms = ALL
+init = 1
+OSSL_EOF
+
+    # ── QAT setup script ──
+    cat > "$mnt/etc/vaigai/qat-setup.sh" << 'QAT_EOF'
+#!/bin/sh
+# Load QAT modules and firmware
+cp /usr/lib/firmware/qat_895xcc*.bin /lib/firmware/ 2>/dev/null
+modprobe intel_qat 2>/dev/null
+modprobe qat_dh895xcc 2>/dev/null
+modprobe af_alg 2>/dev/null
+modprobe algif_skcipher 2>/dev/null
+modprobe algif_aead 2>/dev/null
+modprobe algif_hash 2>/dev/null
+QAT_EOF
+    chmod +x "$mnt/etc/vaigai/qat-setup.sh"
+
+    # ── Finalize ──
+    sync
+    umount "$mnt"
+    rmdir "$mnt"
+
+    ok "QEMU Rootfs: $QEMU_ROOTFS ($(du -h "$QEMU_ROOTFS" | cut -f1))"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
 #
 #  QAT crypto offload on both sides:
@@ -740,6 +873,7 @@ verify_env() {
     check "Firecracker binary"        "command -v firecracker"
     check "Guest kernel"              "test -f '$FC_DIR/vmlinux'"
     check "Rootfs"                    "test -f '$ROOTFS'"
+    check "QEMU Rootfs"               "test -f '$QEMU_ROOTFS'"
     check "Host vmlinuz"              "test -f '/boot/vmlinuz-$(uname -r)'"
     check "Host initramfs"            "test -f '/boot/initramfs-$(uname -r).img'"
     check "QEMU"                      "command -v qemu-system-x86_64"
@@ -812,6 +946,7 @@ should_run "dpdk"          && build_dpdk
 should_run "firecracker"   && install_firecracker
 should_run "kernel"        && build_guest_kernel
 should_run "rootfs"        && build_rootfs
+should_run "qemu-rootfs"   && build_qemu_rootfs
 should_run "qat-host"      && setup_qat_host
 should_run "vaigai"        && build_vaigai
 should_run "verify"        && verify_env

@@ -56,6 +56,19 @@ CLI, REST API, config, and ARP.
 - **Firecracker repo**: `/work/firecracker/fc-repo/` (v1.14.2 source, used to build the binary)
 - **Kernel config reference**: `/work/firecracker/vmlinux-6.1`
 
+### QEMU VM (for HTTP/HTTPS/TLS NIC tests)
+
+- **Root filesystem**: `/work/firecracker/rootfs.ext4` — Alpine 3.23, 256 MB ext4 image
+  - Extended rootfs for QEMU-based NIC loopback tests (http_nic.sh, https_nic.sh, tls_nic.sh)
+  - Contains everything in `alpine.ext4` plus:
+    - QAT firmware (`qat_895xcc.bin`, `qat_895xcc_mmp.bin`) for DH895XCC crypto offload
+    - QAT kernel modules (`intel_qat`, `qat_dh895xcc`) for PF passthrough
+    - nginx TLS vhost on `:443` with pre-generated SSL certificates
+    - OpenSSL afalg engine config (`/etc/vaigai/openssl-qat.cnf`) for kernel crypto API → QAT
+    - QAT setup script (`/etc/vaigai/qat-setup.sh`) for PF initialization
+  - Used with `qemu-system-x86_64` and vfio-pci device passthrough (NIC + QAT PFs)
+  - The QEMU tests make COW copies at runtime, so the base image is never modified
+
 ### Optional Libraries
 
 | Library | Feature flag | Purpose |

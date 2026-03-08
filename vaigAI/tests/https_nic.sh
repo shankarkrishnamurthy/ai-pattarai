@@ -153,7 +153,7 @@ fi
 
 VMLINUX="${VMLINUX:-/boot/vmlinuz-$(uname -r)}"
 INITRAMFS="${INITRAMFS:-/boot/initramfs-$(uname -r).img}"
-ROOTFS="${ROOTFS:-/work/firecracker/alpine.ext4}"
+ROOTFS="${ROOTFS:-/work/firecracker/rootfs.ext4}"
 VAIGAI_BIN="$(cd "$(dirname "$0")/.." && pwd)/build/vaigai"
 
 PASS_COUNT=0

@@ -41,7 +41,7 @@
 #   DPDK_LCORES      DPDK lcore mask for vaigAI       (default: 0-3)
 #   VMLINUX          Path to vmlinuz for QEMU         (default: /boot/vmlinuz-$(uname -r))
 #   INITRAMFS        Path to initramfs for QEMU       (default: /boot/initramfs-$(uname -r).img)
-#   ROOTFS           Path to Alpine rootfs ext4       (default: /work/firecracker/alpine.ext4)
+#   ROOTFS           Path to QEMU rootfs ext4          (default: /work/firecracker/rootfs.ext4)
 #
 # Usage:
 #   bash tests/http_nic.sh [OPTIONS]
@@ -96,7 +96,7 @@ VM_CPUS="${VM_CPUS:-2}"
 DPDK_LCORES="${DPDK_LCORES:-14-15}"
 VMLINUX="${VMLINUX:-/boot/vmlinuz-$(uname -r)}"
 INITRAMFS="${INITRAMFS:-/boot/initramfs-$(uname -r).img}"
-ROOTFS="${ROOTFS:-/work/firecracker/alpine.ext4}"
+ROOTFS="${ROOTFS:-/work/firecracker/rootfs.ext4}"
 VAIGAI_BIN="$(cd "$(dirname "$0")/.." && pwd)/build/vaigai"
 
 PASS_COUNT=0
