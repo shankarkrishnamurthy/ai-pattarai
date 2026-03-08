@@ -52,6 +52,18 @@ int  tls_ctx_init(tls_ctx_t *ctx,
 
 void tls_ctx_fini(tls_ctx_t *ctx);
 
+/**
+ * Enable SSLKEYLOG output to the given file path.
+ * Writes TLS session keys in NSS Key Log format for Wireshark decryption.
+ * Must be called after tls_ctx_init() and before any connections are opened.
+ * @param path  File path to write key log to.
+ * @return 0 on success, negative on error.
+ */
+int  tls_keylog_enable(tls_ctx_t *ctx, const char *path);
+
+/** Close the SSLKEYLOG file (called during shutdown). */
+void tls_keylog_close(void);
+
 /* ------------------------------------------------------------------ */
 /* Per-connection TLS session                                           */
 /* ------------------------------------------------------------------ */

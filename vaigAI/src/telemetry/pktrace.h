@@ -1,17 +1,25 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * vaigAI: DPDK-native packet capture  (rte_pcapng + rx/tx callbacks).
  *
+ * Two capture modes:
+ *   Streaming:  pktrace_start() with a file path — packets are continuously
+ *               flushed to disk via pktrace_flush().  No packet count limit.
+ *   Buffered:   pktrace_start() without a path — packets accumulate in the
+ *               ring buffer (4096 slots), then pktrace_save() writes them out.
+ *
  * Usage:
- *   pktrace_init()   — once at startup, allocates ring + capture mempool
- *   pktrace_start()  — installs RX+TX callbacks on port/queue
- *   pktrace_stop()   — removes callbacks
- *   pktrace_save()   — writes captured mbufs to a .pcapng file
- *   pktrace_destroy()— cleanup at shutdown
+ *   pktrace_init()    — once at startup, allocates ring + capture mempool
+ *   pktrace_start()   — installs RX+TX callbacks on port/queue
+ *   pktrace_flush()   — drain ring to file (streaming mode); call from mgmt tick
+ *   pktrace_stop()    — removes callbacks, auto-flushes + closes file
+ *   pktrace_save()    — writes buffered mbufs to a .pcapng file (non-streaming)
+ *   pktrace_destroy() — cleanup at shutdown
  */
 #ifndef TGEN_PKTRACE_H
 #define TGEN_PKTRACE_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,28 +44,33 @@ void pktrace_destroy(void);
  * @param port_id   DPDK port to capture on.
  * @param queue_id  Queue index to capture on.
  * @param max_pkts  Stop after capturing this many packets (0 = unlimited).
+ * @param path      Output file for streaming mode, or NULL for buffered mode.
+ *                  In streaming mode pktrace_flush() must be called
+ *                  periodically from the management lcore.
  * @return 0 on success, negative errno on failure.
  */
-int  pktrace_start(uint16_t port_id, uint16_t queue_id, uint32_t max_pkts);
+int  pktrace_start(uint16_t port_id, uint16_t queue_id, uint32_t max_pkts,
+                   const char *path);
+
+/**
+ * Flush captured packets from the ring to the open pcapng file.
+ * Only meaningful in streaming mode.  Safe to call when idle.
+ * Should be called periodically from the management lcore tick.
+ */
+void pktrace_flush(void);
 
 /**
  * Stop an active capture.  Removes the rx/tx callbacks and logs capture
- * statistics.  Captured mbufs remain in the ring until pktrace_save().
+ * statistics.  In streaming mode, flushes remaining packets and closes
+ * the output file automatically.
  */
 void pktrace_stop(void);
 
-/**
- * Write all currently captured mbufs to a pcapng file.
- * The ring is drained and all mbufs are freed after writing.
- * Can be called whether a capture is running or not.
- *
- * @param path  Output file path, e.g. "capture.pcapng".
- * @return number of packets written on success, negative errno on failure.
- */
-int  pktrace_save(const char *path);
-
 /** Return number of packets captured since last pktrace_start(). */
 uint32_t pktrace_count(void);
+
+/** Return true if a capture is currently active. */
+bool pktrace_is_active(void);
 
 #ifdef __cplusplus
 }

@@ -15,9 +15,10 @@ extern "C" {
 #define TCP_SYN_QUEUE_SZ       1024
 #define TCP_DELAYED_ACK_US     40000   /* 40 ms */
 #define TCP_MAX_RETRANSMITS    15
-#define TCP_INITIAL_RTO_US     1000000 /* 1 s */
+#define TCP_INITIAL_RTO_US     10000   /* 10 ms — aggressive for traffic gen */
 #define TCP_MAX_RTO_US         60000000 /* 60 s */
 #define TCP_TLS_HS_TIMEOUT_S   5       /* TLS handshake timeout (seconds) */
+#define TCP_HTTP_RSP_TIMEOUT_US 50000   /* 50 ms — abort if no HTTP response */
 
 /** Worker: receive and dispatch an incoming TCP segment.
  *  m's data pointer should be at start of TCP header. */
@@ -41,6 +42,9 @@ int tcp_fsm_close(uint32_t worker_idx, tcb_t *tcb);
 
 /** Worker: send RST for a TCB; free it immediately. */
 void tcp_fsm_reset(uint32_t worker_idx, tcb_t *tcb);
+
+/** Worker: RST all active connections and reset the TCB store + port pool. */
+void tcp_fsm_reset_all(uint32_t worker_idx);
 
 /** Called from timer wheel to handle RTO expiry. */
 void tcp_fsm_rto_expired(uint32_t worker_idx, tcb_t *tcb);

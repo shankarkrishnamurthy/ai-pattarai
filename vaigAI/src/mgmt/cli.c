@@ -18,6 +18,7 @@
 #include "../core/tx_gen.h"
 #include "../core/worker_loop.h"
 #include "../core/core_assign.h"
+#include "../port/port_init.h"
 #include "../tls/tls_session.h"
 #include "../tls/tls_engine.h"
 #include "../app/http11.h"
@@ -30,6 +31,7 @@
 #include <inttypes.h>
 #include <sys/stat.h>
 #include <poll.h>
+#include <arpa/inet.h>
 
 #ifdef HAVE_READLINE
 # include <readline/readline.h>
@@ -71,31 +73,32 @@ static void
 cmd_trace(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("Usage: trace start [port=0] [queue=0] [count=100]\n"
-               "       trace stop\n"
-               "       trace save <file.pcapng>\n");
+        printf("Usage: trace start <file.pcapng> [port=0] [queue=0]\n"
+               "       trace stop\n");
         return;
     }
     if (strcmp(argv[1], "start") == 0) {
-        uint16_t port  = (argc >= 3) ? (uint16_t)strtoul(argv[2], NULL, 10) : 0;
-        uint16_t queue = (argc >= 4) ? (uint16_t)strtoul(argv[3], NULL, 10) : 0;
-        uint32_t count = (argc >= 5) ? (uint32_t)strtoul(argv[4], NULL, 10) : 100;
-        int rc = pktrace_start(port, queue, count);
+        if (argc < 3) {
+            printf("Usage: trace start <file.pcapng> [port=0] [queue=0]\n");
+            return;
+        }
+        const char *path = argv[2];
+        uint16_t port  = (argc >= 4) ? (uint16_t)strtoul(argv[3], NULL, 10) : 0;
+        uint16_t queue = (argc >= 5) ? (uint16_t)strtoul(argv[4], NULL, 10) : 0;
+        int rc = pktrace_start(port, queue, 0, path);
         if (rc == 0)
-            printf("Capture started on port %u queue %u (max %u pkts)\n",
-                   port, queue, count);
+            printf("Capture started on port %u queue %u → %s (unlimited)\n",
+                   port, queue, path);
         else
             printf("trace start failed: %s\n", strerror(-rc));
     } else if (strcmp(argv[1], "stop") == 0) {
+        if (!pktrace_is_active()) {
+            printf("No active capture.\n");
+            return;
+        }
+        uint32_t count = pktrace_count();
         pktrace_stop();
-        printf("Capture stopped (%u packets in ring)\n", pktrace_count());
-    } else if (strcmp(argv[1], "save") == 0) {
-        if (argc < 3) { printf("Usage: trace save <file.pcapng>\n"); return; }
-        int n = pktrace_save(argv[2]);
-        if (n >= 0)
-            printf("Saved %d packets → %s\n", n, argv[2]);
-        else
-            printf("trace save failed: %s\n", strerror(-n));
+        printf("Capture stopped (%u packets captured)\n", count);
     } else {
         printf("Unknown trace sub-command '%s'\n", argv[1]);
     }
@@ -321,6 +324,7 @@ cmd_start(int argc, char **argv)
             struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
             nanosleep(&ts, NULL);
             arp_mgmt_tick();
+            pktrace_flush();
             if (!g_run) break;
         }
         if (!g_run) break;
@@ -360,9 +364,11 @@ cmd_start(int argc, char **argv)
             double pps = (double)snap.total.tx_pkts / (double)a.duration;
             printf("Throughput: %.1f pps\n", pps);
         }
-        printf("\n--- telemetry ---\n");
-        cli_print_stats();
     }
+    /* Human-readable summary with status, rates, warnings */
+    char summary[8192];
+    export_summary(&snap, a.duration, a.proto, summary, sizeof(summary));
+    puts(summary);
 }
 
 static void
@@ -427,6 +433,90 @@ cmd_reset(int argc, char **argv)
     printf("TCP state reset: all connections closed, ports freed, metrics cleared.\n");
 }
 
+/* ── Show interface details ──────────────────────────────────────────────── */
+static void
+cmd_show(int argc, char **argv)
+{
+    if (argc < 2 || strcmp(argv[1], "interface") != 0) {
+        printf("Usage: show interface [port_id]\n");
+        return;
+    }
+
+    uint32_t start = 0, end = g_n_ports;
+    if (argc >= 3) {
+        uint32_t p = (uint32_t)strtoul(argv[2], NULL, 10);
+        if (p >= g_n_ports) {
+            printf("Port %u does not exist (have %u port(s))\n", p, g_n_ports);
+            return;
+        }
+        start = p;
+        end   = p + 1;
+    }
+
+    for (uint32_t p = start; p < end; p++) {
+        port_caps_t *c = &g_port_caps[p];
+
+        /* Link status */
+        struct rte_eth_link link;
+        int link_rc = rte_eth_link_get_nowait(p, &link);
+        if (link_rc < 0)
+            memset(&link, 0, sizeof(link));
+
+        /* Packet stats */
+        struct rte_eth_stats stats;
+        rte_eth_stats_get(p, &stats);
+
+        /* MAC */
+        char mac_buf[18];
+        tgen_mac_str(c->mac_addr.addr_bytes, mac_buf, sizeof(mac_buf));
+
+        /* IP from ARP state */
+        char ip_buf[INET_ADDRSTRLEN];
+        if (g_arp[p].local_ip)
+            tgen_ipv4_str(g_arp[p].local_ip, ip_buf, sizeof(ip_buf));
+        else
+            snprintf(ip_buf, sizeof(ip_buf), "not set");
+
+        printf("Port %u\n", p);
+        printf("  Driver:      %s\n", c->driver_name);
+        printf("  MAC:         %s\n", mac_buf);
+        printf("  IP:          %s\n", ip_buf);
+        printf("  Link:        %s  %u Mbps  %s\n",
+               link.link_status ? "UP" : "DOWN",
+               link.link_speed,
+               link.link_duplex ? "full-duplex" : "half-duplex");
+        printf("  NUMA socket: %u\n", c->socket_id);
+        printf("  Mgmt TX Q:   %u\n", c->mgmt_tx_q);
+        printf("  Offloads:    IPv4-cksum=%s TCP-cksum=%s UDP-cksum=%s\n"
+               "               RSS=%s scatter=%s multi-seg=%s VLAN=%s\n",
+               c->has_ipv4_cksum_offload ? "yes" : "no",
+               c->has_tcp_cksum_offload  ? "yes" : "no",
+               c->has_udp_cksum_offload  ? "yes" : "no",
+               c->has_rss          ? "yes" : "no",
+               c->has_scatter_rx   ? "yes" : "no",
+               c->has_multi_seg_tx ? "yes" : "no",
+               c->has_vlan_offload ? "yes" : "no");
+        printf("  Statistics:\n"
+               "    RX packets: %" PRIu64 "  bytes: %" PRIu64
+               "  missed: %" PRIu64 "  errors: %" PRIu64 "\n"
+               "    TX packets: %" PRIu64 "  bytes: %" PRIu64
+               "  errors: %" PRIu64 "\n",
+               stats.ipackets, stats.ibytes, stats.imissed, stats.ierrors,
+               stats.opackets, stats.obytes, stats.oerrors);
+        if (p + 1 < end)
+            printf("\n");
+    }
+}
+
+/* ── Management tick: runs ARP + pktrace flush ────────────────────────────── */
+static int
+mgmt_tick(void)
+{
+    arp_mgmt_tick();
+    pktrace_flush();
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Public API                                                           */
 /* ------------------------------------------------------------------ */
@@ -444,7 +534,7 @@ void
 cli_print_stats(void)
 {
     metrics_snapshot_t snap;
-    metrics_snapshot(&snap, TGEN_MAX_WORKERS);
+    metrics_snapshot(&snap, g_core_map.num_workers);
     char buf[4096];
     export_json(&snap, buf, sizeof(buf));
     puts(buf);
@@ -484,7 +574,8 @@ cli_run(void)
     cli_register("start",    "Start traffic: start --ip <ip> --port <N> --duration <s> [flags]", cmd_start);
     cli_register("stop",     "Stop active traffic generation",          cmd_stop_gen);
     cli_register("reset",   "Reset all TCP state (connections, ports)", cmd_reset);
-    cli_register("trace",    "Packet capture: trace start/stop/save",    cmd_trace);
+    cli_register("trace",    "Packet capture: trace start/stop",          cmd_trace);
+    cli_register("show",     "Show interface details: show interface [port]", cmd_show);
 
     /* Detect daemon mode: stdin is /dev/null (char device, non-tty).
      * When launched as a background daemon (nohup ... </dev/null),
@@ -496,7 +587,7 @@ cli_run(void)
         TGEN_INFO(TGEN_LOG_MGMT,
                   "stdin is /dev/null — running in headless mode "
                   "(send SIGTERM to stop)\n");
-        while (g_run) {            arp_mgmt_tick();            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100 ms */
+        while (g_run) {            arp_mgmt_tick();            pktrace_flush();            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100 ms */
             nanosleep(&ts, NULL);
         }
         return;
@@ -509,7 +600,7 @@ cli_run(void)
 #ifdef HAVE_READLINE
     rl_bind_key('\t', rl_complete);
     /* Process ARP while readline waits for input */
-    rl_event_hook = (rl_hook_func_t *)arp_mgmt_tick;
+    rl_event_hook = (rl_hook_func_t *)mgmt_tick;
     char *line;
     while ((line = readline(prompt)) != NULL) {
         if (*line) add_history(line);
@@ -528,8 +619,10 @@ cli_run(void)
          * Without this, incoming ARP requests pile up unprocessed when
          * no tps command is active. */
         struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
-        while (poll(&pfd, 1, 10 /* ms */) == 0)
+        while (poll(&pfd, 1, 10 /* ms */) == 0) {
             arp_mgmt_tick();
+            pktrace_flush();
+        }
         if (!fgets(buf, sizeof(buf), stdin)) break;
         buf[strcspn(buf, "\n")] = '\0';
         if (strcmp(buf, "quit") == 0 || strcmp(buf, "exit") == 0) break;

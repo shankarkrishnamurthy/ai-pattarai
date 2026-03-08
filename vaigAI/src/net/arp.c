@@ -164,6 +164,19 @@ void arp_mgmt_process(uint16_t port_id, struct rte_mbuf *m)
 
     if (op == RTE_ARP_OP_REQUEST &&
         arp->arp_data.arp_tip == a->local_ip) {
+        /* Learn sender's MAC from ARP request (RFC 826) */
+        rte_rwlock_write_lock(&a->lock);
+        int rc = rte_hash_add_key(a->table, &sender_ip);
+        if (rc >= 0) {
+            arp_entry_t *e = &a->entries[rc];
+            rte_ether_addr_copy(&arp->arp_data.arp_sha, &e->mac);
+            e->state      = ARP_STATE_RESOLVED;
+            e->expire_tsc = rte_rdtsc() +
+                            g_tsc_hz * ARP_CACHE_TTL_S;
+            e->fail_count = 0;
+        }
+        rte_rwlock_write_unlock(&a->lock);
+
         /* Reply with our MAC */
         extern struct rte_mempool *g_worker_mempools[];
         struct rte_mempool *mp = g_worker_mempools[0];

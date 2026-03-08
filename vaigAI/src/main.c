@@ -44,6 +44,7 @@
 #include "net/icmp.h"
 #include "net/udp.h"
 #include "tls/cert_mgr.h"
+#include "tls/tls_engine.h"
 #include "tls/tls_session.h"
 #include "tls/cryptodev.h"
 #include "telemetry/log.h"
@@ -104,6 +105,7 @@ tgen_cleanup(void)
     icmp_destroy();
     udp_destroy();
     arp_destroy();
+    tls_keylog_close();
     cert_mgr_fini(&g_tls_client, &g_tls_server);
 
     for (uint32_t i = 0; i < g_n_ports; i++)
@@ -210,6 +212,18 @@ main(int argc, char **argv)
         RTE_LOG(WARNING, USER1, "TLS init failed — TLS disabled\n");
     } else {
         g_config.tls_enabled = true;
+        /* SSLKEYLOG: enable key logging for Wireshark decryption */
+        const char *keylog_path = eal_args.sslkeylog_path[0]
+            ? eal_args.sslkeylog_path
+            : getenv("SSLKEYLOGFILE");
+        if (keylog_path) {
+            if (tls_keylog_enable(&g_tls_client, keylog_path) == 0)
+                RTE_LOG(INFO, USER1,
+                    "SSLKEYLOG: writing keys to %s\n", keylog_path);
+            else
+                RTE_LOG(WARNING, USER1,
+                    "SSLKEYLOG: failed to open %s\n", keylog_path);
+        }
         rc = tls_session_store_init(&g_tls_client, &g_tls_server);
         if (rc < 0) goto fail_ipc;
     }

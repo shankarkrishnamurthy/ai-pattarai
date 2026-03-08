@@ -28,6 +28,12 @@ congestion_on_ack(tcb_t *tcb, uint32_t acked)
     /* Reset dup-ACK counter on new ACK. */
     tcb->dup_ack_count = 0;
 
+    /* Throughput mode: keep cwnd = snd_wnd (no CC). */
+    if (tcb->app_ctx == (void *)1) {
+        tcb->cwnd = UINT32_MAX;
+        return;
+    }
+
     if (tcb->in_fast_recovery) {
         /*
          * Fast Recovery: deflate cwnd back to ssthresh once
@@ -61,6 +67,11 @@ void
 congestion_fast_retransmit(uint32_t worker_idx, tcb_t *tcb)
 {
     (void)worker_idx;
+
+    /* Throughput mode: no CC, keep cwnd unlimited. */
+    if (tcb->app_ctx == (void *)1)
+        return;
+
     /* RFC 5681 §3.2: set ssthresh and enter Fast Recovery */
     uint32_t flight = tcb->snd_nxt - tcb->snd_una;
     tcb->ssthresh = cc_max(flight / 2, 2u * tcb->mss_remote);
@@ -84,6 +95,10 @@ congestion_fast_retransmit(uint32_t worker_idx, tcb_t *tcb)
 void
 congestion_on_rto(tcb_t *tcb)
 {
+    /* Throughput mode: don't collapse cwnd on RTO. */
+    if (tcb->app_ctx == (void *)1)
+        return;
+
     /*
      * RFC 5681 §3.1: on RTO, reduce ssthresh and reset cwnd to 1 MSS.
      * RFC 6298 §5.5: back off RTO (caller handles doubling).

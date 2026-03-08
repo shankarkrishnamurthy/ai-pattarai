@@ -161,6 +161,7 @@ main()
   │     config_push_to_workers()     Push flow profiles to ARP subsystem
   ├─8── cert_mgr_init()              TLS client/server SSL contexts
   │     tls_session_store_init()
+  │     tls_keylog_enable()          SSLKEYLOG via --sslkeylog or $SSLKEYLOGFILE
   ├─9── tcb_stores_init()            Per-worker TCB stores (+ tcb_store_reset())
   │     tcp_port_pool_init()         Ephemeral port bitmaps (+ tcp_port_pool_reset())
   ├─10─ cryptodev_init()             HW crypto (non-fatal; falls back to SW)
@@ -306,6 +307,9 @@ Mempool allocation uses a 3-tier NUMA fallback: worker's socket with 1 GB pages 
 - `tcp_send_segment()` sets `m->l2_len = sizeof(struct rte_ether_hdr)` so the TAP PMD can compute L4 checksums via `RTE_MBUF_F_TX_TCP_CKSUM`.
 - FIN_WAIT_1 and FIN_WAIT_2 accept incoming data (half-open receive) — required for echo servers that flush buffered data after receiving FIN.
 - RST processing is skipped for TIME_WAIT and already-freed TCBs to avoid spurious `reset_rx` counts.
+- **CLOSE_WAIT auto-close:** When a peer sends FIN while in ESTABLISHED, the FSM transitions to CLOSE_WAIT, ACKs the FIN, and immediately calls `tcp_fsm_close()` to send our own FIN (→ LAST_ACK). The traffic generator has no pending data, so lingering in CLOSE_WAIT is unnecessary.
+- **RST for unknown connections (RFC 793 §3.4):** Segments arriving with no matching TCB trigger `tcp_send_rst_no_tcb()`, which constructs a RST reply using the RFC 793 §3.4 sequence number rules (ACK-bearing → `SEQ = ACK`; non-ACK → `SEQ = 0, ACK = SEQ + seg_len`). Incoming RSTs are never replied to.
+- **`tcp_fsm_reset_all()`:** Iterates all in-use TCBs in a worker's store, sends RST+ACK to each peer, detaches any TLS state via `tls_detach_if_needed()`, then calls `tcb_store_reset()` to free all entries. Used by the `reset` CLI command.
 
 ### 2.2 Transmit Path — TX Generation Engine
 
@@ -531,6 +535,10 @@ non-blocking operation:
   │   Handshake states: PENDING → IN_PROGRESS → DONE     │
   │   Cipher suites: ECDHE + AES-GCM (TLS 1.2/1.3)     │
   │   SNI support for virtual hosting                    │
+  │                                                      │
+  │   SSLKEYLOG: SSL_CTX_set_keylog_callback() writes    │
+  │   session keys in NSS Key Log format for Wireshark   │
+  │   decryption (--sslkeylog / $SSLKEYLOGFILE)          │
   ├──────────────────────────────────────────────────────┤
   │   ┌─────────────┐  ┌────────────────────────────┐   │
   │   │ cert_mgr.c  │  │ cryptodev.c                │   │
@@ -583,6 +591,11 @@ calls `tcp_fsm_connect()` + `tcp_fsm_send()` on behalf of CLI commands like
 - RTO armed once per flight; restarted on ACK with unacked data; disarmed on full ACK.
 - No TX buffer — lost segments cannot be retransmitted. Fast retransmit adjusts congestion state only.
 - FIN_WAIT_1/2 states accept incoming data (half-open receive) for compatibility with echo servers.
+- RFC 7323 §2.2: SYN-ACK window is NOT scaled — initial `snd_wnd` uses the raw window field.
+- RTT is measured from the SYN round-trip (timestamp echo in SYN-ACK), calibrating RTO before any data segment is sent.
+- **Throughput mode bypass:** connections marked with `app_ctx == (void*)1` (throughput pump) skip congestion control entirely — cwnd is set to UINT32_MAX and `congestion_on_ack`/`congestion_on_rto`/`congestion_fast_retransmit` return early. The receiver's advertised window (`snd_wnd`) is the only flow-control limit.
+- HTTP response timeout: connections in `app_state == 5` (HTTP response pending) are RST'd after 50 ms to free TCB slots quickly.
+- RST-no-TCB (RFC 793 §3.4) is disabled to prevent RST storms from overwhelming the peer.
 
 ---
 

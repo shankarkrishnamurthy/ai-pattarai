@@ -134,7 +134,7 @@ ip_pool_get(worker_pool_t *wp, uint32_t src_ip)
 
     for (uint32_t i = 0; i < N_IP_SLOTS; i++) {
         uint32_t s = (start + i) % N_IP_SLOTS;
-        if (g_pools[0] == NULL) break; /* safety */
+        if (wp == NULL) break; /* safety */
         ip_pool_t *p = &wp->ip_pools[s];
         if (p->src_ip == src_ip)
             return p;
@@ -248,6 +248,16 @@ tcp_port_free(uint32_t worker_idx, uint32_t src_ip, uint16_t port)
     e->port        = port;
     e->release_tsc = rte_rdtsc() + wp->tw_hold_tsc;
     wp->tw_tail    = next_tail;
+}
+
+void
+tcp_port_free_immediate(uint32_t worker_idx, uint32_t src_ip, uint16_t port)
+{
+    worker_pool_t *wp = g_pools[worker_idx];
+    if (port < TGEN_EPHEM_LO || port >= TGEN_EPHEM_HI)
+        return;
+    ip_pool_t *ip = ip_pool_get(wp, src_ip);
+    bm_set(ip->map, port - TGEN_EPHEM_LO);
 }
 
 void

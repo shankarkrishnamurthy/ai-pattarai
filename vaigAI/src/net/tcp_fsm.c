@@ -58,6 +58,35 @@ tls_detach_if_needed(uint32_t worker_idx, tcb_t *tcb)
     }
 }
 
+/* ── Secure ISN generation (RFC 6528) ────────────────────────────────────── */
+static uint64_t g_isn_secret[2];  /* random secret, set once at startup */
+
+__attribute__((constructor))
+static void isn_secret_init(void)
+{
+    /* Use rte_rdtsc as entropy seed — combined with SipHash this is
+     * sufficiently unpredictable for a traffic generator. */
+    g_isn_secret[0] = rte_rdtsc() ^ 0xdeadbeefcafe1234ULL;
+    g_isn_secret[1] = rte_rdtsc() ^ 0x1122334455667788ULL;
+}
+
+static uint32_t isn_generate(uint32_t sip, uint16_t sport,
+                              uint32_t dip, uint16_t dport)
+{
+    /* SipHash-2-4-like mixing of 4-tuple + secret + clock */
+    uint64_t v = g_isn_secret[0] ^ ((uint64_t)sip << 32 | dip);
+    v ^= ((uint64_t)sport << 16 | dport) * 0x9E3779B97F4A7C15ULL;
+    v ^= g_isn_secret[1];
+    v = (v ^ (v >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    v = (v ^ (v >> 27)) * 0x94d049bb133111ebULL;
+    /* Add monotonic clock component (RFC 6528 §3: M + F(...)) */
+    uint32_t m = (uint32_t)(rte_rdtsc() >> 8); /* ~4µs granularity */
+    return (uint32_t)(v >> 32) + m;
+}
+
+/* ── Per-worker IP ID counter ────────────────────────────────────────────── */
+static uint32_t g_tcp_ip_id[TGEN_MAX_WORKERS];
+
 /* ── Build and send a TCP segment ────────────────────────────────────────── */
 static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
                               uint8_t flags,
@@ -76,7 +105,7 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     if (flags & RTE_TCP_SYN_FLAG) {
         opts_len = tcp_options_write_syn(opts, sizeof(opts),
                        tcb->mss_local, tcb->wscale_local,
-                       true, true, ts_val);
+                       true, true, ts_val, tcb->ts_ecr);
     } else {
         opts_len = tcp_options_write_data(opts, sizeof(opts),
                        tcb->ts_enabled, ts_val, tcb->ts_ecr,
@@ -112,7 +141,8 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     ip->type_of_service = 0;
     ip->total_length  = rte_cpu_to_be_16(
         (uint16_t)(sizeof(*ip) + seg_len));
-    ip->packet_id     = 0;
+    ip->packet_id     = rte_cpu_to_be_16(
+        (uint16_t)(g_tcp_ip_id[worker_idx]++ & 0xFFFF));
     ip->fragment_offset = rte_cpu_to_be_16(RTE_IPV4_HDR_DF_FLAG);
     ip->time_to_live  = 64;
     ip->next_proto_id = IPPROTO_TCP;
@@ -188,6 +218,92 @@ static inline void arm_rto(tcb_t *tcb)
                              (uint64_t)tcb->rto_us * g_tsc_hz / 1000000ULL;
 }
 
+/* ── Send RST for a packet that has no matching TCB (RFC 793 §3.4) ──────── *
+ * Currently disabled: for a traffic generator, the RST storm from replying
+ * to every stale packet overwhelms the server and hurts HTTP completion.   */
+__rte_unused
+static void tcp_send_rst_no_tcb(uint32_t worker_idx, struct rte_mbuf *m,
+                                 const struct rte_tcp_hdr *tcp_in,
+                                 uint32_t local_ip, uint32_t remote_ip)
+{
+    uint16_t port_id = 0;
+    struct rte_mempool *mp = g_worker_mempools[worker_idx];
+    struct rte_mbuf *rst = rte_pktmbuf_alloc(mp);
+    if (!rst) return;
+
+    size_t tcp_hdr_sz = sizeof(struct rte_tcp_hdr);
+    char *buf = rte_pktmbuf_append(rst, (uint16_t)(
+        sizeof(struct rte_ether_hdr) +
+        sizeof(struct rte_ipv4_hdr) +
+        tcp_hdr_sz));
+    if (!buf) { rte_pktmbuf_free(rst); return; }
+
+    /* Ethernet */
+    struct rte_ether_hdr *eth = (struct rte_ether_hdr *)buf;
+    rte_ether_addr_copy(&g_port_caps[port_id].mac_addr, &eth->src_addr);
+    struct rte_ether_addr dst_mac;
+    if (!arp_lookup(port_id, remote_ip, &dst_mac))
+        memset(dst_mac.addr_bytes, 0xFF, 6);
+    rte_ether_addr_copy(&dst_mac, &eth->dst_addr);
+    eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+    /* IPv4 */
+    struct rte_ipv4_hdr *ip =
+        (struct rte_ipv4_hdr *)(buf + sizeof(struct rte_ether_hdr));
+    ip->version_ihl    = RTE_IPV4_VHL_DEF;
+    ip->type_of_service = 0;
+    ip->total_length   = rte_cpu_to_be_16(
+        (uint16_t)(sizeof(*ip) + tcp_hdr_sz));
+    ip->packet_id      = 0;
+    ip->fragment_offset = rte_cpu_to_be_16(RTE_IPV4_HDR_DF_FLAG);
+    ip->time_to_live   = 64;
+    ip->next_proto_id  = IPPROTO_TCP;
+    ip->hdr_checksum   = 0;
+    ip->src_addr       = local_ip;
+    ip->dst_addr       = remote_ip;
+
+    /* TCP RST — RFC 793: if ACK bit on, SEQ = ACK of incoming; else ACK = SEQ+LEN */
+    struct rte_tcp_hdr *tcp_h =
+        (struct rte_tcp_hdr *)((uint8_t *)ip + sizeof(*ip));
+    memset(tcp_h, 0, sizeof(*tcp_h));
+    tcp_h->src_port  = tcp_in->dst_port;  /* already in NBO */
+    tcp_h->dst_port  = tcp_in->src_port;
+    tcp_h->data_off  = (uint8_t)((sizeof(*tcp_h) / 4) << 4);
+
+    uint32_t in_seq = rte_be_to_cpu_32(tcp_in->sent_seq);
+    uint8_t  in_flags = tcp_in->tcp_flags;
+    uint8_t  in_doff  = (tcp_in->data_off >> 4) & 0x0F;
+    uint32_t seg_len  = (uint32_t)m->data_len - (uint32_t)(in_doff * 4);
+    if (in_flags & RTE_TCP_SYN_FLAG) seg_len++;
+    if (in_flags & RTE_TCP_FIN_FLAG) seg_len++;
+
+    if (in_flags & RTE_TCP_ACK_FLAG) {
+        tcp_h->sent_seq  = tcp_in->recv_ack;
+        tcp_h->recv_ack  = 0;
+        tcp_h->tcp_flags = RTE_TCP_RST_FLAG;
+    } else {
+        tcp_h->sent_seq  = 0;
+        tcp_h->recv_ack  = rte_cpu_to_be_32(in_seq + seg_len);
+        tcp_h->tcp_flags = RTE_TCP_RST_FLAG | RTE_TCP_ACK_FLAG;
+    }
+    tcp_h->rx_win = 0;
+    tcp_h->cksum  = 0;
+
+    rst->l2_len = sizeof(struct rte_ether_hdr);
+    rst->l3_len = sizeof(struct rte_ipv4_hdr);
+    rst->l4_len = (uint16_t)tcp_hdr_sz;
+    tcp_checksum_set(rst, ip, tcp_h,
+                     g_port_caps[port_id].has_tcp_cksum_offload);
+    rst->port = port_id;
+
+    uint16_t tx_q = is_worker_lcore()
+        ? (uint16_t)worker_idx % g_port_caps[port_id].max_tx_queues
+        : g_port_caps[port_id].mgmt_tx_q;
+    uint16_t sent = rte_eth_tx_burst(port_id, tx_q, &rst, 1);
+    if (sent == 0) rte_pktmbuf_free(rst);
+    else worker_metrics_add_tcp_reset_sent(worker_idx);
+}
+
 /* ── FSM: input ──────────────────────────────────────────────────────────── */
 void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
 {
@@ -200,6 +316,18 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
     uint32_t dst_ip   = m->dynfield1[0];  /* saved by ipv4_input (network order) */
     uint16_t src_port = rte_be_to_cpu_16(tcp->src_port);
     uint16_t dst_port = rte_be_to_cpu_16(tcp->dst_port);
+
+    /* TCP checksum verification (RFC 9293 §3.1) */
+    if (!(m->ol_flags & RTE_MBUF_F_RX_L4_CKSUM_GOOD)) {
+        /* Reconstruct IP header pointer for checksum verification */
+        const struct rte_ipv4_hdr *ip_hdr =
+            (const struct rte_ipv4_hdr *)((const uint8_t *)tcp -
+                                           sizeof(struct rte_ipv4_hdr));
+        if (tcp_checksum_verify(ip_hdr, tcp) != 0) {
+            worker_metrics_add_tcp_bad_cksum(worker_idx);
+            goto bad;
+        }
+    }
 
     tcb_store_t *store = &g_tcb_stores[worker_idx];
 
@@ -222,7 +350,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             if (!tcb) { worker_metrics_add_syn_queue_drops(worker_idx); goto bad; }
             tcb->state         = TCP_SYN_RECEIVED;
             tcb->rcv_nxt       = seq + 1;
-            tcb->snd_nxt       = (uint32_t)rte_rdtsc(); /* ISN */
+            tcb->snd_nxt       = isn_generate(dst_ip, dst_port, src_ip, src_port);
             tcb->snd_una       = tcb->snd_nxt;
             tcb->mss_remote    = opts.has_mss ? opts.mss : 536;
             tcb->mss_local     = 1460;
@@ -230,7 +358,9 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->wscale_local  = 7;
             tcb->rcv_wnd       = 65535 << tcb->wscale_local;
             tcb->snd_wnd       = 65535;
-            tcb->cwnd          = 10 * tcb->mss_local;
+            /* RFC 5681 §3.1: IW = min(10*SMSS, max(2*SMSS, 4380)) */
+            tcb->cwnd          = TGEN_MIN(10u * tcb->mss_remote,
+                                   TGEN_MAX(2u * tcb->mss_remote, 4380u));
             tcb->ssthresh      = UINT32_MAX;
             tcb->sack_enabled  = opts.has_sack_perm;
             tcb->ts_enabled    = opts.has_timestamps;
@@ -247,6 +377,13 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->snd_nxt++;
             arm_rto(tcb);
             worker_metrics_add_tcp_conn_open(worker_idx);
+        } else if (!(flags & RTE_TCP_RST_FLAG)) {
+            /* Stale packets from recently-closed connections: drop silently.
+             * Sending RST-no-TCB per RFC 793 §3.4 causes a RST storm that
+             * overwhelms the server — each stale data-ACK or FIN generates
+             * an RST, which causes more server-side error handling, which
+             * delays HTTP responses, creating more stale packets.
+             * For a traffic generator, silent drop is the right trade-off. */
         }
         goto done;
     }
@@ -263,17 +400,47 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->sack_enabled  = opts.has_sack_perm;
             tcb->ts_enabled    = opts.has_timestamps;
             tcb->ts_ecr        = opts.ts_val;
-            tcb->snd_wnd       = rte_be_to_cpu_16(tcp->rx_win)
-                                  << tcb->wscale_remote;
+            /* RFC 7323 §2.2: window in SYN-ACK is NOT scaled */
+            tcb->snd_wnd       = rte_be_to_cpu_16(tcp->rx_win);
+            /* Recalculate IW now that we know peer MSS (RFC 5681 §3.1) */
+            tcb->cwnd          = TGEN_MIN(10u * tcb->mss_remote,
+                                    TGEN_MAX(2u * tcb->mss_remote, 4380u));
             tcb->state = TCP_ESTABLISHED;
             tcb->retransmit_count = 0;
-            tcb->rto_us = TCP_INITIAL_RTO_US;
             tcb->rto_deadline_tsc = 0;  /* disarm SYN RTO */
+            /* Measure RTT from SYN round-trip using timestamp echo.
+             * Without this, rto_us stays at the aggressive TCP_INITIAL_RTO_US
+             * (10ms), causing spurious retransmissions when the first data
+             * segments are sent before the server's delayed ACK arrives. */
+            if (opts.has_timestamps) {
+                uint32_t ts_now = (uint32_t)(rte_rdtsc() /
+                                             (g_tsc_hz / 1000000));
+                uint32_t rtt_us = ts_now - opts.ts_ecr;
+                if (rtt_us > 0 && rtt_us < 60000000U)
+                    update_rtt(tcb, rtt_us);
+                else
+                    tcb->rto_us = TCP_INITIAL_RTO_US;
+            } else {
+                tcb->rto_us = TCP_INITIAL_RTO_US;
+            }
             worker_metrics_add_tcp_conn_open(worker_idx);
             /* Send ACK */
             tcp_send_segment(worker_idx, tcb,
                               RTE_TCP_ACK_FLAG,
                               NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
+
+            /* ── SYN-only mode: 3WHS complete → RST & recycle ─────── */
+            if (tcb->app_state == 0 && tcb->app_ctx == NULL) {
+                tcp_fsm_reset(worker_idx, tcb);
+                goto done;
+            }
+
+            /* ── Throughput mode: bypass slow start ────────────────── */
+            /* Traffic generators measure link/NIC throughput, not
+             * congestion control convergence.  Set cwnd = MAX so
+             * the receiver's advertised window is the only limit. */
+            if (tcb->app_ctx == (void *)1)
+                tcb->cwnd = UINT32_MAX;
 
             /* ── TLS handshake initiation ─────────────────────────── */
             if (tcb->app_state == 1) { /* TLS requested */
@@ -309,6 +476,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                         tcp_fsm_send(worker_idx, tcb,
                                                      ct_buf, (uint32_t)ct_len);
                                     worker_metrics_add_http_req(worker_idx);
+                                    tcb->http_req_sent_tsc = rte_rdtsc();
                                     tcb->app_state = 5;
                                 }
                             }
@@ -332,6 +500,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                     tcp_fsm_send(worker_idx, tcb,
                                  hp->hdr, hp->hdr_len);
                     worker_metrics_add_http_req(worker_idx);
+                    tcb->http_req_sent_tsc = rte_rdtsc();
                     tcb->app_state = 5; /* HTTP response pending */
                 }
             }
@@ -348,6 +517,10 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
         break;
 
     case TCP_ESTABLISHED: {
+        /* Update timestamp echo (RFC 7323 §4.3.1) */
+        if (opts.has_timestamps && tcb->ts_enabled)
+            tcb->ts_ecr = opts.ts_val;
+
         /* ACK processing */
         if (flags & RTE_TCP_ACK_FLAG) {
             if (SEQ_GT(ack, tcb->snd_una)) {
@@ -436,9 +609,10 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                         tcb->app_state = 5; /* HTTP response pending */
                                     }
                                 } else if (!tcb->app_ctx) {
-                                    /* No app context: close after TLS done
-                                     * (CPS mode with no HTTP to send). */
-                                    tcp_fsm_close(worker_idx, tcb);
+                                    /* TLS-only mode: close after handshake.
+                                     * Use RST for fast teardown (avoids delayed ACK). */
+                                    tcp_fsm_reset(worker_idx, tcb);
+                                    goto done;
                                 }
                                 /* else: throughput mode marker — keep connection open,
                                  * tx_gen_burst phase 1 will pump data */
@@ -459,13 +633,22 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                     uint16_t status =
                                         (uint16_t)atoi((const char *)plain + 9);
                                     worker_metrics_add_http_rsp(worker_idx, status);
+                                    /* Record HTTPS request→response latency */
+                                    if (tcb->http_req_sent_tsc) {
+                                        uint64_t lat_us =
+                                            (rte_rdtsc() - tcb->http_req_sent_tsc)
+                                            * 1000000ULL / rte_get_tsc_hz();
+                                        hist_record(&g_latency_hist[worker_idx],
+                                                    lat_us);
+                                    }
                                     http_prebuilt_req_t *hpb =
                                         (http_prebuilt_req_t *)tcb->app_ctx;
                                     if (hpb && hpb->keep_alive) {
                                         tcb->app_state = 4;
                                     } else {
                                         tcb->app_state = 0;
-                                        tcp_fsm_close(worker_idx, tcb);
+                                        tcp_fsm_reset(worker_idx, tcb);
+                                        goto done;
                                     }
                                 }
                             }
@@ -487,6 +670,14 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                 (uint16_t)atoi((const char *)hp + 9);
                             worker_metrics_add_http_rsp(worker_idx,
                                                         status);
+                            /* Record HTTP request→response latency */
+                            if (tcb->http_req_sent_tsc) {
+                                uint64_t lat_us =
+                                    (rte_rdtsc() - tcb->http_req_sent_tsc)
+                                    * 1000000ULL / rte_get_tsc_hz();
+                                hist_record(&g_latency_hist[worker_idx],
+                                            lat_us);
+                            }
                         } else {
                             worker_metrics_add_http_parse_err(
                                 worker_idx);
@@ -497,7 +688,8 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                             tcb->app_state = 4; /* re-send next request */
                         } else {
                             tcb->app_state = 0;
-                            tcp_fsm_close(worker_idx, tcb);
+                            tcp_fsm_reset(worker_idx, tcb);
+                            goto done;
                         }
                     }
                     /* TLS HTTP responses handled above in decrypt path */
@@ -505,18 +697,31 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             }
         }
 
-        /* FIN */
-        if (flags & RTE_TCP_FIN_FLAG) {
+        /* FIN — only process if still in ESTABLISHED state.
+         * L7 handlers above (HTTP/TLS) may have already transitioned
+         * via tcp_fsm_reset()/tcp_fsm_close(), freeing the TCB. */
+        if ((flags & RTE_TCP_FIN_FLAG) && tcb->state == TCP_ESTABLISHED) {
             tcb->rcv_nxt++;
             tcb->state = TCP_CLOSE_WAIT;
             tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
                               NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
+            /* Throughput mode: keep connection open in CLOSE_WAIT to continue
+             * sending data (RFC 793: CLOSE_WAIT allows sending).
+             * app_ctx == (void*)1 is the throughput marker set by tx_gen. */
+            if (tcb->app_ctx != (void *)1)
+                tcp_fsm_close(worker_idx, tcb);
         }
         break;
     }
 
     case TCP_FIN_WAIT_1: {
-        if (flags & RTE_TCP_ACK_FLAG) tcb->state = TCP_FIN_WAIT_2;
+        bool fin_acked = false;
+        if (flags & RTE_TCP_ACK_FLAG) {
+            if (SEQ_GT(ack, tcb->snd_una)) {
+                tcb->snd_una = ack;
+                fin_acked = (tcb->snd_una == tcb->snd_nxt);
+            }
+        }
         /* Accept incoming data (half-open: remote can still send) */
         uint8_t fw1_doff   = (tcp->data_off >> 4) & 0x0F;
         uint16_t fw1_tlen  = (uint16_t)m->data_len;
@@ -532,10 +737,26 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->rcv_nxt++;
             tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
                               NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
-            tcb->state = TCP_TIME_WAIT;
+            if (fin_acked) {
+                /* Our FIN was ACKed + peer's FIN received → free immediately.
+                 * Traffic generators don't need 2×MSL TIME_WAIT protection;
+                 * rapid port recycling is more important than guarding
+                 * against duplicate segments from old connections. */
+                tls_detach_if_needed(worker_idx, tcb);
+                tcp_port_free_immediate(worker_idx, tcb->src_ip, tcb->src_port);
+                tcb_free(&g_tcb_stores[worker_idx], tcb);
+                worker_metrics_add_tcp_conn_close(worker_idx);
+            } else {
+                /* Simultaneous close: peer FIN but our FIN not yet ACKed → CLOSING */
+                tcb->state = TCP_CLOSING;
+                arm_rto(tcb);
+            }
+        } else if (fin_acked) {
+            /* Our FIN ACKed but no peer FIN yet → FIN_WAIT_2 */
+            tcb->state = TCP_FIN_WAIT_2;
+            /* Arm idle timeout for FIN_WAIT_2 (RFC 9293 §3.6) */
             tcb->timewait_deadline_tsc = rte_rdtsc() +
-                (uint64_t)TGEN_TIMEWAIT_DEFAULT_MS * g_tsc_hz / 1000ULL;
-            worker_metrics_add_tcp_conn_close(worker_idx);
+                60ULL * rte_get_tsc_hz();
         } else if (fw1_tlen > fw1_hlen) {
             /* ACK the data even if no FIN yet */
             tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
@@ -560,9 +781,10 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->rcv_nxt++;
             tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
                               NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
-            tcb->state = TCP_TIME_WAIT;
-            tcb->timewait_deadline_tsc = rte_rdtsc() +
-                (uint64_t)TGEN_TIMEWAIT_DEFAULT_MS * g_tsc_hz / 1000ULL;
+            /* Skip TIME_WAIT — free immediately for fast port recycling */
+            tls_detach_if_needed(worker_idx, tcb);
+            tcp_port_free_immediate(worker_idx, tcb->src_ip, tcb->src_port);
+            tcb_free(&g_tcb_stores[worker_idx], tcb);
             worker_metrics_add_tcp_conn_close(worker_idx);
         } else if (fw2_tlen > fw2_hlen) {
             /* ACK the data even if no FIN yet */
@@ -571,6 +793,36 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
         }
         break;
     }
+
+    case TCP_CLOSING:
+        /* Simultaneous close: waiting for ACK of our FIN */
+        if ((flags & RTE_TCP_ACK_FLAG) && SEQ_GE(ack, tcb->snd_nxt)) {
+            /* Skip TIME_WAIT — free immediately */
+            tls_detach_if_needed(worker_idx, tcb);
+            tcp_port_free_immediate(worker_idx, tcb->src_ip, tcb->src_port);
+            tcb_free(&g_tcb_stores[worker_idx], tcb);
+            worker_metrics_add_tcp_conn_close(worker_idx);
+        }
+        break;
+
+    case TCP_CLOSE_WAIT:
+        /* We can still send data in CLOSE_WAIT. Process ACKs for our data. */
+        if (flags & RTE_TCP_ACK_FLAG) {
+            if (SEQ_GT(ack, tcb->snd_una)) {
+                uint32_t acked = ack - tcb->snd_una;
+                tcb->snd_una = ack;
+                tcb->dup_ack_count = 0;
+                congestion_on_ack(tcb, acked);
+                tcb->retransmit_count = 0;
+                if (tcb->snd_una == tcb->snd_nxt)
+                    tcb->rto_deadline_tsc = 0;
+                else
+                    arm_rto(tcb);
+            }
+            tcb->snd_wnd = rte_be_to_cpu_16(tcp->rx_win)
+                           << tcb->wscale_remote;
+        }
+        break;
 
     case TCP_LAST_ACK:
         if (flags & RTE_TCP_ACK_FLAG) {
@@ -589,13 +841,25 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
         break;
     }
 
-    /* RST processing — only for active connections (not TIME_WAIT or already freed) */
+    /* RST processing (RFC 9293 §3.5.2) — validate sequence is in window */
     if ((flags & RTE_TCP_RST_FLAG) && tcb->in_use &&
         tcb->state != TCP_TIME_WAIT) {
-        tls_detach_if_needed(worker_idx, tcb);
-        tcp_port_free(worker_idx, tcb->src_ip, tcb->src_port);
-        tcb_free(&g_tcb_stores[worker_idx], tcb);
-        worker_metrics_add_tcp_reset_rx(worker_idx);
+        bool rst_valid = false;
+        if (tcb->state == TCP_SYN_SENT) {
+            /* RFC 9293 §3.5.2: In SYN-SENT, RST is valid if ACK is acceptable */
+            rst_valid = (flags & RTE_TCP_ACK_FLAG) && (ack == tcb->snd_nxt);
+        } else {
+            /* All other states: RST valid if SEQ is in receive window */
+            rst_valid = SEQ_GE(seq, tcb->rcv_nxt) &&
+                        SEQ_LT(seq, tcb->rcv_nxt + tcb->rcv_wnd);
+        }
+        if (rst_valid) {
+            tls_detach_if_needed(worker_idx, tcb);
+            tcp_port_free_immediate(worker_idx, tcb->src_ip, tcb->src_port);
+            tcb_free(&g_tcb_stores[worker_idx], tcb);
+            worker_metrics_add_tcp_reset_rx(worker_idx);
+        }
+        /* Invalid RST silently dropped (RFC 9293 §3.5.2) */
     }
 
 done:
@@ -624,12 +888,14 @@ tcb_t *tcp_fsm_connect(uint32_t worker_idx,
     if (!tcb) return NULL;
 
     tcb->state        = TCP_SYN_SENT;
-    tcb->snd_nxt      = (uint32_t)rte_rdtsc();
+    tcb->snd_nxt      = isn_generate(src_ip, src_port, dst_ip, dst_port);
     tcb->snd_una      = tcb->snd_nxt;
     tcb->rcv_wnd      = 65535 << 7;
     tcb->mss_local    = 1460;
     tcb->wscale_local = 7;
-    tcb->cwnd         = 10 * tcb->mss_local;
+    /* RFC 5681 §3.1: IW before knowing peer MSS — use local MSS as estimate */
+    tcb->cwnd         = TGEN_MIN(10u * tcb->mss_local,
+                           TGEN_MAX(2u * tcb->mss_local, 4380u));
     tcb->ssthresh     = UINT32_MAX;
     tcb->nagle_enabled = true;
     tcb->rto_us       = TCP_INITIAL_RTO_US;
@@ -667,19 +933,41 @@ int tcp_fsm_close(uint32_t worker_idx, tcb_t *tcb)
 /* ── Send RST ─────────────────────────────────────────────────────────────── */
 void tcp_fsm_reset(uint32_t worker_idx, tcb_t *tcb)
 {
+    /* Count connection close if handshake was complete (matches conn_open) */
+    if (tcb->state >= TCP_ESTABLISHED)
+        worker_metrics_add_tcp_conn_close(worker_idx);
+
     tcp_send_segment(worker_idx, tcb, RTE_TCP_RST_FLAG | RTE_TCP_ACK_FLAG,
                       NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
     tls_detach_if_needed(worker_idx, tcb);
-    tcp_port_free(worker_idx, tcb->src_ip, tcb->src_port);
+    /* RST teardown — no TIME_WAIT required (RFC 793 §3.4) */
+    tcp_port_free_immediate(worker_idx, tcb->src_ip, tcb->src_port);
     tcb_free(&g_tcb_stores[worker_idx], tcb);
     worker_metrics_add_tcp_reset_sent(worker_idx);
+}
+
+/* ── RST all active connections and reset store ──────────────────────────── */
+void tcp_fsm_reset_all(uint32_t worker_idx)
+{
+    tcb_store_t *store = &g_tcb_stores[worker_idx];
+    for (uint32_t i = 0; i < store->capacity; i++) {
+        tcb_t *tcb = &store->tcbs[i];
+        if (!tcb->in_use) continue;
+        tcp_send_segment(worker_idx, tcb, RTE_TCP_RST_FLAG | RTE_TCP_ACK_FLAG,
+                          NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
+        tls_detach_if_needed(worker_idx, tcb);
+    }
+    tcb_store_reset(store);
 }
 
 /* ── RTO expired ──────────────────────────────────────────────────────────── */
 void tcp_fsm_rto_expired(uint32_t worker_idx, tcb_t *tcb)
 {
     tcb->retransmit_count++;
-    if (tcb->retransmit_count > TCP_MAX_RETRANSMITS) {
+    /* SYN_SENT: fail fast (3 retries) to free slots for new connections.
+     * Other states: use the full TCP_MAX_RETRANSMITS. */
+    uint32_t max_retries = (tcb->state == TCP_SYN_SENT) ? 3 : TCP_MAX_RETRANSMITS;
+    if (tcb->retransmit_count > max_retries) {
         tcp_fsm_reset(worker_idx, tcb);
         return;
     }
@@ -739,7 +1027,10 @@ int tcp_fsm_listen(uint32_t worker_idx, uint16_t local_port)
 int tcp_fsm_send(uint32_t worker_idx, tcb_t *tcb,
                   const uint8_t *data, uint32_t len)
 {
-    if (tcb->state != TCP_ESTABLISHED) return -1;
+    /* RFC 793: sending is valid in ESTABLISHED and CLOSE_WAIT
+     * (peer closed their send direction, but we can still send). */
+    if (tcb->state != TCP_ESTABLISHED && tcb->state != TCP_CLOSE_WAIT)
+        return -1;
 
     /* Flow control: limit by window minus in-flight data */
     uint32_t in_flight = tcb->snd_nxt - tcb->snd_una;

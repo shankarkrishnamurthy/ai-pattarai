@@ -83,11 +83,13 @@ tcb_t *tcb_alloc(tcb_store_t *store,
     tcb->dst_port = d_port;
     tcb->in_use   = true;
 
-    /* Insert into hash table (linear probing) */
+    /* Insert into hash table (linear probing).
+     * Tombstone slots (-2) left by tcb_free are reused for insertion,
+     * otherwise the table fills with tombstones and new entries fail. */
     uint32_t h = tuple_hash(s_ip, s_port, d_ip, d_port) & store->ht_mask;
     for (uint32_t k = 0; k < store->ht_size; k++) {
         uint32_t slot = (h + k) & store->ht_mask;
-        if (store->ht[slot] == -1) {
+        if (store->ht[slot] == -1 || store->ht[slot] == -2) {
             store->ht[slot] = (int32_t)idx;
             break;
         }

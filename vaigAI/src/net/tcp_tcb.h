@@ -113,6 +113,9 @@ typedef struct {
     /* TLS handshake timing (TSC at handshake start) */
     uint64_t    tls_hs_start_tsc;
 
+    /* HTTP request-response latency (TSC at request send) */
+    uint64_t    http_req_sent_tsc;
+
     /* Valid flag */
     bool        in_use;
 } tcb_t;

@@ -33,6 +33,13 @@
 #define TX_GEN_MAX_BURST   32
 #define ICMP_HDR_LEN        8
 
+/* Limit concurrent in-flight TCP connections (SYN_SENT) to prevent
+ * overwhelming the peer's SYN backlog.  Connections complete in
+ * microseconds when the server can keep up, so a modest limit
+ * doesn't reduce sustained CPS — it just prevents the initial burst
+ * from causing mass SYN drops and 200 ms RTO retransmit storms. */
+#define TCP_MAX_INFLIGHT   16
+
 static uint8_t g_tp_zero_buf[1400]; /* zero-filled plaintext for throughput
                                       * Keep small enough that TLS record
                                       * (plaintext + ~29B overhead) fits in
@@ -230,7 +237,8 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
         if (state->cfg.proto == TX_GEN_PROTO_THROUGHPUT) {
             for (uint32_t i = 0; i < state->tp_n_streams; i++) {
                 tcb_t *t = (tcb_t *)state->tp_tcbs[i];
-                if (t && t->state == TCP_ESTABLISHED)
+                if (t && (t->state == TCP_ESTABLISHED ||
+                         t->state == TCP_CLOSE_WAIT))
                     tcp_fsm_close(worker_idx, t);
                 state->tp_tcbs[i] = NULL;
             }
@@ -260,6 +268,15 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
     /* ── TCP SYN TPS: use tcp_fsm_connect() instead of raw packets ── */
     if (state->cfg.proto == TX_GEN_PROTO_TCP_SYN ||
         state->cfg.proto == TX_GEN_PROTO_HTTP) {
+
+        /* Pace connection opens: limit concurrent in-flight TCBs to
+         * prevent a SYN storm that overwhelms the peer's backlog. */
+        uint32_t in_flight = g_tcb_stores[worker_idx].count;
+        if (in_flight >= TCP_MAX_INFLIGHT) {
+            return 0;   /* wait for existing connections to complete */
+        }
+        to_send = TGEN_MIN(to_send, TCP_MAX_INFLIGHT - in_flight);
+
         /* Pre-build HTTP request headers on first burst */
         if (state->cfg.proto == TX_GEN_PROTO_HTTP &&
             g_http_req[worker_idx].hdr_len == 0) {
@@ -289,7 +306,7 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
                              state->cfg.dst_ip, state->cfg.dst_port,
                              state->cfg.port_id);
             if (!tcb) {
-                tcp_port_free(worker_idx, state->cfg.src_ip, src_port);
+                tcp_port_free_immediate(worker_idx, state->cfg.src_ip, src_port);
                 break;   /* TCB store full */
             }
             /* Mark connection for HTTP request after ESTABLISHED */
@@ -311,8 +328,16 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
             initiated++;
         }
         state->pkts_sent += initiated;
-        if (state->cfg.rate_pps > 0 && initiated <= state->tokens)
-            state->tokens -= initiated;
+        if (state->cfg.rate_pps > 0) {
+            /* Always consume at least 1 token per attempt so that
+             * failures (port exhaustion, TCB store full) don't spin
+             * in a tight loop with tokens stuck at the initial value. */
+            uint64_t consumed = initiated > 0 ? initiated : 1;
+            if (consumed <= state->tokens)
+                state->tokens -= consumed;
+            else
+                state->tokens = 0;
+        }
         /* tcp_fsm_connect already updates tcp_syn_sent & tx metrics */
         return initiated;
     }
@@ -340,9 +365,9 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
                     tcp_port_free(worker_idx, state->cfg.src_ip, src_port);
                     break;
                 }
+                tcb->app_ctx = (void *)1; /* mark as throughput (not SYN-only) */
                 if (tls) {
                     tcb->app_state = 1; /* request TLS handshake */
-                    tcb->app_ctx = (void *)1; /* mark as throughput */
                 }
                 state->tp_tcbs[i] = tcb;
                 state->tp_n_streams++;
@@ -356,7 +381,8 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
         uint8_t ct_buf[2048];
         for (uint32_t i = 0; i < state->tp_n_streams; i++) {
             tcb_t *tcb = (tcb_t *)state->tp_tcbs[i];
-            if (!tcb || tcb->state != TCP_ESTABLISHED)
+            if (!tcb || (tcb->state != TCP_ESTABLISHED &&
+                         tcb->state != TCP_CLOSE_WAIT))
                 continue;
             if (tls && tcb->app_state == 3) {
                 uint32_t ci = (uint32_t)(tcb - g_tcb_stores[worker_idx].tcbs);
@@ -375,9 +401,13 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
                     }
                 }
             } else if (!tls) {
-                tcp_fsm_send(worker_idx, tcb,
-                             g_tp_zero_buf, (uint32_t)sizeof(g_tp_zero_buf));
-                sent_total++;
+                /* Send multiple segments to fill the TCP window */
+                for (int seg = 0; seg < 32; seg++) {
+                    int rc = tcp_fsm_send(worker_idx, tcb,
+                                 g_tp_zero_buf, (uint32_t)sizeof(g_tp_zero_buf));
+                    if (rc <= 0) break; /* window full or error */
+                    sent_total++;
+                }
             }
         }
         state->pkts_sent += sent_total;
@@ -413,7 +443,10 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
         state->tokens -= sent;
 
     /* ── Metrics ────────────────────────────────────────────────────── */
-    worker_metrics_add_tx(worker_idx, sent, 0);
+    uint64_t tx_total_bytes = 0;
+    for (uint16_t i = 0; i < sent; i++)
+        tx_total_bytes += pkts[i]->pkt_len;
+    worker_metrics_add_tx(worker_idx, sent, tx_total_bytes);
     if (state->cfg.proto == TX_GEN_PROTO_ICMP) {
         for (uint16_t i = 0; i < sent; i++)
             worker_metrics_add_icmp_echo_tx(worker_idx);

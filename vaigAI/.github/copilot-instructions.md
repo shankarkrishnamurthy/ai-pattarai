@@ -129,12 +129,18 @@ src/
 
 ### CLI Commands
 
-| Command | Example | What it does |
-|---------|---------|-------------|
-| `tps` | `tps 10.0.0.1 5 0 56 80` | Send ICMP/UDP/TCP SYN packets (protocol from config `"protocol"` field) |
-| `throughput` | `throughput tx 10.0.0.1 5000 10 4` | TCP data throughput (iperf3-like) |
-| `stats` | `stats` | Print telemetry JSON snapshot |
-| `quit` | `quit` | Graceful shutdown |
+Refer to `docs/CLI.md` for the full reference. Summary:
+
+| Command | What it does |
+|---------|-------------|
+| `ping`  | ICMP echo request/reply |
+| `start` | Unified traffic generation (TCP SYN, HTTP, HTTPS, UDP, ICMP, throughput) |
+| `stop`  | Stop active traffic generation |
+| `reset` | Reset all TCP state (connections, ports, metrics) |
+| `stats` | Print telemetry JSON snapshot |
+| `trace` | Packet capture to pcapng (streaming, unlimited) |
+| `show`  | Show interface details (driver, MAC, IP, link, offloads, stats) |
+| `quit`  | Graceful shutdown |
 
 ### Telemetry
 
@@ -273,6 +279,7 @@ sudo bash scripts/test-env.sh --step verify
 ## Coding Conventions
 
 - **Keep `docs/ARCHITECTURE.md` updated** for any change that impacts the architecture — new modules, changed startup sequence, new IPC commands, protocol additions, modified data flows, or telemetry counter changes. The architecture doc is the canonical design reference; it must stay in sync with the code.
+- **Keep `docs/CLI.md` updated** when CLI commands change — new commands, renamed/removed commands, changed flags, defaults, or syntax. The CLI doc is the user-facing command reference.
 - License: BSD-3-Clause on all source files
 - All source is under `src/`, tests under `tests/`, docs under `docs/`
 - Header guards: `TGEN_<MODULE>_H`

@@ -41,6 +41,12 @@ int tcp_port_alloc(uint32_t worker_idx, uint32_t src_ip, uint16_t *port);
 void tcp_port_free(uint32_t worker_idx, uint32_t src_ip, uint16_t port);
 
 /**
+ * Release a port immediately, bypassing the TIME_WAIT hold-off.
+ * Use after RST-based teardown where TIME_WAIT is not required.
+ */
+void tcp_port_free_immediate(uint32_t worker_idx, uint32_t src_ip, uint16_t port);
+
+/**
  * Per-worker tick: release ports whose TIME_WAIT hold-off has expired.
  * Called from the worker poll loop on each timer tick (1 ms).
  */

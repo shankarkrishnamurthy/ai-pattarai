@@ -98,19 +98,20 @@ int ipv4_validate_and_strip(struct rte_mbuf *m,
     /* Destination match */
     if (local_ip_net && ip->dst_addr != local_ip_net) {
         worker_metrics_add_ip_not_for_us(rte_lcore_id());
-        /* Debug: print first 3 mismatches */
-        static int dbg_cnt = 0;
-        if (dbg_cnt < 3) {
-            printf("[DBG] ip_not_for_us: dst=0x%08x local=0x%08x proto=%u\n",
-                   ip->dst_addr, local_ip_net, ip->next_proto_id);
-            dbg_cnt++;
-        }
         goto bad;
     }
 
     uint8_t proto = ip->next_proto_id;
+    uint16_t ip_hdr_len = (uint16_t)(ihl * 4);
     /* Strip IP header */
-    if (rte_pktmbuf_adj(m, (uint16_t)(ihl * 4)) == NULL) goto bad;
+    if (rte_pktmbuf_adj(m, ip_hdr_len) == NULL) goto bad;
+    /* Trim data_len to IP payload length — removes Ethernet padding/trailer
+     * that would otherwise be interpreted as TCP data. */
+    uint16_t ip_payload_len = total_len - ip_hdr_len;
+    if (m->data_len > ip_payload_len) {
+        m->data_len = ip_payload_len;
+        m->pkt_len  = ip_payload_len;
+    }
 
     return (int)proto;
 

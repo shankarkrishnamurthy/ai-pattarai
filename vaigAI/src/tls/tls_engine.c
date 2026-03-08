@@ -5,6 +5,7 @@
 #include "../telemetry/log.h"
 #include <string.h>
 #include <errno.h>
+#include <stdio.h>
 
 #ifndef HAVE_OPENSSL
 
@@ -12,6 +13,9 @@ int  tls_ctx_init(tls_ctx_t *c, const char *a, const char *b,
                   const char *d, bool e)
 { (void)c;(void)a;(void)b;(void)d;(void)e; return -ENOTSUP; }
 void tls_ctx_fini(tls_ctx_t *c) { (void)c; }
+int  tls_keylog_enable(tls_ctx_t *c, const char *p)
+{ (void)c;(void)p; return -ENOTSUP; }
+void tls_keylog_close(void) {}
 int  tls_session_new(tls_session_t *s, tls_ctx_t *c,
                      uint32_t w, const char *n)
 { (void)s;(void)c;(void)w;(void)n; return -ENOTSUP; }
@@ -29,6 +33,44 @@ int  tls_shutdown(tls_session_t *s, uint8_t *co, size_t *ol)
 { (void)s;(void)co;(void)ol; return -ENOTSUP; }
 
 #else /* HAVE_OPENSSL */
+
+/* ------------------------------------------------------------------ */
+/* SSLKEYLOG — write session keys for Wireshark decryption              */
+/* ------------------------------------------------------------------ */
+static FILE *g_keylog_fp;
+
+static void
+keylog_callback(const SSL *ssl, const char *line)
+{
+    (void)ssl;
+    FILE *fp = g_keylog_fp;
+    if (!fp) return;
+    fprintf(fp, "%s\n", line);
+    fflush(fp);
+}
+
+int
+tls_keylog_enable(tls_ctx_t *ctx, const char *path)
+{
+    if (!ctx || !ctx->ssl_ctx || !path) return -EINVAL;
+    if (g_keylog_fp) {
+        fclose(g_keylog_fp);
+        g_keylog_fp = NULL;
+    }
+    g_keylog_fp = fopen(path, "a");
+    if (!g_keylog_fp) return -errno;
+    SSL_CTX_set_keylog_callback(ctx->ssl_ctx, keylog_callback);
+    return 0;
+}
+
+void
+tls_keylog_close(void)
+{
+    if (g_keylog_fp) {
+        fclose(g_keylog_fp);
+        g_keylog_fp = NULL;
+    }
+}
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                              */

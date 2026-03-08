@@ -36,7 +36,7 @@ int tcp_options_parse(const struct rte_tcp_hdr *tcp, tcp_parsed_opts_t *out)
             break;
         case TCPOPT_WINDOW_SCALE:
             if (len == 3) {
-                out->wscale     = v[0];
+                out->wscale     = v[0] > 14 ? 14 : v[0]; /* RFC 7323 §2.3 */
                 out->has_wscale = true;
             }
             break;
@@ -76,7 +76,8 @@ int tcp_options_parse(const struct rte_tcp_hdr *tcp, tcp_parsed_opts_t *out)
 /* ── Write SYN options ────────────────────────────────────────────────────── */
 int tcp_options_write_syn(uint8_t *buf, size_t bufsz,
                            uint16_t mss, uint8_t wscale,
-                           bool sack_perm, bool timestamps, uint32_t ts_val)
+                           bool sack_perm, bool timestamps,
+                           uint32_t ts_val, uint32_t ts_ecr)
 {
     uint8_t *p = buf;
     size_t  remaining = bufsz;
@@ -102,7 +103,8 @@ int tcp_options_write_syn(uint8_t *buf, size_t bufsz,
         p[0] = TCPOPT_TIMESTAMP; p[1] = 10;
         p[2] = (uint8_t)(ts_val>>24); p[3] = (uint8_t)(ts_val>>16);
         p[4] = (uint8_t)(ts_val>>8);  p[5] = (uint8_t)ts_val;
-        p[6] = p[7] = p[8] = p[9] = 0; /* ts_ecr = 0 for SYN */
+        p[6] = (uint8_t)(ts_ecr>>24); p[7] = (uint8_t)(ts_ecr>>16);
+        p[8] = (uint8_t)(ts_ecr>>8);  p[9] = (uint8_t)ts_ecr;
         p += 10;
     }
 

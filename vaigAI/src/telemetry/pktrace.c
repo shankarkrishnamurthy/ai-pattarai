@@ -1,5 +1,14 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * vaigAI: DPDK-native packet capture via rte_pcapng + eth callbacks.
+ *
+ * Streaming mode:  when pktrace_start() is given a file path, packets are
+ *                  continuously drained from the ring and written to disk
+ *                  via pktrace_flush() (called from the mgmt-lcore tick).
+ *                  The ring never fills up, so capture is unlimited.
+ *
+ * Buffered mode:   when path is NULL, packets accumulate in the ring
+ *                  (capped at PKTRACE_RING_SZ) and are written out later
+ *                  via pktrace_save().
  */
 #include "pktrace.h"
 #include "log.h"
@@ -35,6 +44,12 @@ static uint32_t                            g_max_pkts;
 static atomic_uint                         g_active;
 static atomic_uint                         g_captured;
 static atomic_uint                         g_dropped;   /* ring-full drops  */
+
+/* ─── streaming state (only used when started with a file path) ─────────── */
+static rte_pcapng_t                       *g_writer;
+static int                                 g_out_fd = -1;
+static uint32_t                            g_written;   /* packets flushed  */
+static bool                                g_streaming;
 
 /* ─── RX callback (runs on worker lcore) ───────────────────────────────── */
 static uint16_t
@@ -102,12 +117,30 @@ pktrace_tx_cb(uint16_t port, uint16_t queue,
     return nb_pkts;
 }
 
+/* ─── Internal: close the streaming writer ──────────────────────────────── */
+static void
+streaming_close(void)
+{
+    if (g_writer) {
+        rte_pcapng_write_stats(g_writer, g_port,
+                               atomic_load(&g_captured),
+                               atomic_load(&g_dropped),
+                               NULL);
+        rte_pcapng_close(g_writer);
+        g_writer = NULL;
+    }
+    if (g_out_fd >= 0) {
+        close(g_out_fd);
+        g_out_fd = -1;
+    }
+    g_streaming = false;
+}
+
 /* ─── Public API ────────────────────────────────────────────────────────── */
 
 int
 pktrace_init(void)
 {
-    /* Compute required mbuf data-room for pcapng-annotated packets. */
     uint32_t data_room = rte_pcapng_mbuf_size(PKTRACE_SNAP_LEN);
 
     g_ring = rte_ring_create("pktrace_ring", PKTRACE_RING_SZ,
@@ -160,7 +193,8 @@ pktrace_destroy(void)
 }
 
 int
-pktrace_start(uint16_t port_id, uint16_t queue_id, uint32_t max_pkts)
+pktrace_start(uint16_t port_id, uint16_t queue_id, uint32_t max_pkts,
+              const char *path)
 {
     if (!g_ring || !g_mp) {
         TGEN_ERR(TGEN_LOG_MGMT, "pktrace: not initialised\n");
@@ -171,6 +205,36 @@ pktrace_start(uint16_t port_id, uint16_t queue_id, uint32_t max_pkts)
                   "pktrace: already active on port %u queue %u\n",
                   g_port, g_queue);
         return -EBUSY;
+    }
+
+    /* Drain any stale packets from a previous capture */
+    {
+        void *obj;
+        while (rte_ring_dequeue(g_ring, &obj) == 0)
+            rte_pktmbuf_free((struct rte_mbuf *)obj);
+    }
+
+    /* Open streaming output if a path was given */
+    g_streaming = false;
+    g_written   = 0;
+    if (path) {
+        g_out_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (g_out_fd < 0) {
+            TGEN_ERR(TGEN_LOG_MGMT,
+                     "pktrace: cannot open '%s': %s\n", path, strerror(errno));
+            return -errno;
+        }
+        g_writer = rte_pcapng_fdopen(g_out_fd, NULL, NULL, "vaigai", NULL);
+        if (!g_writer) {
+            TGEN_ERR(TGEN_LOG_MGMT,
+                     "pktrace: rte_pcapng_fdopen failed: %s\n",
+                     rte_strerror(rte_errno));
+            close(g_out_fd);
+            g_out_fd = -1;
+            return -EIO;
+        }
+        rte_pcapng_add_interface(g_writer, port_id, NULL, NULL, NULL);
+        g_streaming = true;
     }
 
     g_port      = port_id;
@@ -193,17 +257,45 @@ pktrace_start(uint16_t port_id, uint16_t queue_id, uint32_t max_pkts)
     }
 
     TGEN_INFO(TGEN_LOG_MGMT,
-              "pktrace: capturing on port %u queue %u%s\n",
+              "pktrace: capturing on port %u queue %u%s%s\n",
               port_id, queue_id,
-              max_pkts ? "" : " (unlimited)");
+              max_pkts ? "" : " (unlimited)",
+              g_streaming ? " [streaming]" : " [buffered]");
     return 0;
+}
+
+void
+pktrace_flush(void)
+{
+    if (!g_streaming || !g_writer)
+        return;
+
+    struct rte_mbuf *batch[PKTRACE_BATCH];
+    unsigned n;
+    while ((n = rte_ring_dequeue_burst(g_ring, (void **)batch,
+                                       PKTRACE_BATCH, NULL)) > 0) {
+        ssize_t written = rte_pcapng_write_packets(g_writer, batch, (uint16_t)n);
+        if (written < 0) {
+            TGEN_ERR(TGEN_LOG_MGMT,
+                     "pktrace: write error after %u flushed packets\n",
+                     g_written);
+            for (unsigned i = 0; i < n; i++)
+                rte_pktmbuf_free(batch[i]);
+            break;
+        }
+        g_written += n;
+    }
 }
 
 void
 pktrace_stop(void)
 {
-    if (!atomic_load(&g_active) && !g_rx_cb && !g_tx_cb)
+    if (!atomic_load(&g_active) && !g_rx_cb && !g_tx_cb) {
+        /* Still close streaming resources if open */
+        if (g_streaming)
+            streaming_close();
         return;
+    }
 
     atomic_store(&g_active, 0);
 
@@ -216,86 +308,32 @@ pktrace_stop(void)
         g_tx_cb = NULL;
     }
 
-    TGEN_INFO(TGEN_LOG_MGMT,
-              "pktrace: stopped — captured=%u  dropped=%u  ring_used=%u\n",
-              atomic_load(&g_captured),
-              atomic_load(&g_dropped),
-              rte_ring_count(g_ring));
-}
+    /* In streaming mode, flush remaining ring contents and close file */
+    if (g_streaming) {
+        pktrace_flush();
+        streaming_close();
 
-int
-pktrace_save(const char *path)
-{
-    if (!g_ring) {
-        TGEN_ERR(TGEN_LOG_MGMT, "pktrace: not initialised\n");
-        return -EINVAL;
+        TGEN_INFO(TGEN_LOG_MGMT,
+                  "pktrace: stopped — captured=%u  written=%u  dropped=%u\n",
+                  atomic_load(&g_captured), g_written,
+                  atomic_load(&g_dropped));
+    } else {
+        TGEN_INFO(TGEN_LOG_MGMT,
+                  "pktrace: stopped — captured=%u  dropped=%u  ring_used=%u\n",
+                  atomic_load(&g_captured),
+                  atomic_load(&g_dropped),
+                  rte_ring_count(g_ring));
     }
-
-    uint32_t npkts = rte_ring_count(g_ring);
-    if (npkts == 0) {
-        TGEN_WARN(TGEN_LOG_MGMT, "pktrace: ring is empty, nothing to save\n");
-        return 0;
-    }
-
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) {
-        TGEN_ERR(TGEN_LOG_MGMT,
-                 "pktrace: cannot open '%s': %s\n", path, strerror(errno));
-        return -errno;
-    }
-
-    rte_pcapng_t *pcapng = rte_pcapng_fdopen(fd,
-                                             NULL,   /* osname  */
-                                             NULL,   /* hardware */
-                                             "vaigai",
-                                             NULL);  /* comment */
-    if (!pcapng) {
-        TGEN_ERR(TGEN_LOG_MGMT,
-                 "pktrace: rte_pcapng_fdopen failed: %s\n",
-                 rte_strerror(rte_errno));
-        close(fd);
-        return -EIO;
-    }
-
-    /* Register the interface that was captured. */
-    rte_pcapng_add_interface(pcapng, g_port, NULL, NULL, NULL);
-
-    /* Drain ring in batches and write to file. */
-    struct rte_mbuf *batch[PKTRACE_BATCH];
-    uint32_t total = 0;
-
-    while (rte_ring_count(g_ring) > 0) {
-        unsigned n = rte_ring_dequeue_burst(g_ring, (void **)batch,
-                                            PKTRACE_BATCH, NULL);
-        if (n == 0)
-            break;
-        /* rte_pcapng_write_packets frees the mbufs */
-        ssize_t written = rte_pcapng_write_packets(pcapng, batch, (uint16_t)n);
-        if (written < 0) {
-            TGEN_ERR(TGEN_LOG_MGMT,
-                     "pktrace: write error after %u packets\n", total);
-            /* free remaining batch mbufs on error */
-            for (unsigned i = 0; i < n; i++)
-                rte_pktmbuf_free(batch[i]);
-            break;
-        }
-        total += n;
-    }
-
-    rte_pcapng_write_stats(pcapng, g_port,
-                           atomic_load(&g_captured),
-                           atomic_load(&g_dropped),
-                           NULL);
-    rte_pcapng_close(pcapng);
-    close(fd);
-
-    TGEN_INFO(TGEN_LOG_MGMT,
-              "pktrace: saved %u packets to '%s'\n", total, path);
-    return (int)total;
 }
 
 uint32_t
 pktrace_count(void)
 {
     return atomic_load(&g_captured);
+}
+
+bool
+pktrace_is_active(void)
+{
+    return atomic_load_explicit(&g_active, memory_order_relaxed) != 0;
 }

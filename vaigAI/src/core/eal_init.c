@@ -35,6 +35,7 @@ static const struct option g_long_opts[] = {
     { "max-conn",               required_argument, NULL, 'X' },
     { "rest-port",              required_argument, NULL, 'R' },
     { "src-ip",                 required_argument, NULL, 'I' },
+    { "sslkeylog",              required_argument, NULL, 'K' },
     { NULL, 0, NULL, 0 },
 };
 
@@ -64,7 +65,7 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
     optind = 1;
     opterr = 0; /* suppress errors for unknown options (belong to EAL) */
 
-    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:X:R:I:", g_long_opts,
+    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:X:R:I:K:", g_long_opts,
                               &opt_idx)) != -1) {
         switch (opt) {
         case 'W': a->num_worker_cores = (uint32_t)atoi(optarg); break;
@@ -81,6 +82,10 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
                 fprintf(stderr, "[TGEN] invalid --src-ip: %s\n", optarg);
                 return -1;
             }
+            break;
+        case 'K':
+            snprintf(a->sslkeylog_path, sizeof(a->sslkeylog_path),
+                     "%s", optarg);
             break;
         default:  break; /* unknown → EAL handles */
         }

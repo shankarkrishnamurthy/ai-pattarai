@@ -165,6 +165,12 @@ int tgen_worker_loop(void *arg)
             }
             if (cmd.cmd == CFG_CMD_START) {
                 tx_gen_config_t *gcfg = (tx_gen_config_t *)cmd.payload;
+                /* Reset stale TCP state from any previous test so
+                 * the new test starts with a clean TCB store and
+                 * fully available port pool.  Sends RST for all
+                 * active connections before clearing. */
+                tcp_fsm_reset_all(ctx->worker_idx);
+                tcp_port_pool_reset(ctx->worker_idx);
                 /* Clear pre-built HTTP request for this worker */
                 if (gcfg->proto == TX_GEN_PROTO_HTTP)
                     g_http_req[ctx->worker_idx].hdr_len = 0;
@@ -197,7 +203,10 @@ int tgen_worker_loop(void *arg)
                                                rx_pkts, TGEN_MAX_RX_BURST);
             if (nb_rx == 0) continue;
 
-            worker_metrics_add_rx(ctx->worker_idx, nb_rx, 0);
+            uint64_t rx_total_bytes = 0;
+            for (uint16_t bi = 0; bi < nb_rx; bi++)
+                rx_total_bytes += rx_pkts[bi]->pkt_len;
+            worker_metrics_add_rx(ctx->worker_idx, nb_rx, rx_total_bytes);
 
             for (uint16_t i = 0; i < nb_rx; i++) {
                 struct rte_mbuf *reply = classify_and_process(ctx, rx_pkts[i]);
@@ -214,7 +223,7 @@ int tgen_worker_loop(void *arg)
                                                   tx_pkts, (uint16_t)n_tx);
                 for (uint16_t i = sent; i < n_tx; i++)
                     rte_pktmbuf_free(tx_pkts[i]);
-                worker_metrics_add_tx(ctx->worker_idx, sent, 0);
+                worker_metrics_add_tx(ctx->worker_idx, sent, 0); /* replies are few */
             }
             n_tx = 0;
         }

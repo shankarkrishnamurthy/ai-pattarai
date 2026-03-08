@@ -35,6 +35,8 @@ typedef struct {
     uint16_t    rest_port;          /* REST API port (0 = disabled) */
 
     uint32_t    src_ip;             /* local IPv4 in network byte order (--src-ip) */
+
+    char        sslkeylog_path[256]; /* SSLKEYLOG file path (--sslkeylog) */
 } tgen_eal_args_t;
 
 /** Parse argv, populate tgen_eal_args_t, then call rte_eal_init().

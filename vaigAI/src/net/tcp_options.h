@@ -40,11 +40,13 @@ typedef struct {
 int tcp_options_parse(const struct rte_tcp_hdr *tcp,
                        tcp_parsed_opts_t *out);
 
-/** Write options into a SYN segment; returns options byte length. */
+/** Write options into a SYN segment; returns options byte length.
+ *  For SYN-ACK (passive open), pass peer's ts_val as ts_ecr.
+ *  For SYN (active open), pass 0 as ts_ecr. */
 int tcp_options_write_syn(uint8_t *buf, size_t bufsz,
                            uint16_t mss, uint8_t wscale,
                            bool sack_perm, bool timestamps,
-                           uint32_t ts_val);
+                           uint32_t ts_val, uint32_t ts_ecr);
 
 /** Write options into a data/ACK segment; returns options byte length. */
 int tcp_options_write_data(uint8_t *buf, size_t bufsz,
