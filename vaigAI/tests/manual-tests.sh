@@ -7,10 +7,10 @@
 #
 #  Sections:
 #    0. Common Pre-Setup  (hugepages, modules — run once per boot)
-#    1. Server Topologies (5 types, pick one)
-#    2. Matching vaigai Client Commands (one per topology)
-#    3. Traffic Commands  (common to all topologies)
-#    4. Monitoring & Debug Commands (common to all topologies)
+#    1. Server + vaigai Pairs (5 topologies, pick one)
+#    2. Traffic Commands  (common to all topologies)
+#    3. Monitoring & Debug Commands (common to all topologies)
+#    4. Cleanup
 #
 #  Conventions:
 #    SERVER_IP  = IP of the server (nginx/openssl/socat)
@@ -36,10 +36,15 @@ ninja -C build
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  1. SERVER TOPOLOGIES                                                       ║
+# ║  1. SERVER + VAIGAI PAIRS                                                   ║
 # ║                                                                             ║
-# ║  Pick ONE of these five. Each starts a server with nginx (:80/:443),        ║
-# ║  openssl s_server (:4433), and socat listeners (:5000-5002).                ║
+# ║  Pick ONE pair. Each starts a server with nginx (:80/:443),                 ║
+# ║  openssl s_server (:4433), and socat listeners (:5000-5002),                ║
+# ║  then shows the matching vaigai command to pair with it.                    ║
+# ║                                                                             ║
+# ║  DPDK QAT note: crypto_qat PMD only has VF device ID 0x0443 in its PCI     ║
+# ║  table, not PF 0x0435. If vaigai ignores the QAT PF, use a VF instead:     ║
+# ║    VF 0b:01.0 (from PF 0b:00.0 — different device from 0d/0e)              ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,12 +56,8 @@ ninja -C build
 #            95:00.1 → VM      (PF passthrough, bind to vfio-pci)
 #  QAT:     PF 0d:00.0 → VM    (PF passthrough, kernel qat_dh895xcc inside VM)
 #           PF 0e:00.0 → vaigai (PF passthrough, DPDK crypto_qat PMD)
-#
-#  NOTE: DPDK crypto_qat PMD only has VF device ID 0x0443 in its PCI ID table,
-#  not PF 0x0435. If vaigai ignores the QAT PF, use a VF instead:
-#    QAT_VF=0000:0b:01.0  (VF of PF 0b:00.0 — different device from 0d/0e)
 
-# -- Per-test setup: bind VM NIC + QAT PFs to vfio-pci --
+# -- Setup: bind VM NIC + QAT PFs to vfio-pci --
 NIC_VM=0000:95:00.1
 NIC_IFACE=ens30f1np1   # kernel interface name before unbinding
 QAT_PF_VM=0000:0d:00.0     # → QEMU VM (server-side crypto)
@@ -69,7 +70,7 @@ for DEV in $NIC_VM $QAT_PF_VM $QAT_PF_VAIGAI; do
     echo "$DEV" > /sys/bus/pci/drivers/vfio-pci/bind
 done
 
-# -- Start QEMU VM (without QAT) --
+# -- Server: QEMU VM (without QAT) --
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -kernel /boot/vmlinuz-$(uname -r) \
     -initrd /boot/initramfs-$(uname -r).img \
@@ -78,8 +79,9 @@ qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -nic user,model=virtio,hostfwd=tcp::2222-:22 \
     -device "vfio-pci,host=$NIC_VM" \
     -nographic
+# ↳ vaigai: ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -- -I 10.0.0.1
 
-# -- OR: Start QEMU VM with QAT PF (for TLS/HTTPS crypto offload) --
+# -- OR: Server: QEMU VM with QAT PF --
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -kernel /boot/vmlinuz-$(uname -r) \
     -initrd /boot/initramfs-$(uname -r).img \
@@ -89,20 +91,16 @@ qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -device "vfio-pci,host=$NIC_VM" \
     -device "vfio-pci,host=$QAT_PF_VM" \
     -nographic
-# ↳ Pair with: ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -a $QAT_PF_VAIGAI -- -I 10.0.0.1
+# ↳ vaigai: ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
+# ↳ fallback (if DPDK ignores PF):
+#    ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -a 0000:0b:01.0 -- -I 10.0.0.1
 
-# -- Wait for boot, then configure VM networking --
+# -- Post-boot setup --
 sleep 15
 ssh -o StrictHostKeyChecking=no -p 2222 root@localhost 'ip addr add 10.0.0.2/24 dev eth0 && ip link set eth0 up'
-
-# -- Verify services --
 ssh -p 2222 root@localhost 'nginx -t && rc-service nginx start; ss -tlnp'
-
-# -- Verify QAT inside VM (QAT variant only) --
 ssh -p 2222 root@localhost 'lspci | grep Co-pro && dmesg | grep -i qat | tail -3'
-
-# CLIENT_IP=10.0.0.1  SERVER_IP=10.0.0.2
-# See section 2A for matching vaigai command.
+# SERVER_IP=10.0.0.2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -114,10 +112,8 @@ ssh -p 2222 root@localhost 'lspci | grep Co-pro && dmesg | grep -i qat | tail -3
 #            83:00.1 → VM      (PF passthrough, bind to vfio-pci)
 #  QAT:     PF 0d:00.0 → VM    (PF passthrough, kernel qat_dh895xcc inside VM)
 #           PF 0e:00.0 → vaigai (PF passthrough, DPDK crypto_qat PMD)
-#
-#  NOTE: Same DPDK QAT PF limitation as 1A — see note there.
 
-# -- Per-test setup: bind NICs + QAT PFs to vfio-pci --
+# -- Setup: bind NICs + QAT PFs to vfio-pci --
 NIC_VAIGAI=0000:83:00.0
 NIC_VM=0000:83:00.1
 QAT_PF_VM=0000:0d:00.0     # → QEMU VM
@@ -128,7 +124,7 @@ for DEV in $NIC_VAIGAI $NIC_VM $QAT_PF_VM $QAT_PF_VAIGAI; do
     echo "$DEV" > /sys/bus/pci/drivers/vfio-pci/bind
 done
 
-# -- Start QEMU VM (without QAT) --
+# -- Server: QEMU VM (without QAT) --
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -kernel /boot/vmlinuz-$(uname -r) \
     -initrd /boot/initramfs-$(uname -r).img \
@@ -137,8 +133,9 @@ qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -nic user,model=virtio,hostfwd=tcp::2222-:22 \
     -device "vfio-pci,host=$NIC_VM" \
     -nographic
+# ↳ vaigai: ./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -- -I 10.0.0.1
 
-# -- OR: Start QEMU VM with QAT PF (for TLS/HTTPS crypto offload) --
+# -- OR: Server: QEMU VM with QAT PF --
 qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -kernel /boot/vmlinuz-$(uname -r) \
     -initrd /boot/initramfs-$(uname -r).img \
@@ -148,15 +145,16 @@ qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -device "vfio-pci,host=$NIC_VM" \
     -device "vfio-pci,host=$QAT_PF_VM" \
     -nographic
-# ↳ Pair with: ./build/vaigai -l 0-1 -n 4 -a $NIC_VAIGAI -a $QAT_PF_VAIGAI -- -I 10.0.0.1
+# ↳ vaigai: ./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
+# ↳ fallback (if DPDK ignores PF):
+#    ./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -a 0000:0b:01.0 -- -I 10.0.0.1
 
+# -- Post-boot setup --
 sleep 15
 ssh -o StrictHostKeyChecking=no -p 2222 root@localhost 'ip addr add 10.0.0.2/24 dev eth0 && ip link set eth0 up'
 ssh -p 2222 root@localhost 'nginx -t && rc-service nginx start; ss -tlnp'
 ssh -p 2222 root@localhost 'lspci | grep Co-pro && dmesg | grep -i qat | tail -3'
-
-# CLIENT_IP=10.0.0.1  SERVER_IP=10.0.0.2
-# See section 2B for matching vaigai command.
+# SERVER_IP=10.0.0.2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -166,7 +164,7 @@ ssh -p 2222 root@localhost 'lspci | grep Co-pro && dmesg | grep -i qat | tail -3
 #  Network:  192.168.204.1 (vaigai) ↔ 192.168.204.2 (VM) via 192.168.204.0/24
 #  No physical NIC needed.
 
-# -- Per-test setup: create bridge + TAP for Firecracker --
+# -- Setup: create bridge + TAP for Firecracker --
 BRIDGE=br-vaigai
 TAP_FC=tap-fc0
 VM_IP=192.168.204.2
@@ -189,14 +187,13 @@ sysctl -w net.bridge.bridge-nf-call-arptables=0
 ROOTFS_COW=/tmp/vaigai-fc-rootfs.ext4
 cp --reflink=auto /work/firecracker/alpine.ext4 "$ROOTFS_COW"
 
-# -- Start Firecracker --
+# -- Server: Firecracker --
 FC_SOCKET=/tmp/vaigai-fc.sock
 rm -f "$FC_SOCKET"
 firecracker --api-sock "$FC_SOCKET" &
 FC_PID=$!
 sleep 1
 
-# Configure Firecracker via API
 curl -s --unix-socket "$FC_SOCKET" -X PUT http://localhost/boot-source \
     -H 'Content-Type: application/json' \
     -d '{"kernel_image_path":"/work/firecracker/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw quiet vaigai_mode=all ip=192.168.204.2::192.168.204.3:255.255.255.0::eth0:off"}'
@@ -218,23 +215,22 @@ curl -s --unix-socket "$FC_SOCKET" -X PUT http://localhost/actions \
     -d '{"action_type":"InstanceStart"}'
 
 sleep 5
-# Verify: ping VM from host
 ping -c 1 "$VM_IP"
 
-# CLIENT_IP=192.168.204.1  SERVER_IP=192.168.204.2
-# See section 2C for matching vaigai command.
-# NOTE: DPDK creates tap-vaigai internally; attach it to bridge AFTER vaigai starts:
+# ↳ vaigai: ./build/vaigai -l 0-1 --no-pci --vdev "net_tap0,iface=tap-vaigai" -- -I 192.168.204.1
+# IMPORTANT: After vaigai starts, attach tap-vaigai to bridge:
 #   ip link set tap-vaigai master br-vaigai && ip link set tap-vaigai up
+# SERVER_IP=192.168.204.2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  1D. Container (podman) + veth pair
+#  1D. Container (podman) + veth pair (AF_XDP)
 # ─────────────────────────────────────────────────────────────────────────────
-#  Topology: vaigai (DPDK af_packet on veth-vaigai) ↔ container (veth-peer)
+#  Topology: vaigai (DPDK af_xdp on veth-vaigai) ↔ container (veth-peer)
 #  Network:  192.168.200.1 (vaigai) ↔ 192.168.200.2 (container)
-#  No physical NIC needed.
+#  No physical NIC needed. Requires: libbpf, vaigai built with -Daf_xdp=enabled.
 
-# -- Per-test setup: create veth pair + container --
+# -- Setup: create veth pair + container --
 VETH_HOST=veth-vaigai
 VETH_PEER=veth-peer
 
@@ -242,45 +238,33 @@ ip link add "$VETH_HOST" type veth peer name "$VETH_PEER"
 ip link set "$VETH_HOST" up
 ip addr add 192.168.200.1/24 dev "$VETH_HOST"
 
-# Start Alpine container with networking
 podman run -d --name vaigai-server --network=none alpine:latest sleep infinity
 CTR_PID=$(podman inspect -f '{{.State.Pid}}' vaigai-server)
 
-# Move peer veth into container namespace
 ip link set "$VETH_PEER" netns "/proc/$CTR_PID/ns/net" 2>/dev/null || \
     nsenter -t "$CTR_PID" -n ip link set "$VETH_PEER" up  # fallback
 nsenter -t "$CTR_PID" -n ip addr add 192.168.200.2/24 dev "$VETH_PEER"
 nsenter -t "$CTR_PID" -n ip link set "$VETH_PEER" up
 
-# Install and start services inside container
+# -- Server: install and start services inside container --
 podman exec vaigai-server sh -c '
     apk add --no-cache nginx openssl socat
-    # Generate self-signed cert
     mkdir -p /etc/nginx/ssl /var/www/html /run/nginx
     openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
         -keyout /etc/nginx/ssl/server.key -out /etc/nginx/ssl/server.crt \
         -subj "/CN=vaigai-test" 2>/dev/null
     echo "OK" > /var/www/html/index.html
     dd if=/dev/urandom of=/var/www/html/100k.bin bs=1024 count=100 2>/dev/null
-    # Start nginx
     nginx
-    # Start openssl s_server
     openssl s_server -cert /etc/nginx/ssl/server.crt -key /etc/nginx/ssl/server.key \
         -accept 4433 -www -quiet &
-    # Start socat listeners
     socat TCP-LISTEN:5000,fork,reuseaddr PIPE &
     socat TCP-LISTEN:5001,fork,reuseaddr /dev/null &
 '
-
-# Verify
 podman exec vaigai-server ss -tlnp
 
-# CLIENT_IP=192.168.200.1  SERVER_IP=192.168.200.2
-# See section 2D for matching vaigai command.
-
-# -- Cleanup (after tests) --
-# podman rm -f vaigai-server
-# ip link del veth-vaigai 2>/dev/null
+# ↳ vaigai (AF_XDP): ./build/vaigai -l 0-1 --no-pci --vdev "net_af_xdp0,iface=veth-vaigai" -- -I 192.168.200.1
+# SERVER_IP=192.168.200.2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -290,7 +274,7 @@ podman exec vaigai-server ss -tlnp
 #  Network:  192.168.201.1 (vaigai) ↔ 192.168.201.2 (native)
 #  No physical NIC needed.
 
-# -- Per-test setup: create veth pair --
+# -- Setup: create veth pair --
 VETH_HOST=veth-vaigai
 VETH_NATIVE=veth-native
 
@@ -299,15 +283,13 @@ ip link set "$VETH_HOST" up
 ip link set "$VETH_NATIVE" up
 ip addr add 192.168.201.2/24 dev "$VETH_NATIVE"
 
-# Generate self-signed cert
 mkdir -p /tmp/vaigai-native-tls
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
     -keyout /tmp/vaigai-native-tls/server.key \
     -out /tmp/vaigai-native-tls/server.crt \
     -subj "/CN=vaigai-test" 2>/dev/null
 
-# Start servers on the native veth interface
-# nginx (bind to 192.168.201.2)
+# -- Server: nginx + openssl s_server + socat --
 cat > /tmp/vaigai-native-nginx.conf << 'EOF'
 worker_processes 1;
 events { worker_connections 4096; }
@@ -329,64 +311,21 @@ echo "OK" > /tmp/vaigai-native-www/index.html
 dd if=/dev/urandom of=/tmp/vaigai-native-www/100k.bin bs=1024 count=100 2>/dev/null
 nginx -c /tmp/vaigai-native-nginx.conf
 
-# openssl s_server
 openssl s_server -cert /tmp/vaigai-native-tls/server.crt \
     -key /tmp/vaigai-native-tls/server.key \
     -accept 192.168.201.2:4433 -www -quiet &
 
-# socat listeners
 socat TCP-LISTEN:5000,bind=192.168.201.2,fork,reuseaddr PIPE &
 socat TCP-LISTEN:5001,bind=192.168.201.2,fork,reuseaddr /dev/null &
 
-# Verify
 ss -tlnp | grep -E ':(80|443|4433|5000|5001)\b'
 
-# CLIENT_IP=192.168.201.1  SERVER_IP=192.168.201.2
-# See section 2E for matching vaigai command.
-
-# -- Cleanup (after tests) --
-# nginx -s stop -c /tmp/vaigai-native-nginx.conf
-# kill <openssl_pid> <socat_pids>
-# ip link del veth-vaigai 2>/dev/null
+# ↳ vaigai: ./build/vaigai -l 0-1 --no-pci --vdev "net_af_packet0,iface=veth-vaigai" -- -I 192.168.201.1
+# SERVER_IP=192.168.201.2
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  2. MATCHING VAIGAI CLIENT COMMANDS  (one per server topology)              ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-
-# ─── 2A. vaigai for Mellanox NIC (pairs with 1A) ───
-# mlx5 uses bifurcated driver — no vfio-pci binding needed for vaigai port.
-# Use lcores on same NUMA node as the NIC.
-./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -- -I 10.0.0.1
-
-# With QAT PF (pairs with 1A QAT variant — PF 0e:00.0 for vaigai, PF 0d:00.0 in VM):
-./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
-# NOTE: If DPDK ignores PF 0x0435, use VF 0b:01.0 instead (from PF 0b:00.0):
-# ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -a 0000:0b:01.0 -- -I 10.0.0.1
-
-# ─── 2B. vaigai for i40e NIC (pairs with 1B) ───
-# i40e NIC must be bound to vfio-pci (done in 1B setup).
-./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -- -I 10.0.0.1
-
-# With QAT PF (pairs with 1B QAT variant — PF 0e:00.0 for vaigai, PF 0d:00.0 in VM):
-./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
-# NOTE: If DPDK ignores PF 0x0435, use VF 0b:01.0 instead:
-# ./build/vaigai -l 0-1 -n 4 -a 0000:83:00.0 -a 0000:0b:01.0 -- -I 10.0.0.1
-
-# ─── 2C. vaigai for Firecracker TAP (pairs with 1C) ───
-# IMPORTANT: After vaigai starts, attach tap-vaigai to bridge:
-#   ip link set tap-vaigai master br-vaigai && ip link set tap-vaigai up
-./build/vaigai -l 0-1 --no-pci --vdev "net_tap0,iface=tap-vaigai" -- -I 192.168.204.1
-
-# ─── 2D. vaigai for Container veth (pairs with 1D) ───
-./build/vaigai -l 0-1 --no-pci --vdev "net_af_packet0,iface=veth-vaigai" -- -I 192.168.200.1
-
-# ─── 2E. vaigai for Native veth (pairs with 1E) ───
-./build/vaigai -l 0-1 --no-pci --vdev "net_af_packet0,iface=veth-vaigai" -- -I 192.168.201.1
-
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  3. TRAFFIC COMMANDS  (run at the vaigai> prompt, common to all topologies) ║
+# ║  2. TRAFFIC COMMANDS  (run at the vaigai> prompt, common to all topologies) ║
 # ║                                                                             ║
 # ║  Replace SERVER_IP with the server IP from your chosen topology:            ║
 # ║    1A/1B: 10.0.0.2    1C: 192.168.204.2                                    ║
@@ -446,7 +385,7 @@ reset
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  4. MONITORING & DEBUG  (run at vaigai> prompt during or after tests)       ║
+# ║  3. MONITORING & DEBUG  (run at vaigai> prompt during or after tests)       ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 # ── Stats ──
@@ -479,7 +418,7 @@ quit                        # graceful shutdown
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  5. QEMU VM CLEANUP  (after QEMU-based tests)                              ║
+# ║  4. CLEANUP  (after tests)                                                  ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 # Kill QEMU
@@ -513,27 +452,3 @@ nginx -s stop -c /tmp/vaigai-native-nginx.conf 2>/dev/null
 ip link del veth-vaigai 2>/dev/null
 rm -rf /tmp/vaigai-native-tls /tmp/vaigai-native-www /tmp/vaigai-native-nginx.conf
 
-
-# ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  6. QAT CRYPTO OFFLOAD NOTES                                               ║
-# ╚══════════════════════════════════════════════════════════════════════════════╝
-#
-#  QAT setup is integrated into sections 1A/1B (PF binding + QEMU passthrough)
-#  and sections 2A/2B (vaigai with QAT PF or VF).
-#
-#  Device allocation (1 QAT per side):
-#    PF 0d:00.0 → QEMU VM  (kernel qat_dh895xcc driver for server-side offload)
-#    PF 0e:00.0 → vaigai   (DPDK crypto_qat PMD for client-side offload)
-#
-#  DPDK limitation: crypto_qat PMD PCI ID table has VF 0x0443 but NOT PF 0x0435.
-#  If vaigai doesn't probe the PF, use a VF from a third PF (0b:00.0):
-#    VF 0b:01.0 → vaigai   (bind to vfio-pci, add -a 0000:0b:01.0 to EAL)
-#
-#  Host pre-requisites (included in section 0):
-modprobe intel_qat
-modprobe qat_dh895xcc
-
-# -- Verify QAT inside VM --
-ssh -p 2222 root@localhost 'lspci | grep Co-pro'
-ssh -p 2222 root@localhost 'dmesg | grep -i qat | tail -5'
-ssh -p 2222 root@localhost 'cat /sys/bus/pci/drivers/qat_dh895xcc/*/qat/state 2>/dev/null'
