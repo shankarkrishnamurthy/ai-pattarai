@@ -126,6 +126,12 @@ main(int argc, char **argv)
 {
     int rc;
 
+    /* Ensure stdout is line-buffered even when redirected to a file
+     * or pipe.  Without this, test harnesses that read stdout via a
+     * log file may time out waiting for output that is stuck in
+     * libc's fully-buffered stdio buffer. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     /* Check for --attach BEFORE EAL init — lightweight client mode */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--attach") == 0) {

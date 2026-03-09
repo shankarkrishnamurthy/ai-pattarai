@@ -919,9 +919,16 @@ cli_print_stats(void)
 {
     metrics_snapshot_t snap;
     metrics_snapshot(&snap, g_core_map.num_workers);
-    char buf[8192];
+
+    /* Human-readable display */
+    char buf[16384];
     export_net_text(&snap, buf, sizeof(buf));
     puts(buf);
+
+    /* Machine-parseable JSON for tests and scripts */
+    char json[4096];
+    export_json(&snap, json, sizeof(json));
+    puts(json);
 }
 
 static void
@@ -940,10 +947,12 @@ dispatch(char *line)
     for (uint32_t i = 0; i < g_n_cmds; i++) {
         if (strcmp(argv[0], g_cmds[i].name) == 0) {
             g_cmds[i].fn(argc, argv);
+            fflush(stdout);
             return;
         }
     }
     printf("Unknown command: %s (type 'help' for list)\n", argv[0]);
+    fflush(stdout);
 }
 
 void

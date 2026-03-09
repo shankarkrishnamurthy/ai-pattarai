@@ -224,6 +224,8 @@ mgmt_traffic_stop(void)
         }
         metrics_reset(ts->n_workers);
     }
+
+    fflush(stdout);
 }
 
 /* ── Non-blocking stdin ───────────────────────────────────────────── */
