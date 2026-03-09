@@ -52,7 +52,7 @@ static inline int
 tcp_checksum_verify(const struct rte_ipv4_hdr *ip4h,
                     const struct rte_tcp_hdr  *tcph)
 {
-    return rte_ipv4_udptcp_cksum(ip4h, tcph) != 0xFFFF;
+    return rte_ipv4_udptcp_cksum_verify(ip4h, tcph);
 }
 
 #ifdef __cplusplus

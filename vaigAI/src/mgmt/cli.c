@@ -680,8 +680,8 @@ cmd_start(int argc, char **argv)
             cli_server_poll(dispatch);
             if (!g_run) break;
 
-            /* --one: exit early once at least one TX packet has been sent
-             * and either an RX response arrived or a connection completed */
+            /* --one: exit early once the full transaction lifecycle
+             * is complete (handshake + data + graceful close). */
             if (a.one) {
                 metrics_snapshot_t ms;
                 metrics_snapshot(&ms, n_workers);
@@ -689,9 +689,10 @@ cmd_start(int argc, char **argv)
                 if (strcmp(a.proto, "icmp") == 0 || strcmp(a.proto, "udp") == 0)
                     done = (ms.total.tx_pkts >= 1);
                 else if (strcmp(a.proto, "http") == 0 || strcmp(a.proto, "https") == 0)
-                    done = (ms.total.http_rsp_rx >= 1);
+                    done = (ms.total.http_rsp_rx >= 1 &&
+                            ms.total.tcp_conn_close >= 1);
                 else /* tcp, tls */
-                    done = (ms.total.tcp_conn_open >= 1);
+                    done = (ms.total.tcp_conn_close >= 1);
                 if (done) { s = a.duration; break; }
             }
         }

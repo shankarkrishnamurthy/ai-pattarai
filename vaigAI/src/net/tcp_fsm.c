@@ -430,9 +430,12 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                               RTE_TCP_ACK_FLAG,
                               NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
 
-            /* ── SYN-only mode: 3WHS complete → RST & recycle ─────── */
+            /* ── SYN-only mode: 3WHS complete → close & recycle ──── */
             if (tcb->app_state == 0 && tcb->app_ctx == NULL) {
-                tcp_fsm_reset(worker_idx, tcb);
+                if (tcb->graceful_close)
+                    tcp_fsm_close(worker_idx, tcb);
+                else
+                    tcp_fsm_reset(worker_idx, tcb);
                 goto done;
             }
 
@@ -610,9 +613,11 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                         tcb->app_state = 5; /* HTTP response pending */
                                     }
                                 } else if (!tcb->app_ctx) {
-                                    /* TLS-only mode: close after handshake.
-                                     * Use RST for fast teardown (avoids delayed ACK). */
-                                    tcp_fsm_reset(worker_idx, tcb);
+                                    /* TLS-only mode: close after handshake. */
+                                    if (tcb->graceful_close)
+                                        tcp_fsm_close(worker_idx, tcb);
+                                    else
+                                        tcp_fsm_reset(worker_idx, tcb);
                                     goto done;
                                 }
                                 /* else: throughput mode marker — keep connection open,
@@ -648,7 +653,10 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                         tcb->app_state = 4;
                                     } else {
                                         tcb->app_state = 0;
-                                        tcp_fsm_reset(worker_idx, tcb);
+                                        if (tcb->graceful_close)
+                                            tcp_fsm_close(worker_idx, tcb);
+                                        else
+                                            tcp_fsm_reset(worker_idx, tcb);
                                         goto done;
                                     }
                                 }
@@ -689,7 +697,10 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                             tcb->app_state = 4; /* re-send next request */
                         } else {
                             tcb->app_state = 0;
-                            tcp_fsm_reset(worker_idx, tcb);
+                            if (tcb->graceful_close)
+                                tcp_fsm_close(worker_idx, tcb);
+                            else
+                                tcp_fsm_reset(worker_idx, tcb);
                             goto done;
                         }
                     }

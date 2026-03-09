@@ -326,6 +326,8 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
                 tcp_port_free_immediate(worker_idx, state->cfg.src_ip, src_port);
                 break;   /* TCB store full */
             }
+            if (state->cfg.max_initiations > 0)
+                tcb->graceful_close = true;
             /* Mark connection for HTTP request after ESTABLISHED */
             if (state->cfg.proto == TX_GEN_PROTO_HTTP) {
                 tcb->app_ctx = &g_http_req[worker_idx];

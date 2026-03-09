@@ -116,6 +116,10 @@ typedef struct {
     /* HTTP request-response latency (TSC at request send) */
     uint64_t    http_req_sent_tsc;
 
+    /* When true, use graceful FIN close instead of RST at end of
+     * transaction (--one flag).  Set by tx_gen when max_initiations > 0. */
+    bool        graceful_close;
+
     /* Valid flag */
     bool        in_use;
 } tcb_t;
