@@ -45,6 +45,7 @@ typedef struct {
     uint16_t              port_id;      /* DPDK port to transmit on      */
     uint64_t              rate_pps;     /* 0 = unlimited (line rate)     */
     uint32_t              duration_s;   /* 0 = run until stopped         */
+    uint32_t              max_initiations; /* 0 = unlimited; >0 = stop after N */
     bool                  enable_tls;   /* initiate TLS after TCP 3WHS   */
     uint8_t               http_method;  /* http_method_t (0=GET,1=POST…) */
     uint8_t               throughput_streams; /* streams for THROUGHPUT (1-16) */

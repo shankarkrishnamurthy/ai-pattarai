@@ -202,10 +202,17 @@ tx_gen_start(tx_gen_state_t *state)
     uint64_t now = rte_rdtsc();
     state->start_tsc       = now;
     state->last_refill_tsc = now;
-    state->tokens          = TX_GEN_MAX_BURST; /* initial allowance */
     state->pkts_sent       = 0;
     state->pkts_dropped    = 0;
     state->seq             = 0;
+
+    /* Cap initial token allowance when max_initiations is set,
+     * so a --one command doesn't burst 32 connections on first tick. */
+    if (state->cfg.max_initiations > 0 &&
+        state->cfg.max_initiations < TX_GEN_MAX_BURST)
+        state->tokens = state->cfg.max_initiations;
+    else
+        state->tokens = TX_GEN_MAX_BURST;
 
     if (state->cfg.duration_s > 0)
         state->deadline_tsc = now +
@@ -245,6 +252,16 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
             state->tp_n_streams = 0;
             state->tp_phase = 0;
         }
+        __atomic_store_n(&state->active, false, __ATOMIC_RELEASE);
+        return 0;
+    }
+
+    /* ── Max-initiations check (--one flag) ─────────────────────────── */
+    if (state->cfg.max_initiations > 0 &&
+        state->pkts_sent >= state->cfg.max_initiations) {
+        /* Already initiated enough connections/packets.
+         * Stop generating new ones.  Existing TCP connections
+         * continue processing via RX and timer ticks. */
         __atomic_store_n(&state->active, false, __ATOMIC_RELEASE);
         return 0;
     }

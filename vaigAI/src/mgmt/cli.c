@@ -609,6 +609,7 @@ cmd_start(int argc, char **argv)
     gcfg.port_id    = port_id;
     gcfg.rate_pps   = a.rate;
     gcfg.duration_s = a.duration;
+    gcfg.max_initiations = a.one ? 1 : 0;
     gcfg.enable_tls = a.tls;
 
     if (a.reuse)

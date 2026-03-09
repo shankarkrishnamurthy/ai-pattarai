@@ -75,7 +75,8 @@ static void probe_caps(uint16_t port_id, port_caps_t *caps)
 static int port_setup(uint16_t port_id,
                        uint32_t n_rxq, uint32_t n_txq,
                        uint32_t rx_desc, uint32_t tx_desc,
-                       struct rte_mempool *mp)
+                       struct rte_mempool *mp,
+                       uint32_t *configured_txq)
 {
     port_caps_t *caps = &g_port_caps[port_id];
     probe_caps(port_id, caps);
@@ -209,6 +210,9 @@ static int port_setup(uint16_t port_id,
         "Port %u: driver=%s mac=%s rxq=%u txq=%u rx_desc=%u tx_desc=%u\n",
         port_id, caps->driver_name, mac_buf, n_rxq, n_txq, rx_desc, tx_desc);
 
+    if (configured_txq)
+        *configured_txq = n_txq;
+
     return 0;
 }
 
@@ -251,13 +255,13 @@ int tgen_ports_init(uint32_t num_rx_desc, uint32_t num_tx_desc)
 
         /* +1 TX queue for mgmt lcore (avoids race with worker TX) */
         uint32_t n_txq = n_queues + 1;
+        uint32_t actual_txq = 0;
         if (port_setup(port_id, n_queues, n_txq,
-                       num_rx_desc, num_tx_desc, mp) < 0)
+                       num_rx_desc, num_tx_desc, mp, &actual_txq) < 0)
             return -1;
-        /* If the driver only supports 1 TX queue (af_packet, TAP, etc.),
-         * mgmt must share worker queue 0.  Otherwise use the dedicated
-         * extra queue at index n_queues. */
-        if (g_port_caps[port_id].max_tx_queues <= n_queues)
+        /* If the actual configured TX queue count doesn't have room for
+         * a dedicated mgmt queue, share worker queue 0. */
+        if (actual_txq <= n_queues)
             g_port_caps[port_id].mgmt_tx_q = 0;
         else
             g_port_caps[port_id].mgmt_tx_q = (uint16_t)n_queues;

@@ -157,8 +157,14 @@ ssh -p 2222 root@localhost 'lspci | grep Co-pro && dmesg | grep -i qat | tail -3
 #  Topology: vaigai (DPDK net_tap) ↔ tap-vaigai ↔ br-vaigai ↔ tap-fc0 ↔ Firecracker VM
 #  Network:  192.168.204.1 (vaigai) ↔ 192.168.204.2 (VM) via 192.168.204.0/24
 #  No physical NIC needed.
+#
+#  This test runs in TWO phases:
+#    Phase 1: Infrastructure — bridge, Firecracker VM, vaigai daemon, bridge wiring
+#    Phase 2: Manual testing via remote CLI (vaigai --attach)
+#
+#  Serial console output goes to /tmp/vaigai-serial.log (NOT mixed with this terminal).
 
-# -- Setup: create bridge + TAP for Firecracker --
+# -- Phase 1a: create bridge + TAP for Firecracker --
 BRIDGE=br-vaigai
 TAP_FC=tap-fc0
 VM_IP=192.168.204.2
@@ -173,52 +179,71 @@ ip link set "$TAP_FC" master "$BRIDGE"
 ip link set "$TAP_FC" up
 
 # Disable netfilter on bridge (critical for performance)
-sysctl -w net.bridge.bridge-nf-call-iptables=0
-sysctl -w net.bridge.bridge-nf-call-ip6tables=0
-sysctl -w net.bridge.bridge-nf-call-arptables=0
+sysctl -q -w net.bridge.bridge-nf-call-iptables=0
+sysctl -q -w net.bridge.bridge-nf-call-ip6tables=0
+sysctl -q -w net.bridge.bridge-nf-call-arptables=0
+echo "[1C] Bridge $BRIDGE + $TAP_FC created"
 
-# -- COW copy of rootfs --
+# -- Phase 1b: COW copy of rootfs --
 ROOTFS_COW=/tmp/vaigai-fc-rootfs.ext4
 cp --reflink=auto /work/firecracker/alpine.ext4 "$ROOTFS_COW"
 
-# -- Server: Firecracker --
+# -- Phase 1c: Start Firecracker (serial console redirected to log file) --
 FC_SOCKET=/tmp/vaigai-fc.sock
-rm -f "$FC_SOCKET"
-firecracker --api-sock "$FC_SOCKET" &
+FC_SERIAL=/tmp/vaigai-serial.log
+rm -f "$FC_SOCKET" "$FC_SERIAL"
+
+# Redirect Firecracker stdout/stderr to serial log so it doesn't mix
+# with this terminal.  Curl API calls use the unix socket, not stdin.
+firecracker --api-sock "$FC_SOCKET" >"$FC_SERIAL" 2>&1 &
 FC_PID=$!
 sleep 1
+echo "[1C] Firecracker started (PID $FC_PID, serial → $FC_SERIAL)"
 
-curl -s --unix-socket "$FC_SOCKET" -X PUT http://localhost/boot-source \
+# -- Phase 1d: Configure + boot VM via Firecracker API (curl → unix socket) --
+curl -sf --unix-socket "$FC_SOCKET" -X PUT http://localhost/boot-source \
     -H 'Content-Type: application/json' \
     -d '{"kernel_image_path":"/work/firecracker/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw quiet vaigai_mode=all ip=192.168.204.2::192.168.204.3:255.255.255.0::eth0:off"}'
+echo "[1C] API: boot-source configured"
 
-curl -s --unix-socket "$FC_SOCKET" -X PUT http://localhost/drives/rootfs \
+curl -sf --unix-socket "$FC_SOCKET" -X PUT http://localhost/drives/rootfs \
     -H 'Content-Type: application/json' \
     -d "{\"drive_id\":\"rootfs\",\"path_on_host\":\"$ROOTFS_COW\",\"is_root_device\":true,\"is_read_only\":false}"
+echo "[1C] API: rootfs drive attached"
 
-curl -s --unix-socket "$FC_SOCKET" -X PUT http://localhost/network-interfaces/eth0 \
+curl -sf --unix-socket "$FC_SOCKET" -X PUT http://localhost/network-interfaces/eth0 \
     -H 'Content-Type: application/json' \
     -d "{\"iface_id\":\"eth0\",\"host_dev_name\":\"$TAP_FC\"}"
+echo "[1C] API: network interface attached ($TAP_FC → eth0)"
 
-curl -s --unix-socket "$FC_SOCKET" -X PUT http://localhost/machine-config \
+curl -sf --unix-socket "$FC_SOCKET" -X PUT http://localhost/machine-config \
     -H 'Content-Type: application/json' \
     -d '{"vcpu_count":1,"mem_size_mib":256}'
+echo "[1C] API: machine config set (1 vCPU, 256 MiB)"
 
-curl -s --unix-socket "$FC_SOCKET" -X PUT http://localhost/actions \
+curl -sf --unix-socket "$FC_SOCKET" -X PUT http://localhost/actions \
     -H 'Content-Type: application/json' \
     -d '{"action_type":"InstanceStart"}'
+echo "[1C] API: VM instance started — booting (serial log: tail -f $FC_SERIAL)"
 
-sleep 5
-ping -c 1 "$VM_IP"
+# Wait for VM to finish booting
+echo "[1C] Waiting for VM to boot..."
+for i in $(seq 1 20); do
+    ping -c 1 -W 1 "$VM_IP" >/dev/null 2>&1 && break
+    sleep 1
+done
+if ping -c 1 -W 2 "$VM_IP" >/dev/null 2>&1; then
+    echo "[1C] VM is reachable at $VM_IP ✓"
+else
+    echo "[1C] WARNING: VM not reachable at $VM_IP after 20s — check $FC_SERIAL"
+fi
 
-# -- vaigai --
-# Run vaigai in the background (daemon-like).  DPDK TAP PMD will create
-# tap-vaigai internally.  We wait for it, attach it to the bridge, then
-# interact via the remote CLI (vaigai --attach).
+# -- Phase 1e: Start vaigai (daemon mode with TAP PMD) --
+# DPDK TAP PMD creates tap-vaigai internally. We wait for it, attach to bridge.
 nohup ./build/vaigai -l 0-1 --no-pci --vdev "net_tap0,iface=tap-vaigai" \
     -- -I 192.168.204.1 </dev/null >/tmp/vaigai-fc.log 2>&1 &
 VAIGAI_PID=$!
-echo "vaigai PID: $VAIGAI_PID"
+echo "[1C] vaigai started (PID $VAIGAI_PID, log → /tmp/vaigai-fc.log)"
 
 # Wait for DPDK to create tap-vaigai (up to 15 seconds)
 for i in $(seq 1 30); do
@@ -226,26 +251,39 @@ for i in $(seq 1 30); do
     sleep 0.5
 done
 if ! ip link show tap-vaigai >/dev/null 2>&1; then
-    echo "ERROR: tap-vaigai not created after 15 seconds"
-    kill $VAIGAI_PID 2>/dev/null
+    echo "[1C] ERROR: tap-vaigai not created after 15 seconds"
     exit 1
 fi
 
 # Attach tap-vaigai to the bridge
 ip link set tap-vaigai master "$BRIDGE"
 ip link set tap-vaigai up
-echo "tap-vaigai attached to $BRIDGE"
+echo "[1C] tap-vaigai attached to $BRIDGE ✓"
 
-# Verify bridge setup
-bridge link show
-ping -c 1 -W 2 "$VM_IP" && echo "VM reachable from host via bridge"
+# Verify bridge has all expected interfaces
+echo "[1C] Bridge members:"
+bridge link show master "$BRIDGE"
 
-# Now interact with vaigai via remote CLI:
-#   ./build/vaigai --attach
-# Example:
-#   vaigai> ping 192.168.204.2
-#   vaigai> start --ip 192.168.204.2 --port 80 --proto http --duration 10 --url /
-#   vaigai> stat net --rate
+# -- Phase 2: Manual testing via remote CLI --
+echo ""
+echo "┌──────────────────────────────────────────────────────┐"
+echo "│  1C Setup Complete — Use remote CLI for testing:     │"
+echo "│                                                      │"
+echo "│  ./build/vaigai --attach                             │"
+echo "│                                                      │"
+echo "│  Example commands:                                   │"
+echo "│    ping 192.168.204.2                                │"
+echo "│    start --ip 192.168.204.2 --port 5000 --proto tcp --one │"
+echo "│    start --ip 192.168.204.2 --port 80 --proto http --duration 10 --url / │"
+echo "│    stat net --rate                                   │"
+echo "│    show                                              │"
+echo "│                                                      │"
+echo "│  Monitor VM serial console:                          │"
+echo "│    tail -f /tmp/vaigai-serial.log                    │"
+echo "│  Monitor vaigai log:                                 │"
+echo "│    tail -f /tmp/vaigai-fc.log                        │"
+echo "└──────────────────────────────────────────────────────┘"
+echo ""
 # SERVER_IP=192.168.204.2
 
 
@@ -520,7 +558,7 @@ echo "$NIC_VM" > /sys/bus/pci/drivers/mlx5_core/bind 2>/dev/null
 # Firecracker cleanup
 kill $VAIGAI_PID 2>/dev/null  # kill daemon-mode vaigai
 kill $FC_PID 2>/dev/null
-rm -f "$FC_SOCKET" "$ROOTFS_COW"
+rm -f "$FC_SOCKET" "$ROOTFS_COW" "$FC_SERIAL"
 ip link del tap-fc0 2>/dev/null
 ip link del br-vaigai 2>/dev/null
 
