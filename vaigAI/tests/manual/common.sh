@@ -35,6 +35,22 @@ setup_hugepages() {
         echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
         info "Hugepages set to 256 × 2 MB"
     fi
+    # Ensure each NUMA node has enough hugepages for DPDK workers
+    local node
+    for node in /sys/devices/system/node/node*/hugepages/hugepages-2048kB/free_hugepages; do
+        [[ -f "$node" ]] || continue
+        local free ndir
+        free=$(cat "$node")
+        ndir=$(dirname "$node")
+        if (( free < 64 )); then
+            echo 128 > "$ndir/nr_hugepages"
+            local nname
+            nname=$(basename "$(dirname "$(dirname "$ndir")")")
+            info "Hugepages on $nname increased to 128"
+        fi
+    done
+    # Clean up stale DPDK hugepage files from previous runs
+    rm -f /dev/hugepages/vaigai_* 2>/dev/null || true
 }
 
 # ── Send command to vaigai via remote CLI ────────────────────────────────────

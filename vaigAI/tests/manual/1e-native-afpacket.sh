@@ -23,7 +23,7 @@ VETH_NATIVE=veth-native
 
 # Use 8443 for HTTPS if port 443 is already taken on this host
 HTTPS_PORT=443
-if ss -tlnp sport = :443 | grep -q LISTEN; then
+if ss -tlnp sport = :443 | grep -q LISTEN 2>/dev/null; then
     HTTPS_PORT=8443
     info "Port 443 in use — using $HTTPS_PORT for HTTPS"
 fi
@@ -42,6 +42,10 @@ cleanup() {
     ok "1E cleanup done"
 }
 trap cleanup EXIT
+
+# ── Pre-clean: stop leftovers from previous runs ────────────────────────────
+nginx -s stop -c /tmp/vaigai-native-nginx.conf 2>/dev/null || true
+ip link del "$VETH_HOST" 2>/dev/null || true
 
 # ── Setup: create veth pair ─────────────────────────────────────────────────
 ip link add "$VETH_HOST" type veth peer name "$VETH_NATIVE"
@@ -95,14 +99,14 @@ dd if=/dev/urandom of=/tmp/vaigai-native-www/100k.bin bs=1024 count=100 2>/dev/n
 # ── Start servers ────────────────────────────────────────────────────────────
 nginx -c /tmp/vaigai-native-nginx.conf
 
-openssl s_server -cert /tmp/vaigai-native-tls/server.crt \
+setsid openssl s_server -cert /tmp/vaigai-native-tls/server.crt \
     -key /tmp/vaigai-native-tls/server.key \
-    -accept 4433 -www -quiet &
+    -accept 4433 -www -quiet </dev/null &>/dev/null &
 OPENSSL_PID=$!
 
-socat TCP-LISTEN:5000,bind=$SERVER_IP,fork,reuseaddr PIPE &
+setsid socat TCP-LISTEN:5000,bind=$SERVER_IP,fork,reuseaddr SYSTEM:'cat' </dev/null &>/dev/null &
 SOCAT1_PID=$!
-socat TCP-LISTEN:5001,bind=$SERVER_IP,fork,reuseaddr /dev/null &
+setsid socat TCP-LISTEN:5001,bind=$SERVER_IP,fork,reuseaddr /dev/null </dev/null &>/dev/null &
 SOCAT2_PID=$!
 
 sleep 1

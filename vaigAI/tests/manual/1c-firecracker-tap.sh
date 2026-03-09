@@ -38,6 +38,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ── Pre-clean: stop leftovers from previous runs ────────────────────────────
+echo "quit" | "$VAIGAI_BIN" --attach 2>/dev/null || true
+ip link del "$TAP_FC" 2>/dev/null || true
+ip link del "$BRIDGE" 2>/dev/null || true
+rm -f "$FC_SOCKET" "$ROOTFS_COW" "$FC_SERIAL"
+
 # ── Phase 1a: create bridge + TAP for Firecracker ───────────────────────────
 ip link add "$BRIDGE" type bridge
 ip link set "$BRIDGE" up
@@ -58,9 +64,10 @@ cp --reflink=auto /work/firecracker/alpine.ext4 "$ROOTFS_COW"
 
 # ── Phase 1c: Start Firecracker ─────────────────────────────────────────────
 rm -f "$FC_SOCKET" "$FC_SERIAL"
-firecracker --api-sock "$FC_SOCKET" >"$FC_SERIAL" 2>&1 &
-FC_PID=$!
+# setsid creates a new session so Firecracker survives parent shell exit
+setsid firecracker --api-sock "$FC_SOCKET" </dev/null >"$FC_SERIAL" 2>&1 &
 sleep 1
+FC_PID=$(pgrep -f "firecracker.*$FC_SOCKET" | head -1)
 info "Firecracker started (PID $FC_PID, serial → $FC_SERIAL)"
 
 # ── Phase 1d: Configure + boot VM via API ────────────────────────────────────
@@ -115,7 +122,15 @@ fi
 # Attach tap-vaigai to the bridge
 ip link set tap-vaigai master "$BRIDGE"
 ip link set tap-vaigai up
-ok "tap-vaigai attached to $BRIDGE"
+
+# Delete the bridge's permanent FDB entry for tap-vaigai's MAC.
+# Without this, the bridge treats unicast frames destined for tap-vaigai's
+# own MAC as "local" and delivers them to the kernel protocol stack instead
+# of forwarding them to the TAP fd where DPDK can read them.
+VAIGAI_MAC=$(cat /sys/class/net/tap-vaigai/address)
+bridge fdb del "$VAIGAI_MAC" dev tap-vaigai master 2>/dev/null || true
+
+ok "tap-vaigai attached to $BRIDGE (FDB fix applied)"
 
 echo ""
 bridge link show master "$BRIDGE"
