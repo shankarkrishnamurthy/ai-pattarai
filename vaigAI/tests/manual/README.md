@@ -25,7 +25,7 @@ sudo bash tests/manual/1e-native-afpacket.sh
 ./build/vaigai --attach
 ```
 
-## Common file
+## Structure
 
-`common.sh` — shared helpers (preflight checks, hugepage setup, traffic command
-reference). Sourced automatically by each script.
+Each script is fully self-contained — no shared files. You can copy-paste
+individual commands from any script directly into a terminal.

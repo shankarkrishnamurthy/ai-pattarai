@@ -8,10 +8,77 @@
 #  No physical NIC needed. Requires: libbpf, vaigai built with -Daf_xdp=enabled.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/common.sh"
-preflight
-setup_hugepages
+set -euo pipefail
+
+VAIGAI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+VAIGAI_BIN="$VAIGAI_DIR/build/vaigai"
+
+# ── Colours & logging ────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
+ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+err()   { echo -e "${RED}[ERR]${NC}   $*"; }
+
+# ── Pre-flight checks ───────────────────────────────────────────────────────
+[[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
+[[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
+
+# ── Hugepages ────────────────────────────────────────────────────────────────
+_cur=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
+if (( _cur < 256 )); then
+    echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+    info "Hugepages set to 256 × 2 MB"
+fi
+for _node in /sys/devices/system/node/node*/hugepages/hugepages-2048kB/free_hugepages; do
+    [[ -f "$_node" ]] || continue
+    _free=$(cat "$_node"); _ndir=$(dirname "$_node")
+    if (( _free < 64 )); then
+        echo 128 > "$_ndir/nr_hugepages"
+        info "Hugepages on $(basename "$(dirname "$(dirname "$_ndir")")") increased to 128"
+    fi
+done
+rm -f /dev/hugepages/vaigai_* 2>/dev/null || true
+
+# ── Print traffic & debug commands ───────────────────────────────────────────
+print_traffic_commands() {
+    local SIP="$1"
+    local HTTP_PORT="${2:-80}" HTTPS_PORT="${3:-443}" TLS_PORT="${4:-4433}"
+    local TCP_PORT="${5:-5000}" UDP_PORT="${6:-5001}"
+    cat <<CMDS
+
+${BOLD}═══ Traffic Commands (at vaigai> prompt or via --attach) ═══${NC}
+
+  ${CYAN}# Single-request tests (--one)${NC}
+  start --ip $SIP --port $TCP_PORT --proto tcp --one
+  start --ip $SIP --port $HTTP_PORT --proto http --one --url /
+  start --ip $SIP --port $HTTPS_PORT --proto https --one --url /
+  start --ip $SIP --port $TLS_PORT --proto tls --one
+
+  ${CYAN}# Duration / rate tests${NC}
+  start --ip $SIP --port $TCP_PORT --proto tcp --duration 30
+  start --ip $SIP --port $TCP_PORT --proto tcp --duration 30 --rate 1000
+  start --ip $SIP --port $HTTP_PORT --proto http --duration 30 --url /
+  start --ip $SIP --port $HTTPS_PORT --proto https --duration 30 --url /
+  start --ip $SIP --port $TLS_PORT --proto tls --duration 30
+  start --ip $SIP --port $UDP_PORT --proto udp --size 1024 --duration 30
+
+  ${CYAN}# Control${NC}
+  stop                          # stop active traffic
+  reset                         # reset TCP state between tests
+
+${BOLD}═══ Monitoring & Debug ═══${NC}
+  stat net                      # snapshot of all counters
+  stat net --rate               # per-second rates
+  stat cpu                      # CPU utilization per lcore
+  ping $SIP                     # ICMP ping
+  show interface                # interface info
+  trace start /tmp/capture.pcapng   # packet capture
+  trace stop
+  quit
+CMDS
+}
 
 SERVER_IP=192.168.200.2
 VETH_HOST=veth-vaigai
