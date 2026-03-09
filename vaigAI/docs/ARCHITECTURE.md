@@ -10,7 +10,7 @@
 1. [System Architecture](#1-system-architecture) — block diagram, module map, build, startup, core assignment, memory
 2. [Life of a Packet](#2-life-of-a-packet) — RX/TX paths, worker loop, protocol stack, HTTP parser, TLS, TCP flow control
 3. [Telemetry System](#3-telemetry-system) — metrics ownership, counters, histogram, export, logging
-4. [Control Plane / Data Plane](#4-control-plane--data-plane-segregation) — IPC, CLI, REST API, config, shared state
+4. [Control Plane / Data Plane](#4-control-plane--data-plane-segregation) — mgmt core scheduling, IPC, CLI, REST API, config, shared state
 5. [Test Infrastructure](#5-test-infrastructure) — scripts, topology tiers, coverage
 
 ---
@@ -809,7 +809,108 @@ hot path. All cross-plane communication uses **lock-free SPSC rings**.
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 IPC Protocol
+### 4.2 Management Core Scheduling
+
+The management core is a **single thread** that cooperatively multiplexes all
+control-plane activities. There is no preemptive scheduler — every long-running
+CLI command must **yield periodically** by calling management tick functions, or
+all other management activities stall.
+
+#### Management Activities
+
+| Activity | Entry Point | Frequency | What It Does |
+|----------|-------------|-----------|--------------|
+| **ARP cache management** | `arp_mgmt_tick()` | Every mgmt tick | Drains worker ARP rings (`g_arp_rings[p]`), processes ARP requests/replies, probes stale entries, expires failed entries |
+| **ICMP management** | `icmp_mgmt_tick()` | Every mgmt tick | Drains worker ICMP rings, processes echo requests (sends replies), leaves echo replies for ping client |
+| **Packet trace flush** | `pktrace_flush()` | Every mgmt tick | Writes buffered packet captures to the pcapng file on disk |
+| **Remote CLI server** | `cli_server_poll(dispatch)` | Every mgmt tick | Accepts new Unix socket connections, reads commands from attached clients, dispatches them, captures + sends output |
+| **CLI REPL** | `readline()` / `fgets()` | Blocking (with tick hook) | Reads user commands from stdin, dispatches via `dispatch()` |
+| **REST API** | libmicrohttpd | Own internal thread | HTTP request handler for `/api/v1/*` endpoints — runs independently on `MHD_USE_INTERNAL_POLLING_THREAD` |
+| **Telemetry snapshot** | `metrics_snapshot()` et al. | On demand | Reads per-worker counter slabs (racy single-writer read), aggregates totals |
+| **Traffic coordination** | `cmd_start()` wait loop | During `start` command | Blocks for the configured duration while servicing management ticks every 100 ms |
+
+> **Note:** The REST API is the only management activity that runs on a
+> separate thread (libmicrohttpd's internal polling thread). All other
+> activities share the management lcore and must cooperate.
+
+#### The `mgmt_tick()` Function
+
+All periodic management work is bundled into a single tick function:
+
+```c
+static int mgmt_tick(void) {
+    arp_mgmt_tick();              // drain ARP rings, process, expire
+    icmp_mgmt_tick();             // drain ICMP rings, send replies
+    pktrace_flush();              // flush capture buffers to disk
+    cli_server_poll(dispatch);    // service remote CLI clients
+    return 0;
+}
+```
+
+#### Tick Contexts — Where `mgmt_tick` Runs
+
+The management core enters different execution contexts depending on the
+operational mode and the active CLI command. Each context must call the
+management tick functions (or a subset) to keep the control plane alive:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                     Management Core Timeline                          │
+│                                                                       │
+│  ┌──────────┐ ┌─────────────────────────┐ ┌──────────┐ ┌──────────┐  │
+│  │  REPL    │ │     cmd_start()         │ │  REPL    │ │  REPL    │  │
+│  │  idle    │ │  (traffic generation)   │ │  idle    │ │  idle    │  │
+│  │          │ │                         │ │          │ │          │  │
+│  │ mgmt_   │ │ 100ms ticks:            │ │ mgmt_   │ │ mgmt_   │  │
+│  │ tick()   │ │  arp_mgmt_tick()        │ │ tick()   │ │ tick()   │  │
+│  │ every    │ │  pktrace_flush()        │ │ every    │ │ every    │  │
+│  │ ~10ms    │ │  cli_server_poll()      │ │ ~10ms    │ │ ~10ms    │  │
+│  └──────────┘ └─────────────────────────┘ └──────────┘ └──────────┘  │
+│       ▲              ▲                         ▲             ▲        │
+│       │              │                         │             │        │
+│   readline      nanosleep(100ms)          readline      readline     │
+│   event hook    between ticks             event hook    event hook    │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+| Context | Tick Interval | Functions Called | When Active |
+|---------|--------------|-----------------|-------------|
+| **Readline REPL** (interactive) | ~10 ms | `mgmt_tick()` (all four) | Waiting for user input (via `rl_event_hook`) |
+| **fgets REPL** (no readline) | 10 ms | `arp_mgmt_tick`, `icmp_mgmt_tick`, `pktrace_flush`, `cli_server_poll` | Polling stdin with 10 ms timeout |
+| **Headless / daemon mode** | 100 ms | `arp_mgmt_tick`, `icmp_mgmt_tick`, `pktrace_flush`, `cli_server_poll` | stdin is `/dev/null` — no interactive CLI |
+| **`cmd_start()` wait loop** | 100 ms | `arp_mgmt_tick`, `pktrace_flush`, `cli_server_poll` | During traffic generation (`--duration N`) |
+| **`cmd_ping()` wait loop** | ~100 ms | `pktrace_flush`, `cli_server_poll` | During ICMP ping (via `ping_poll_cb`) |
+| **`stat --watch` loop** | ~100 ms | `arp_mgmt_tick`, `icmp_mgmt_tick`, `pktrace_flush` | Continuous stats display (between 1 s rate samples) |
+
+#### Invariant: Long-Running Commands Must Yield
+
+Any CLI command that blocks the management core for more than a few
+milliseconds **must** call management tick functions periodically. If it
+does not, the following failures occur:
+
+| Starved Function | Failure Mode | Time to Impact |
+|------------------|--------------|----------------|
+| `arp_mgmt_tick()` | Remote peer's ARP requests go unanswered → its ARP cache for vaigai expires → TCP responses stop arriving → **traffic generation effectively stops** | 30–60 s (peer's ARP cache timeout) |
+| `icmp_mgmt_tick()` | ICMP echo requests from peers go unanswered → `ping` from remote hosts fails | Immediate |
+| `pktrace_flush()` | Packet capture buffer fills → new captures are dropped | Seconds (depends on traffic rate) |
+| `cli_server_poll()` | Remote CLI clients hang — their commands queue in the socket buffer | Until the blocking command returns |
+
+#### Remote CLI and `--watch`
+
+When a command is dispatched from a remote CLI client (`vaigai --attach`),
+`cli_server_poll()` redirects `stdout` to a `memstream` (via
+`open_memstream()`) before calling `dispatch()`. The captured output is sent
+to the client as a single response after `dispatch()` returns.
+
+This means commands dispatched from remote clients **must not block
+indefinitely** — the remote client's `recv()` will hang until the command
+completes, and the memstream accumulates unbounded output.
+
+The `stat --watch` command detects this context by checking `fileno(stdout)`:
+if `stdout` is a memstream (`fileno() < 0`), it falls back to a single
+`--rate` sample instead of entering the infinite watch loop.
+
+### 4.3 IPC Protocol
 
 Commands flow from management to workers via `config_update_t` messages (256 bytes,
 8-byte aligned). Workers acknowledge with `ipc_ack_t`.
@@ -846,7 +947,7 @@ Commands flow from management to workers via `config_update_t` messages (256 byt
 - Worker frees message after processing
 - Broadcast sends to all workers; returns success count
 
-### 4.3 CLI Commands
+### 4.4 CLI Commands
 
 ```
 vaigai> help
@@ -866,7 +967,7 @@ vaigai> help
 | `show` | `show interface [port_id]` | Show DPDK interface details |
 | `quit` | `quit` | Graceful shutdown |
 
-### 4.4 REST API
+### 4.5 REST API
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
@@ -878,7 +979,7 @@ vaigai> help
 | `/api/v1/start` | `POST` | Start traffic generation |
 | `/api/v1/stop` | `POST` | Stop traffic generation |
 
-### 4.5 Remote CLI Attach
+### 4.6 Remote CLI Attach
 
 Multiple CLI clients can connect to a running vaigai process via Unix
 domain socket:
@@ -901,7 +1002,7 @@ vaigai process (mgmt core)
 All responses are JSON with CORS headers (`Access-Control-Allow-Origin: *`).
 REST server runs on the management core via `libmicrohttpd`.
 
-### 4.5 Configuration Schema
+### 4.7 Configuration Schema
 
 ```json
 {
@@ -931,7 +1032,7 @@ REST server runs on the management core via `libmicrohttpd`.
 Loaded from `$VAIGAI_CONFIG` env var at startup.
 `config_push_to_workers()` distributes flow profiles to the ARP subsystem.
 
-### 4.6 How They Work Together — Concrete Scenarios
+### 4.8 How They Work Together — Concrete Scenarios
 
 #### Scenario 1: `start --proto udp --ip 10.0.0.1 --duration 3 --rate 1000 --size 64 --port 9`
 
@@ -1006,7 +1107,7 @@ but never process them. They forward to the management core via a per-port SPSC
 ring. The management core handles all cache mutations, reply generation, and
 expiry probing. Workers read the cache via `arp_lookup()` under a read-lock.
 
-### 4.7 Why This Design
+### 4.9 Why This Design
 
 | Concern                   | How It's Addressed                                          |
 |---------------------------|-------------------------------------------------------------|
@@ -1019,7 +1120,7 @@ expiry probing. Workers read the cache via `arp_lookup()` under a read-lock.
 
 ---
 
-### 4.8 Shared State Inventory
+### 4.10 Shared State Inventory
 
 The following global state is accessed by both planes. Each is designed to be
 safe without mutual exclusion in the fast path:
