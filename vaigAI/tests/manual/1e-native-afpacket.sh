@@ -10,6 +10,9 @@
 #  NOTE: TX checksum offload is disabled on both veth interfaces so that the
 #  kernel computes checksums in software. DPDK af_packet does not support HW
 #  checksum offload, and partial checksums cause vaigai to drop packets.
+#
+#  Access: Servers run as native processes on the host — no SSH needed.
+#          Service ports are bound to 192.168.201.2.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -25,25 +28,47 @@ ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()   { echo -e "${RED}[ERR]${NC}   $*"; }
 
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--server | --tgen | --cleanup]
+  (no args)   Run everything: server + vaigai (original behavior)
+  --server    Start server infrastructure only (terminal 1)
+  --tgen      Start vaigai traffic generator only (terminal 2)
+  --cleanup   Clean up all resources from previous runs
+EOF
+}
+
+# ── Parse arguments ──────────────────────────────────────────────────────────
+MODE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --server)  MODE="server" ;;
+        --tgen)    MODE="tgen" ;;
+        --cleanup) MODE="cleanup" ;;
+        -h|--help) usage; exit 0 ;;
+        *) err "Unknown option: $1"; usage; exit 1 ;;
+    esac
+    shift
+done
+
 # ── Pre-flight checks ───────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
-[[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
-
-# ── Hugepages ────────────────────────────────────────────────────────────────
-_cur=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
-if (( _cur < 256 )); then
-    echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-    info "Hugepages set to 256 × 2 MB"
+if [[ "$MODE" == "tgen" || -z "$MODE" ]]; then
+    [[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
 fi
-for _node in /sys/devices/system/node/node*/hugepages/hugepages-2048kB/free_hugepages; do
-    [[ -f "$_node" ]] || continue
-    _free=$(cat "$_node"); _ndir=$(dirname "$_node")
-    if (( _free < 64 )); then
-        echo 128 > "$_ndir/nr_hugepages"
-        info "Hugepages on $(basename "$(dirname "$(dirname "$_ndir")")") increased to 128"
-    fi
-done
-rm -f /dev/hugepages/vaigai_* 2>/dev/null || true
+
+# ── Constants ────────────────────────────────────────────────────────────────
+SERVER_IP=192.168.201.2
+VETH_HOST=veth-vaigai
+VETH_NATIVE=veth-native
+STATE_DIR=/tmp/vaigai-1e
+
+# Use 8443 for HTTPS if port 443 is already taken on this host
+HTTPS_PORT=443
+if ss -tlnp sport = :443 | grep -q LISTEN 2>/dev/null; then
+    HTTPS_PORT=8443
+    info "Port 443 in use — using $HTTPS_PORT for HTTPS"
+fi
 
 # ── Print traffic & debug commands ───────────────────────────────────────────
 print_traffic_commands() {
@@ -84,62 +109,88 @@ ${BOLD}═══ Monitoring & Debug ═══${NC}
 CMDS
 }
 
-SERVER_IP=192.168.201.2
-VETH_HOST=veth-vaigai
-VETH_NATIVE=veth-native
+# ── Helper: terminate process from PID file ──────────────────────────────────
+stop_pidfile() {
+    local f="$1"
+    if [[ -f "$f" ]]; then
+        local pid
+        pid=$(cat "$f")
+        /bin/kill "$pid" 2>/dev/null || true
+        rm -f "$f"
+    fi
+}
 
-# Use 8443 for HTTPS if port 443 is already taken on this host
-HTTPS_PORT=443
-if ss -tlnp sport = :443 | grep -q LISTEN 2>/dev/null; then
-    HTTPS_PORT=8443
-    info "Port 443 in use — using $HTTPS_PORT for HTTPS"
-fi
+# ── Hugepages ────────────────────────────────────────────────────────────────
+setup_hugepages() {
+    local _cur
+    _cur=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
+    if (( _cur < 256 )); then
+        echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+        info "Hugepages set to 256 × 2 MB"
+    fi
+    for _node in /sys/devices/system/node/node*/hugepages/hugepages-2048kB/free_hugepages; do
+        [[ -f "$_node" ]] || continue
+        local _free _ndir
+        _free=$(cat "$_node"); _ndir=$(dirname "$_node")
+        if (( _free < 64 )); then
+            echo 128 > "$_ndir/nr_hugepages"
+            info "Hugepages on $(basename "$(dirname "$(dirname "$_ndir")")") increased to 128"
+        fi
+    done
+    rm -f /dev/hugepages/vaigai_* 2>/dev/null || true
+}
 
-# ── Cleanup function ────────────────────────────────────────────────────────
-cleanup() {
+# ── Cleanup ──────────────────────────────────────────────────────────────────
+do_cleanup() {
     info "Cleaning up 1E..."
     nginx -s stop -c /tmp/vaigai-native-nginx.conf 2>/dev/null || true
-    [[ -n "${OPENSSL_PID:-}" ]] && kill "$OPENSSL_PID" 2>/dev/null || true
-    [[ -n "${SOCAT1_PID:-}" ]] && kill "$SOCAT1_PID" 2>/dev/null || true
-    [[ -n "${SOCAT2_PID:-}" ]] && kill "$SOCAT2_PID" 2>/dev/null || true
+    stop_pidfile "$STATE_DIR/openssl.pid"
+    stop_pidfile "$STATE_DIR/socat1.pid"
+    stop_pidfile "$STATE_DIR/socat2.pid"
     ip link del "$VETH_HOST" 2>/dev/null || true
     rm -rf /tmp/vaigai-native-tls /tmp/vaigai-native-www
     rm -f /tmp/vaigai-native-nginx.conf /tmp/vaigai-native-nginx.pid
     rm -f /tmp/vaigai-native-nginx-error.log /tmp/vaigai-native-nginx-access.log
+    rm -rf "$STATE_DIR"
     ok "1E cleanup done"
 }
-trap cleanup EXIT
 
-# ── Pre-clean: stop leftovers from previous runs ────────────────────────────
-nginx -s stop -c /tmp/vaigai-native-nginx.conf 2>/dev/null || true
-ip link del "$VETH_HOST" 2>/dev/null || true
+# ── Server: veth + TLS + nginx + socat ───────────────────────────────────────
+start_server() {
+    # Pre-clean leftovers
+    nginx -s stop -c /tmp/vaigai-native-nginx.conf 2>/dev/null || true
+    stop_pidfile "$STATE_DIR/openssl.pid"
+    stop_pidfile "$STATE_DIR/socat1.pid"
+    stop_pidfile "$STATE_DIR/socat2.pid"
+    ip link del "$VETH_HOST" 2>/dev/null || true
+    mkdir -p "$STATE_DIR"
 
-# ── Setup: create veth pair ─────────────────────────────────────────────────
-ip link add "$VETH_HOST" type veth peer name "$VETH_NATIVE"
-ip link set "$VETH_HOST" up
-ip link set "$VETH_NATIVE" up
-ip addr add "$SERVER_IP/24" dev "$VETH_NATIVE"
+    # Create veth pair
+    ip link add "$VETH_HOST" type veth peer name "$VETH_NATIVE"
+    ip link set "$VETH_HOST" up
+    ip link set "$VETH_NATIVE" up
+    ip addr add "$SERVER_IP/24" dev "$VETH_NATIVE"
 
-# Disable TX checksum offload (critical for af_packet)
-ethtool -K "$VETH_NATIVE" tx off 2>/dev/null || true
-ethtool -K "$VETH_HOST" tx off 2>/dev/null || true
+    # Disable TX checksum offload (critical for af_packet)
+    ethtool -K "$VETH_NATIVE" tx off 2>/dev/null || true
+    ethtool -K "$VETH_HOST" tx off 2>/dev/null || true
 
-# Wait for IP to be ready
-for i in $(seq 1 20); do
-    ip addr show "$VETH_NATIVE" | grep -q "$SERVER_IP" && break
-    sleep 0.25
-done
-ok "veth pair created ($VETH_HOST ↔ $VETH_NATIVE)"
+    # Wait for IP to be ready
+    for i in $(seq 1 20); do
+        ip addr show "$VETH_NATIVE" | grep -q "$SERVER_IP" && break
+        sleep 0.25
+    done
+    ok "veth pair created ($VETH_HOST ↔ $VETH_NATIVE)"
 
-# ── TLS certificates ───────────────────────────────────────────────────────
-mkdir -p /tmp/vaigai-native-tls
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-    -keyout /tmp/vaigai-native-tls/server.key \
-    -out /tmp/vaigai-native-tls/server.crt \
-    -subj "/CN=vaigai-test" 2>/dev/null
+    # TLS certificates
+    mkdir -p /tmp/vaigai-native-tls
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+        -keyout /tmp/vaigai-native-tls/server.key \
+        -out /tmp/vaigai-native-tls/server.crt \
+        -subj "/CN=vaigai-test" 2>/dev/null
 
-# ── nginx config ─────────────────────────────────────────────────────────────
-cat > /tmp/vaigai-native-nginx.conf << EOF
+    # nginx config
+    cat > /tmp/vaigai-native-nginx.conf << NGINXEOF
 worker_processes 1;
 pid /tmp/vaigai-native-nginx.pid;
 error_log /tmp/vaigai-native-nginx-error.log;
@@ -157,43 +208,76 @@ http {
         location / { root /tmp/vaigai-native-www; }
     }
 }
-EOF
+NGINXEOF
 
-mkdir -p /tmp/vaigai-native-www
-echo "OK" > /tmp/vaigai-native-www/index.html
-dd if=/dev/urandom of=/tmp/vaigai-native-www/100k.bin bs=1024 count=100 2>/dev/null
+    mkdir -p /tmp/vaigai-native-www
+    echo "OK" > /tmp/vaigai-native-www/index.html
+    dd if=/dev/urandom of=/tmp/vaigai-native-www/100k.bin bs=1024 count=100 2>/dev/null
 
-# ── Start servers ────────────────────────────────────────────────────────────
-nginx -c /tmp/vaigai-native-nginx.conf
+    # Start servers (no setsid — capture real PIDs via $!)
+    nginx -c /tmp/vaigai-native-nginx.conf
 
-setsid openssl s_server -cert /tmp/vaigai-native-tls/server.crt \
-    -key /tmp/vaigai-native-tls/server.key \
-    -accept 4433 -www -quiet </dev/null &>/dev/null &
-OPENSSL_PID=$!
+    openssl s_server -cert /tmp/vaigai-native-tls/server.crt \
+        -key /tmp/vaigai-native-tls/server.key \
+        -accept 4433 -www -quiet </dev/null &>/dev/null &
+    echo $! > "$STATE_DIR/openssl.pid"
 
-setsid socat TCP-LISTEN:5000,bind=$SERVER_IP,fork,reuseaddr SYSTEM:'cat' </dev/null &>/dev/null &
-SOCAT1_PID=$!
-setsid socat TCP-LISTEN:5001,bind=$SERVER_IP,fork,reuseaddr /dev/null </dev/null &>/dev/null &
-SOCAT2_PID=$!
+    socat TCP-LISTEN:5000,bind=$SERVER_IP,fork,reuseaddr SYSTEM:'cat' </dev/null &>/dev/null &
+    echo $! > "$STATE_DIR/socat1.pid"
+    socat TCP-LISTEN:5001,bind=$SERVER_IP,fork,reuseaddr /dev/null </dev/null &>/dev/null &
+    echo $! > "$STATE_DIR/socat2.pid"
 
-sleep 1
+    sleep 1
 
-# Verify all ports are listening
-info "Listening ports:"
-ss -tlnp | grep -E ":(80|${HTTPS_PORT}|4433|5000|5001)\b"
-EXPECTED=5
-ACTUAL=$(ss -tlnp | grep -cE ":(80|${HTTPS_PORT}|4433|5000|5001)\b")
-if (( ACTUAL < EXPECTED )); then
-    warn "Only $ACTUAL of $EXPECTED server ports are listening"
-else
-    ok "All $EXPECTED server ports listening"
-fi
-echo ""
+    # Verify all ports are listening
+    info "Listening ports:"
+    ss -tlnp | grep -E ":(80|${HTTPS_PORT}|4433|5000|5001)\b" || true
+    local EXPECTED=5
+    local ACTUAL
+    ACTUAL=$(ss -tlnp | grep -cE ":(80|${HTTPS_PORT}|4433|5000|5001)\b" || true)
+    if (( ACTUAL < EXPECTED )); then
+        warn "Only $ACTUAL of $EXPECTED server ports are listening"
+    else
+        ok "All $EXPECTED server ports listening"
+    fi
+}
 
-# ── Start vaigai ─────────────────────────────────────────────────────────────
-info "Starting vaigai with af_packet (interactive — Ctrl+C or 'quit' to exit)..."
-echo ""
-print_traffic_commands "$SERVER_IP" 80 "$HTTPS_PORT" 4433 5000 5001
-echo ""
+# ── Tgen: vaigai with af_packet ──────────────────────────────────────────────
+start_tgen() {
+    # Verify server is running
+    if ! ip link show "$VETH_HOST" >/dev/null 2>&1; then
+        err "veth interface $VETH_HOST not found — run --server first"
+        exit 1
+    fi
 
-"$VAIGAI_BIN" -l 0-1 --no-pci --vdev "net_af_packet0,iface=$VETH_HOST" -- -I 192.168.201.1
+    info "Starting vaigai with af_packet (interactive — Ctrl+C or 'quit' to exit)..."
+    echo ""
+    print_traffic_commands "$SERVER_IP" 80 "$HTTPS_PORT" 4433 5000 5001
+    echo ""
+
+    "$VAIGAI_BIN" -l 0-1 --no-pci --vdev "net_af_packet0,iface=$VETH_HOST" -- -I 192.168.201.1
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+case "$MODE" in
+    server)
+        setup_hugepages
+        trap do_cleanup EXIT
+        start_server
+        ok "Server running. Press Ctrl+C to stop and clean up."
+        sleep infinity
+        ;;
+    tgen)
+        setup_hugepages
+        start_tgen
+        ;;
+    cleanup)
+        do_cleanup
+        ;;
+    "")
+        setup_hugepages
+        trap do_cleanup EXIT
+        start_server
+        start_tgen
+        ;;
+esac

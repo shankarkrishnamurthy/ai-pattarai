@@ -16,14 +16,41 @@ commands, and cleans up on exit (Ctrl+C).
 
 ## Usage
 
+Each script supports three modes for split-terminal workflows:
+
 ```bash
-# Run as root
+# All-in-one (original behavior) — run as root
 sudo bash tests/manual/1e-native-afpacket.sh
 
-# Each script prints traffic commands after setup.
-# For daemon-mode tests (1C), use a second terminal:
-./build/vaigai --attach
+# Split-terminal workflow:
+#   Terminal 1: start server infrastructure
+sudo bash tests/manual/1e-native-afpacket.sh --server
+
+#   Terminal 2: start vaigai traffic generator
+sudo bash tests/manual/1e-native-afpacket.sh --tgen
+
+# Explicit cleanup (if needed after abnormal exit)
+sudo bash tests/manual/1e-native-afpacket.sh --cleanup
 ```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| (none) | Run everything: server + vaigai (original behavior) |
+| `--server` | Start server infrastructure only — blocks until Ctrl+C |
+| `--tgen` | Start vaigai traffic generator only (assumes `--server` is running) |
+| `--cleanup` | Clean up all resources from previous runs |
+
+### Accessing the server
+
+| Script | Access command |
+|--------|---------------|
+| `1a-qemu-mlx5.sh` | `ssh -o StrictHostKeyChecking=no -p 2222 root@localhost` |
+| `1b-qemu-i40e.sh` | `ssh -o StrictHostKeyChecking=no -p 2222 root@localhost` |
+| `1c-firecracker-tap.sh` | `tail -f /tmp/vaigai-serial.log` (serial) or `ssh root@192.168.204.2` (if SSH in rootfs) |
+| `1d-container-afxdp.sh` | `podman exec -it vaigai-server sh` |
+| `1e-native-afpacket.sh` | Native processes on host — no SSH needed |
 
 ## Structure
 

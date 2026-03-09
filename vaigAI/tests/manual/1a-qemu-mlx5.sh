@@ -9,6 +9,8 @@
 #            95:00.1 → VM      (PF passthrough, bind to vfio-pci)
 #  QAT:     PF 0d:00.0 → VM    (PF passthrough, kernel qat_dh895xcc inside VM)
 #           PF 0e:00.0 → vaigai (PF passthrough, DPDK crypto_qat PMD)
+#
+#  SSH into server VM: ssh -o StrictHostKeyChecking=no -p 2222 root@localhost
 # ═══════════════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -24,25 +26,44 @@ ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()   { echo -e "${RED}[ERR]${NC}   $*"; }
 
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--server | --tgen | --cleanup]
+  (no args)   Run everything: server + vaigai (original behavior)
+  --server    Start QEMU VM with all services (terminal 1)
+  --tgen      Start vaigai traffic generator only (terminal 2)
+  --cleanup   Clean up all resources from previous runs
+EOF
+}
+
+# ── Parse arguments ──────────────────────────────────────────────────────────
+MODE=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --server)  MODE="server" ;;
+        --tgen)    MODE="tgen" ;;
+        --cleanup) MODE="cleanup" ;;
+        -h|--help) usage; exit 0 ;;
+        *) err "Unknown option: $1"; usage; exit 1 ;;
+    esac
+    shift
+done
+
 # ── Pre-flight checks ───────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
-[[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
-
-# ── Hugepages ────────────────────────────────────────────────────────────────
-_cur=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
-if (( _cur < 256 )); then
-    echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-    info "Hugepages set to 256 × 2 MB"
+if [[ "$MODE" == "tgen" || -z "$MODE" ]]; then
+    [[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
 fi
-for _node in /sys/devices/system/node/node*/hugepages/hugepages-2048kB/free_hugepages; do
-    [[ -f "$_node" ]] || continue
-    _free=$(cat "$_node"); _ndir=$(dirname "$_node")
-    if (( _free < 64 )); then
-        echo 128 > "$_ndir/nr_hugepages"
-        info "Hugepages on $(basename "$(dirname "$(dirname "$_ndir")")") increased to 128"
-    fi
-done
-rm -f /dev/hugepages/vaigai_* 2>/dev/null || true
+
+# ── Constants ────────────────────────────────────────────────────────────────
+SERVER_IP=10.0.0.2
+NIC_VM=0000:95:00.1
+NIC_IFACE=ens30f1np1
+QAT_PF_VM=0000:0d:00.0
+QAT_PF_VAIGAI=0000:0e:00.0
+INITRAMFS="${INITRAMFS:-/work/firecracker/initramfs-vm.img}"
+ROOTFS_COW=/tmp/1a-rootfs.ext4
+STATE_DIR=/tmp/vaigai-1a
 
 # ── Print traffic & debug commands ───────────────────────────────────────────
 print_traffic_commands() {
@@ -83,75 +104,131 @@ ${BOLD}═══ Monitoring & Debug ═══${NC}
 CMDS
 }
 
-SERVER_IP=10.0.0.2
-NIC_VM=0000:95:00.1
-NIC_IFACE=ens30f1np1
-QAT_PF_VM=0000:0d:00.0
-QAT_PF_VAIGAI=0000:0e:00.0
-INITRAMFS="${INITRAMFS:-/work/firecracker/initramfs-vm.img}"
+# ── Hugepages ────────────────────────────────────────────────────────────────
+setup_hugepages() {
+    local _cur
+    _cur=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
+    if (( _cur < 256 )); then
+        echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+        info "Hugepages set to 256 × 2 MB"
+    fi
+    for _node in /sys/devices/system/node/node*/hugepages/hugepages-2048kB/free_hugepages; do
+        [[ -f "$_node" ]] || continue
+        local _free _ndir
+        _free=$(cat "$_node"); _ndir=$(dirname "$_node")
+        if (( _free < 64 )); then
+            echo 128 > "$_ndir/nr_hugepages"
+            info "Hugepages on $(basename "$(dirname "$(dirname "$_ndir")")") increased to 128"
+        fi
+    done
+    rm -f /dev/hugepages/vaigai_* 2>/dev/null || true
+}
 
-# ── Cleanup function ────────────────────────────────────────────────────────
-ROOTFS_COW=/tmp/1a-rootfs.ext4
-cleanup() {
+# ── Cleanup ──────────────────────────────────────────────────────────────────
+do_cleanup() {
     info "Cleaning up 1A..."
-    [[ -n "${QEMU_PID:-}" ]] && kill "$QEMU_PID" 2>/dev/null
+    if [[ -f "$STATE_DIR/qemu.pid" ]]; then
+        /bin/kill "$(cat "$STATE_DIR/qemu.pid")" 2>/dev/null || true
+    fi
     rm -f "$ROOTFS_COW"
     # Rebind VM NIC back to mlx5_core
     echo "$NIC_VM" > /sys/bus/pci/devices/$NIC_VM/driver/unbind 2>/dev/null || true
     echo "" > /sys/bus/pci/devices/$NIC_VM/driver_override 2>/dev/null || true
     echo "$NIC_VM" > /sys/bus/pci/drivers/mlx5_core/bind 2>/dev/null || true
+    rm -rf "$STATE_DIR"
     ok "1A cleanup done"
 }
-trap cleanup EXIT
 
-# ── Setup: bind VM NIC + QAT PFs to vfio-pci ───────────────────────────────
-modprobe vfio-pci
-modprobe vfio_iommu_type1
+# ── Server: bind NICs + start QEMU VM ────────────────────────────────────────
+start_server() {
+    mkdir -p "$STATE_DIR"
 
-ip link set "$NIC_IFACE" down 2>/dev/null || true
-for DEV in $NIC_VM $QAT_PF_VM $QAT_PF_VAIGAI; do
-    echo "$DEV" > /sys/bus/pci/devices/$DEV/driver/unbind 2>/dev/null || true
-    echo "vfio-pci" > /sys/bus/pci/devices/$DEV/driver_override
-    echo "$DEV" > /sys/bus/pci/drivers/vfio-pci/bind
-done
-info "NICs + QAT bound to vfio-pci"
+    # Bind VM NIC + QAT PFs to vfio-pci
+    modprobe vfio-pci
+    modprobe vfio_iommu_type1
+    ip link set "$NIC_IFACE" down 2>/dev/null || true
+    for DEV in $NIC_VM $QAT_PF_VM $QAT_PF_VAIGAI; do
+        echo "$DEV" > /sys/bus/pci/devices/$DEV/driver/unbind 2>/dev/null || true
+        echo "vfio-pci" > /sys/bus/pci/devices/$DEV/driver_override
+        echo "$DEV" > /sys/bus/pci/drivers/vfio-pci/bind
+    done
+    info "NICs + QAT bound to vfio-pci"
 
-# ── Start QEMU VM ───────────────────────────────────────────────────────────
-# COW copy to avoid corrupting original rootfs
-cp --reflink=auto /work/firecracker/rootfs.ext4 "$ROOTFS_COW"
+    # COW copy of rootfs
+    cp --reflink=auto /work/firecracker/rootfs.ext4 "$ROOTFS_COW"
 
-# setsid + </dev/null to avoid SIGHUP/SIGTTIN when backgrounded
-setsid qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
-    -kernel /boot/vmlinuz-$(uname -r) \
-    -initrd "$INITRAMFS" \
-    -append "console=ttyS0,115200 root=/dev/vda rw quiet net.ifnames=0 biosdevname=0 vaigai_mode=all modprobe.blacklist=qat_dh895xcc,intel_qat" \
-    -drive "file=$ROOTFS_COW,format=raw,if=virtio,cache=unsafe" \
-    -nic user,model=virtio,hostfwd=tcp::2222-:22 \
-    -device "vfio-pci,host=$NIC_VM" \
-    -device "vfio-pci,host=$QAT_PF_VM" \
-    -nographic -no-reboot \
-    </dev/null >/tmp/1a-vm.log 2>&1 &
-sleep 1
-QEMU_PID=$(pgrep -f "1a-rootfs" | head -1)
-info "QEMU started (PID $QEMU_PID, log → /tmp/1a-vm.log)"
+    # setsid + </dev/null to avoid SIGHUP/SIGTTIN when backgrounded
+    setsid qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
+        -kernel /boot/vmlinuz-$(uname -r) \
+        -initrd "$INITRAMFS" \
+        -append "console=ttyS0,115200 root=/dev/vda rw quiet net.ifnames=0 biosdevname=0 vaigai_mode=all modprobe.blacklist=qat_dh895xcc,intel_qat" \
+        -drive "file=$ROOTFS_COW,format=raw,if=virtio,cache=unsafe" \
+        -nic user,model=virtio,hostfwd=tcp::2222-:22 \
+        -device "vfio-pci,host=$NIC_VM" \
+        -device "vfio-pci,host=$QAT_PF_VM" \
+        -nographic -no-reboot \
+        </dev/null >/tmp/1a-vm.log 2>&1 &
+    sleep 1
+    local QEMU_PID
+    QEMU_PID=$(pgrep -f "1a-rootfs" | head -1)
+    echo "$QEMU_PID" > "$STATE_DIR/qemu.pid"
+    info "QEMU started (PID $QEMU_PID, log → /tmp/1a-vm.log)"
 
-# ── Post-boot setup ─────────────────────────────────────────────────────────
-info "Waiting for VM to boot (15s)..."
-sleep 15
-# The VM init script (vaigai_mode=all) auto-configures eth1 (passthrough NIC)
-# with 10.0.0.2/24 and starts services. Just verify:
-ssh -o StrictHostKeyChecking=no -p 2222 root@localhost '
-    # Ensure passthrough NIC has the test IP
-    ip addr show eth1 | grep -q 10.0.0.2 || ip addr add 10.0.0.2/24 dev eth1
-    ip link set eth1 up
-    ss -tlnp | grep -E "5000|5001|5002|443|4433|80"
-'
-ok "VM server running at $SERVER_IP"
+    # Post-boot setup
+    info "Waiting for VM to boot (15s)..."
+    sleep 15
+    ssh -o StrictHostKeyChecking=no -p 2222 root@localhost '
+        ip addr show eth1 | grep -q 10.0.0.2 || ip addr add 10.0.0.2/24 dev eth1
+        ip link set eth1 up
+        ss -tlnp | grep -E "5000|5001|5002|443|4433|80"
+    '
+    ok "VM server running at $SERVER_IP"
+    info "SSH into VM: ssh -o StrictHostKeyChecking=no -p 2222 root@localhost"
+}
 
-# ── Start vaigai ─────────────────────────────────────────────────────────────
-info "Starting vaigai (interactive — Ctrl+C or 'quit' to exit)..."
-echo ""
-print_traffic_commands "$SERVER_IP"
-echo ""
+# ── Tgen: vaigai on mlx5 ────────────────────────────────────────────────────
+start_tgen() {
+    # Verify server VM is running
+    if [[ -f "$STATE_DIR/qemu.pid" ]]; then
+        local qpid
+        qpid=$(cat "$STATE_DIR/qemu.pid")
+        if ! /bin/kill -0 "$qpid" 2>/dev/null; then
+            err "QEMU (PID $qpid) is not running — run --server first"
+            exit 1
+        fi
+    else
+        warn "No state from --server found; assuming VM is already running"
+    fi
 
-"$VAIGAI_BIN" -l 14-15 -n 4 -a 0000:95:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
+    info "Starting vaigai (interactive — Ctrl+C or 'quit' to exit)..."
+    echo ""
+    print_traffic_commands "$SERVER_IP"
+    echo ""
+
+    "$VAIGAI_BIN" -l 14-15 -n 4 -a 0000:95:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+case "$MODE" in
+    server)
+        setup_hugepages
+        trap do_cleanup EXIT
+        start_server
+        ok "Server running. Press Ctrl+C to stop and clean up."
+        ok "SSH into VM: ssh -o StrictHostKeyChecking=no -p 2222 root@localhost"
+        sleep infinity
+        ;;
+    tgen)
+        setup_hugepages
+        start_tgen
+        ;;
+    cleanup)
+        do_cleanup
+        ;;
+    "")
+        setup_hugepages
+        trap do_cleanup EXIT
+        start_server
+        start_tgen
+        ;;
+esac
