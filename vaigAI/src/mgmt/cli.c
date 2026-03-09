@@ -765,6 +765,35 @@ cmd_start(int argc, char **argv)
                    wm->tcp_retransmit, wm->tx_pkts, wm->rx_pkts);
         }
     }
+
+    /* --one: implicit stop + reset so the user can immediately start
+     * another test without a manual "stop" / "reset" cycle. */
+    if (a.one) {
+        config_update_t stop_cmd;
+        memset(&stop_cmd, 0, sizeof(stop_cmd));
+        stop_cmd.cmd = CFG_CMD_STOP;
+        stop_cmd.seq = 2;
+        tgen_ipc_broadcast(&stop_cmd);
+
+        /* Brief pause so workers process the stop. */
+        rte_delay_ms(50);
+
+        /* Send RSTs for any open TCBs, then reset stores + metrics. */
+        for (uint32_t w = 0; w < n_workers; w++) {
+            tcb_store_t *store = &g_tcb_stores[w];
+            for (uint32_t i = 0; i < store->capacity; i++) {
+                tcb_t *tcb = &store->tcbs[i];
+                if (tcb->in_use)
+                    tcp_fsm_reset(w, tcb);
+            }
+        }
+        rte_delay_ms(100);
+        for (uint32_t w = 0; w < n_workers; w++) {
+            tcb_store_reset(&g_tcb_stores[w]);
+            tcp_port_pool_reset(w);
+        }
+        metrics_reset(n_workers);
+    }
 }
 
 static void
