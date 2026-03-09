@@ -60,6 +60,12 @@ int export_stat_summary(const cpu_stats_snapshot_t *cpu,
 int export_net_core_text(const metrics_snapshot_t *snap, uint32_t core,
                          char *buf, size_t len);
 
+/**
+ * Render aggregated network metrics as human-readable text grouped by protocol.
+ * Sections with all-zero counters are omitted for clarity.
+ */
+int export_net_text(const metrics_snapshot_t *snap, char *buf, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

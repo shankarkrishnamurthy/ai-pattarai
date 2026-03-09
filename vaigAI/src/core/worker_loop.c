@@ -31,8 +31,9 @@
 volatile int      g_run = 0;
 /* g_traffic: 1 = traffic generation active, 0 = paused/idle.
  * Distinct from g_run (process lifecycle): stop/start via REST/CLI
- * toggle g_traffic only; g_run=0 means the whole process should exit. */
-volatile int      g_traffic = 0;
+ * toggle g_traffic only; g_run=0 means the whole process should exit.
+ * Atomic because REST thread writes from MHD_USE_INTERNAL_POLLING_THREAD. */
+_Atomic int       g_traffic = 0;
 worker_ctx_t      g_worker_ctx[TGEN_MAX_WORKERS];
 
 /* ── TX drain helper ─────────────────────────────────────────────────────── */

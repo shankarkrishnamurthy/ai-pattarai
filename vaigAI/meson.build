@@ -121,6 +121,7 @@ mgmt_src = files(
   'src/mgmt/cli.c',
   'src/mgmt/cli_server.c',
   'src/mgmt/cli_client.c',
+  'src/mgmt/mgmt_loop.c',
   'src/mgmt/rest.c',
 )
 

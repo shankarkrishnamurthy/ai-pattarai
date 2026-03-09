@@ -5,6 +5,7 @@
 #include "histogram.h"
 #include "cpu_stats.h"
 #include "mem_stats.h"
+#include "../mgmt/mgmt_loop.h"
 #include "../core/core_assign.h"
 #include "../core/worker_loop.h"
 #include "../net/tcp_tcb.h"
@@ -13,7 +14,9 @@
 #include <stdarg.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdbool.h>
 #include <rte_ethdev.h>
+#include <rte_lcore.h>
 
 /* ------------------------------------------------------------------ */
 /* JSON export (compact, for REST API / machine consumption)            */
@@ -413,6 +416,26 @@ export_cpu_text(const cpu_stats_snapshot_t *snap, int core,
     p = append(buf, len, p,
         "──────────────────────────────────────────────────────────────────\n");
 
+    /* Management core row */
+    if (core < 0) {
+        const mgmt_cpu_stats_t *ms = &g_mgmt_cpu_stats;
+        if (ms->cycles_total > 0) {
+            double mt = (double)ms->cycles_total;
+            double cli_pct   = (double)ms->cycles_cli   / mt * 100.0;
+            double proto_pct = (double)ms->cycles_proto  / mt * 100.0;
+            double bg_pct    = (double)ms->cycles_bg     / mt * 100.0;
+            double idle_pct  = (double)ms->cycles_idle   / mt * 100.0;
+            double busy_pct  = (1.0 - (double)ms->cycles_idle / mt) * 100.0;
+            p = append(buf, len, p,
+                "Mgmt   %-6u %-7u mgmt     %5.1f   %5.1f  %5.1f  %5.1f   %5.1f\n"
+                "       (columns: Busy / CLI / Proto / BG / Idle)\n",
+                rte_lcore_id(), rte_socket_id(),
+                busy_pct, cli_pct, proto_pct, bg_pct, idle_pct);
+            p = append(buf, len, p,
+                "──────────────────────────────────────────────────────────────────\n");
+        }
+    }
+
     if (active > 1 && core < 0) {
         double t = (double)tot_total;
         if (t > 0) {
@@ -435,6 +458,13 @@ export_cpu_text(const cpu_stats_snapshot_t *snap, int core,
         double secs = (double)cs->cycles_total / (double)hz;
         uint64_t lps = secs > 0 ? (uint64_t)((double)cs->loop_count / secs) : 0;
         p = append(buf, len, p, " W%u=%s/s", w, fmt_loops(lps, tmp, sizeof(tmp)));
+    }
+    /* Mgmt loop rate */
+    if (core < 0 && g_mgmt_cpu_stats.cycles_total > 0) {
+        double msecs = (double)g_mgmt_cpu_stats.cycles_total / (double)hz;
+        uint64_t mlps = msecs > 0
+            ? (uint64_t)((double)g_mgmt_cpu_stats.loop_count / msecs) : 0;
+        p = append(buf, len, p, " Mgmt=%s/s", fmt_loops(mlps, tmp, sizeof(tmp)));
     }
 
     /* Uptime */
@@ -735,6 +765,169 @@ export_net_core_text(const metrics_snapshot_t *snap, uint32_t core,
                        total, store->capacity);
         }
     }
+
+    return p;
+}
+
+/* ================================================================== */
+/* Aggregated network stats — grouped by protocol layer                */
+/* ================================================================== */
+int
+export_net_text(const metrics_snapshot_t *snap, char *buf, size_t len)
+{
+    const worker_metrics_t *t = &snap->total;
+    int p = 0;
+    char tmp1[32], tmp2[32], tmp3[32];
+
+    /* ── Ethernet (L2) ─────────────────────────────────────────────── */
+    p = append(buf, len, p,
+        "\n── Ethernet ─────────────────────────────────────────────\n");
+    p = append(buf, len, p,
+        "  TX packets: %-14s  TX bytes: %s\n",
+        fmt_loops(t->tx_pkts, tmp1, sizeof(tmp1)),
+        fmt_bytes(t->tx_bytes, tmp2, sizeof(tmp2)));
+    p = append(buf, len, p,
+        "  RX packets: %-14s  RX bytes: %s\n",
+        fmt_loops(t->rx_pkts, tmp1, sizeof(tmp1)),
+        fmt_bytes(t->rx_bytes, tmp2, sizeof(tmp2)));
+
+    /* ── IPv4 (L3) ─────────────────────────────────────────────────── */
+    if (t->ip_bad_cksum || t->ip_frag_dropped || t->ip_not_for_us) {
+        p = append(buf, len, p,
+            "\n── IPv4 ─────────────────────────────────────────────────\n");
+        p = append(buf, len, p,
+            "  Bad checksum:  %-10"PRIu64"  Frags dropped: %"PRIu64"\n",
+            t->ip_bad_cksum, t->ip_frag_dropped);
+        if (t->ip_not_for_us)
+            p = append(buf, len, p,
+                "  Not for us:    %"PRIu64"\n", t->ip_not_for_us);
+    }
+
+    /* ── ARP ───────────────────────────────────────────────────────── */
+    if (t->arp_reply_tx || t->arp_request_tx || t->arp_miss) {
+        p = append(buf, len, p,
+            "\n── ARP ──────────────────────────────────────────────────\n"
+            "  Replies TX:    %-10"PRIu64"  Requests TX:   %"PRIu64"\n",
+            t->arp_reply_tx, t->arp_request_tx);
+        if (t->arp_miss)
+            p = append(buf, len, p,
+                "  Cache miss:    %"PRIu64" ⚠\n", t->arp_miss);
+    }
+
+    /* ── ICMP ──────────────────────────────────────────────────────── */
+    if (t->icmp_echo_tx || t->icmp_bad_cksum || t->icmp_unreachable_tx) {
+        p = append(buf, len, p,
+            "\n── ICMP ─────────────────────────────────────────────────\n"
+            "  Echo TX:       %-10"PRIu64"  Unreachable TX: %"PRIu64"\n",
+            t->icmp_echo_tx, t->icmp_unreachable_tx);
+        if (t->icmp_bad_cksum)
+            p = append(buf, len, p,
+                "  Bad checksum:  %"PRIu64" ⚠\n", t->icmp_bad_cksum);
+    }
+
+    /* ── UDP (L4) ──────────────────────────────────────────────────── */
+    if (t->udp_tx || t->udp_rx || t->udp_bad_cksum) {
+        p = append(buf, len, p,
+            "\n── UDP ──────────────────────────────────────────────────\n"
+            "  TX:            %-10"PRIu64"  RX:            %"PRIu64"\n",
+            t->udp_tx, t->udp_rx);
+        if (t->udp_bad_cksum)
+            p = append(buf, len, p,
+                "  Bad checksum:  %"PRIu64" ⚠\n", t->udp_bad_cksum);
+    }
+
+    /* ── TCP (L4) ──────────────────────────────────────────────────── */
+    if (t->tcp_syn_sent || t->tcp_conn_open || t->tcp_payload_tx ||
+        t->tcp_payload_rx) {
+        p = append(buf, len, p,
+            "\n── TCP ──────────────────────────────────────────────────\n"
+            "  Conn open:     %-10"PRIu64"  Conn close:    %"PRIu64"\n"
+            "  SYN sent:      %-10"PRIu64"  Retransmits:   %"PRIu64"\n",
+            t->tcp_conn_open, t->tcp_conn_close,
+            t->tcp_syn_sent, t->tcp_retransmit);
+        if (t->tcp_reset_rx || t->tcp_reset_sent)
+            p = append(buf, len, p,
+                "  RST received:  %-10"PRIu64"  RST sent:      %"PRIu64"\n",
+                t->tcp_reset_rx, t->tcp_reset_sent);
+        if (t->tcp_bad_cksum)
+            p = append(buf, len, p,
+                "  Bad checksum:  %"PRIu64" ⚠\n", t->tcp_bad_cksum);
+        if (t->tcp_syn_queue_drops)
+            p = append(buf, len, p,
+                "  SYN queue drops: %"PRIu64" ⚠\n", t->tcp_syn_queue_drops);
+        if (t->tcp_ooo_pkts || t->tcp_duplicate_acks)
+            p = append(buf, len, p,
+                "  Out-of-order:  %-10"PRIu64"  Dup ACKs:      %"PRIu64"\n",
+                t->tcp_ooo_pkts, t->tcp_duplicate_acks);
+        if (t->tcp_payload_tx || t->tcp_payload_rx)
+            p = append(buf, len, p,
+                "  Payload TX:    %-10s  Payload RX:    %s\n",
+                fmt_bytes(t->tcp_payload_tx, tmp1, sizeof(tmp1)),
+                fmt_bytes(t->tcp_payload_rx, tmp2, sizeof(tmp2)));
+    }
+
+    /* ── TLS (L5) ──────────────────────────────────────────────────── */
+    if (t->tls_handshake_ok || t->tls_handshake_fail ||
+        t->tls_records_tx || t->tls_records_rx) {
+        p = append(buf, len, p,
+            "\n── TLS ──────────────────────────────────────────────────\n"
+            "  Handshake OK:  %-10"PRIu64"  Handshake fail: %"PRIu64,
+            t->tls_handshake_ok, t->tls_handshake_fail);
+        if (t->tls_handshake_fail)
+            p = append(buf, len, p, " ⚠");
+        p = append(buf, len, p, "\n");
+        if (t->tls_records_tx || t->tls_records_rx)
+            p = append(buf, len, p,
+                "  Records TX:    %-10"PRIu64"  Records RX:    %"PRIu64"\n",
+                t->tls_records_tx, t->tls_records_rx);
+    }
+
+    /* ── HTTP (L7) ─────────────────────────────────────────────────── */
+    if (t->http_req_tx || t->http_rsp_rx) {
+        p = append(buf, len, p,
+            "\n── HTTP ─────────────────────────────────────────────────\n"
+            "  Requests TX:   %-10"PRIu64"  Responses RX:  %"PRIu64"\n",
+            t->http_req_tx, t->http_rsp_rx);
+        bool has_codes = t->http_rsp_1xx || t->http_rsp_2xx ||
+                         t->http_rsp_3xx || t->http_rsp_4xx ||
+                         t->http_rsp_5xx;
+        if (has_codes) {
+            p = append(buf, len, p, "  Status codes:  ");
+            if (t->http_rsp_1xx) p = append(buf, len, p, "1xx:%-6"PRIu64" ", t->http_rsp_1xx);
+            if (t->http_rsp_2xx) p = append(buf, len, p, "2xx:%-6"PRIu64" ", t->http_rsp_2xx);
+            if (t->http_rsp_3xx) p = append(buf, len, p, "3xx:%-6"PRIu64" ", t->http_rsp_3xx);
+            if (t->http_rsp_4xx) p = append(buf, len, p, "4xx:%-6"PRIu64" ⚠ ", t->http_rsp_4xx);
+            if (t->http_rsp_5xx) p = append(buf, len, p, "5xx:%-6"PRIu64" ⚠ ", t->http_rsp_5xx);
+            p = append(buf, len, p, "\n");
+        }
+        if (t->http_parse_err)
+            p = append(buf, len, p,
+                "  Parse errors:  %"PRIu64" ⚠\n", t->http_parse_err);
+    }
+
+    /* ── Latency ───────────────────────────────────────────────────── */
+    uint64_t p50 = hist_percentile(&snap->latency, 50.0);
+    uint64_t p95 = hist_percentile(&snap->latency, 95.0);
+    uint64_t p99 = hist_percentile(&snap->latency, 99.0);
+    if (p50 || p95 || p99) {
+        p = append(buf, len, p,
+            "\n── Latency ──────────────────────────────────────────────\n"
+            "  p50: %-10s  p95: %-10s  p99: %s\n",
+            fmt_lat(p50, tmp1, sizeof(tmp1)),
+            fmt_lat(p95, tmp2, sizeof(tmp2)),
+            fmt_lat(p99, tmp3, sizeof(tmp3)));
+        if (snap->latency.total_count > 0) {
+            uint64_t avg = snap->latency.total_sum_us / snap->latency.total_count;
+            p = append(buf, len, p,
+                "  min: %-10s  avg: %-10s  max: %s  (%"PRIu64" samples)\n",
+                fmt_lat(snap->latency.min_us, tmp1, sizeof(tmp1)),
+                fmt_lat(avg, tmp2, sizeof(tmp2)),
+                fmt_lat(snap->latency.max_us, tmp3, sizeof(tmp3)),
+                snap->latency.total_count);
+        }
+    }
+
+    p = append(buf, len, p, "\nWorkers: %u\n", snap->n_workers);
 
     return p;
 }

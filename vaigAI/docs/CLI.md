@@ -106,7 +106,11 @@ vaigai> ping 10.0.0.2 10 128 500
 
 ## start
 
-Start traffic generation toward a destination.
+Start traffic generation toward a destination.  In interactive mode
+(TTY), the command returns immediately and traffic runs in the background.
+Use `stat` to monitor progress and `stop` to abort early.  In pipe mode
+(stdin is not a TTY), `start` blocks until the traffic duration completes
+for backward compatibility with scripts.
 
 ```
 start --ip <addr> --port <N> --duration <secs> [options]

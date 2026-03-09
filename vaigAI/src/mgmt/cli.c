@@ -4,6 +4,7 @@
 #include "cli.h"
 #include "cli_server.h"
 #include "config_mgr.h"
+#include "mgmt_loop.h"
 #include "../net/icmp.h"
 #include "../net/udp.h"
 #include "../net/arp.h"
@@ -589,6 +590,12 @@ cmd_start(int argc, char **argv)
     if (!a.has_duration) { printf("start: --duration is required (or use --one)\n%s", start_usage()); return; }
     if (a.duration == 0) { printf("start: --duration must be > 0\n");  return; }
 
+    /* Reject if traffic already running */
+    if (g_traffic_state.active) {
+        printf("start: traffic generation already active — run 'stop' first\n");
+        return;
+    }
+
     /* Parse destination IP */
     uint32_t dst_ip;
     if (tgen_parse_ipv4(a.ip, &dst_ip) < 0) {
@@ -669,6 +676,7 @@ cmd_start(int argc, char **argv)
                                        n_rxq);
     }
 
+    /* ── Broadcast START command to all workers ───────────────────── */
     config_update_t cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmd = CFG_CMD_START;
@@ -676,6 +684,7 @@ cmd_start(int argc, char **argv)
     memcpy(cmd.payload, &gcfg, sizeof(gcfg));
     tgen_ipc_broadcast(&cmd);
 
+    /* ── Print initial progress ──────────────────────────────────────── */
     if (a.reuse) {
         printf("Traffic %s → %s:%u  streams=%u  duration=%us%s\n",
                a.proto, a.ip, a.port, a.streams, a.duration,
@@ -691,146 +700,80 @@ cmd_start(int argc, char **argv)
                a.duration, a.tls ? " [TLS]" : "");
     }
 
-    /* ── Wait for duration (live progress on TTY) ───────────────────── */
-    bool is_tty = isatty(STDOUT_FILENO);
-    for (uint32_t s = 0; s < a.duration; s++) {
-        for (int tick = 0; tick < 10; tick++) {
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 };
-            nanosleep(&ts, NULL);
-            arp_mgmt_tick();
-            pktrace_flush();
-            /* Allow remote CLI clients to run commands (e.g. stat)
-             * while traffic generation is active. */
-            cli_server_poll(dispatch);
-            if (!g_run) break;
+    /* ── Set up async traffic gen state ──────────────────────────────── */
+    traffic_gen_state_t tgs;
+    memset(&tgs, 0, sizeof(tgs));
+    tgs.one_shot   = a.one;
+    tgs.reuse      = a.reuse;
+    tgs.is_tty     = isatty(STDOUT_FILENO);
+    tgs.duration_s = a.duration;
+    tgs.n_workers  = n_workers;
+    tgs.port_id    = port_id;
+    tgs.rate       = a.rate;
+    tgs.size       = a.size;
+    tgs.tls        = a.tls;
+    tgs.streams    = a.streams;
+    strncpy(tgs.proto, a.proto, sizeof(tgs.proto) - 1);
 
-            /* --one: exit early once the full transaction lifecycle
-             * is complete (handshake + data + graceful close). */
-            if (a.one) {
+    /* Pipe mode: keep blocking behavior for scripts that expect start
+     * to block until completion (e.g. `echo "start ..." | vaigai`). */
+    bool pipe_mode = !isatty(STDIN_FILENO);
+    if (pipe_mode) {
+        mgmt_traffic_start(&tgs);
+        while (g_traffic_state.active && g_run) {
+            arp_mgmt_tick();
+            icmp_mgmt_tick();
+            pktrace_flush();
+            cli_server_poll(dispatch);
+            /* Check completion inline */
+            uint64_t now = rte_rdtsc();
+            uint64_t hz  = rte_get_tsc_hz();
+            uint64_t elapsed_s = (now - g_traffic_state.start_tsc) / hz;
+            if (elapsed_s >= g_traffic_state.duration_s) {
+                mgmt_traffic_stop();
+                break;
+            }
+            if (g_traffic_state.one_shot) {
                 metrics_snapshot_t ms;
                 metrics_snapshot(&ms, n_workers);
                 bool done = false;
-                if (strcmp(a.proto, "icmp") == 0 || strcmp(a.proto, "udp") == 0)
+                if (strcmp(a.proto, "icmp") == 0 ||
+                    strcmp(a.proto, "udp") == 0)
                     done = (ms.total.tx_pkts >= 1);
-                else if (strcmp(a.proto, "http") == 0 || strcmp(a.proto, "https") == 0)
+                else if (strcmp(a.proto, "http") == 0 ||
+                         strcmp(a.proto, "https") == 0)
                     done = (ms.total.http_rsp_rx >= 1 &&
                             ms.total.tcp_conn_close >= 1);
-                else /* tcp, tls */
+                else
                     done = (ms.total.tcp_conn_close >= 1);
-                if (done) { s = a.duration; break; }
+                if (done) { mgmt_traffic_stop(); break; }
             }
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
+            nanosleep(&ts, NULL);
         }
-        if (!g_run) break;
-        if (is_tty && !a.reuse && !a.one) {
-            metrics_snapshot_t snap;
-            metrics_snapshot(&snap, n_workers);
-            printf("\r  [%u/%us] %" PRIu64 " pkts",
-                   s + 1, a.duration, snap.total.tx_pkts);
-            fflush(stdout);
-        }
+        return;
     }
 
-    /* Grace period */
-    struct timespec grace = { .tv_sec = a.reuse ? 1 : 0,
-                              .tv_nsec = a.reuse ? 0 : 100000000 };
-    nanosleep(&grace, NULL);
-    if (is_tty && !a.reuse) printf("\n");
-
-    /* ── Snapshot results ───────────────────────────────────────────── */
-    metrics_snapshot_t snap;
-    metrics_snapshot(&snap, n_workers);
-
-    if (a.reuse) {
-        uint64_t total_bytes = snap.total.tcp_payload_tx;
-        double   mbps = (double)total_bytes * 8.0 / ((double)a.duration * 1e6);
-        double   mb   = (double)total_bytes / (1024.0 * 1024.0);
-        printf("[SUM]  0.00-%.2fs    %.0f MB       %.1f Mbps\n",
-               (double)a.duration, mb, mbps);
-    } else {
-        printf("\n--- traffic statistics ---\n"
-               "Protocol: %s, Duration: %us, Rate: %s\n"
-               "%" PRIu64 " packets transmitted\n",
-               a.proto, a.duration,
-               a.rate ? "limited" : "unlimited",
-               snap.total.tx_pkts);
-        if (a.duration > 0 && snap.total.tx_pkts > 0) {
-            double pps = (double)snap.total.tx_pkts / (double)a.duration;
-            printf("Throughput: %.1f pps\n", pps);
-        }
-    }
-    /* Human-readable summary with status, rates, warnings */
-    char summary[8192];
-    export_summary(&snap, a.duration, a.proto, summary, sizeof(summary));
-    puts(summary);
-
-    /* NIC-level stats for diagnosis */
-    struct rte_eth_stats nic;
-    if (rte_eth_stats_get(port_id, &nic) == 0) {
-        printf("\n--- NIC stats (port %u) ---\n", port_id);
-        printf("  opackets: %" PRIu64 "  ipackets: %" PRIu64 "\n",
-               nic.opackets, nic.ipackets);
-        printf("  obytes:   %" PRIu64 "  ibytes:   %" PRIu64 "\n",
-               nic.obytes, nic.ibytes);
-        printf("  imissed:  %" PRIu64 "  ierrors:  %" PRIu64
-               "  oerrors:  %" PRIu64 "\n",
-               nic.imissed, nic.ierrors, nic.oerrors);
-        for (uint32_t q = 0; q < n_workers; q++)
-            printf("  q%u: rx=%" PRIu64 " tx=%" PRIu64 "\n",
-                   q, nic.q_ipackets[q], nic.q_opackets[q]);
-    }
-
-    /* Per-worker TCP counters */
-    if (n_workers > 1) {
-        printf("\n--- per-worker TCP ---\n");
-        for (uint32_t w = 0; w < n_workers; w++) {
-            const worker_metrics_t *wm = &snap.per_worker[w];
-            printf("  w%u: syn=%"PRIu64" open=%"PRIu64" retx=%"PRIu64
-                   " tx=%"PRIu64" rx=%"PRIu64"\n",
-                   w, wm->tcp_syn_sent, wm->tcp_conn_open,
-                   wm->tcp_retransmit, wm->tx_pkts, wm->rx_pkts);
-        }
-    }
-
-    /* --one: implicit stop + reset so the user can immediately start
-     * another test without a manual "stop" / "reset" cycle. */
-    if (a.one) {
-        config_update_t stop_cmd;
-        memset(&stop_cmd, 0, sizeof(stop_cmd));
-        stop_cmd.cmd = CFG_CMD_STOP;
-        stop_cmd.seq = 2;
-        tgen_ipc_broadcast(&stop_cmd);
-
-        /* Brief pause so workers process the stop. */
-        rte_delay_ms(50);
-
-        /* Send RSTs for any open TCBs, then reset stores + metrics. */
-        for (uint32_t w = 0; w < n_workers; w++) {
-            tcb_store_t *store = &g_tcb_stores[w];
-            for (uint32_t i = 0; i < store->capacity; i++) {
-                tcb_t *tcb = &store->tcbs[i];
-                if (tcb->in_use)
-                    tcp_fsm_reset(w, tcb);
-            }
-        }
-        rte_delay_ms(100);
-        for (uint32_t w = 0; w < n_workers; w++) {
-            tcb_store_reset(&g_tcb_stores[w]);
-            tcp_port_pool_reset(w);
-        }
-        metrics_reset(n_workers);
-    }
+    /* Interactive mode: non-blocking — return to prompt immediately */
+    mgmt_traffic_start(&tgs);
+    printf("(running in background — use 'stat' to monitor, 'stop' to abort)\n");
 }
 
 static void
 cmd_stop_gen(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    config_update_t cmd;
-    memset(&cmd, 0, sizeof(cmd));
-    cmd.cmd = CFG_CMD_STOP;
-    cmd.seq = 2;
-    tgen_ipc_broadcast(&cmd);
-    printf("Traffic generation stopped.\n");
+    if (g_traffic_state.active) {
+        mgmt_traffic_stop();
+        printf("Traffic generation stopped.\n");
+    } else {
+        config_update_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.cmd = CFG_CMD_STOP;
+        cmd.seq = 2;
+        tgen_ipc_broadcast(&cmd);
+        printf("Traffic generation stopped.\n");
+    }
 }
 
 /* ── Reset all TCP state ─────────────────────────────────────────────────── */
@@ -958,17 +901,6 @@ cmd_show(int argc, char **argv)
     }
 }
 
-/* ── Management tick: runs ARP + ICMP + pktrace flush + remote CLI ────────── */
-static int
-mgmt_tick(void)
-{
-    arp_mgmt_tick();
-    icmp_mgmt_tick();
-    pktrace_flush();
-    cli_server_poll(dispatch);
-    return 0;
-}
-
 /* ------------------------------------------------------------------ */
 /* Public API                                                           */
 /* ------------------------------------------------------------------ */
@@ -1017,8 +949,6 @@ dispatch(char *line)
 void
 cli_run(void)
 {
-    extern volatile int g_run;
-
     /* Register built-ins */
     cli_register("help",     "Show this help",           cmd_help);
     cli_register("stat",     "Statistics: stat [cpu|mem|net|port] [--rate] [--watch] [--core N]", cmd_stat);
@@ -1033,66 +963,8 @@ cli_run(void)
     /* Start CLI socket server for remote attach */
     cli_server_init(NULL);
 
-    /* Detect daemon mode: stdin is /dev/null (char device, non-tty).
-     * When launched as a background daemon (nohup ... </dev/null),
-     * skip the interactive loop and block until g_run becomes 0.
-     * When stdin is a pipe (subprocess.run with input=), process normally. */
-    struct stat st_in;
-    if (fstat(STDIN_FILENO, &st_in) == 0 && S_ISCHR(st_in.st_mode) &&
-        !isatty(STDIN_FILENO)) {
-        TGEN_INFO(TGEN_LOG_MGMT,
-                  "stdin is /dev/null — running in headless mode "
-                  "(send SIGTERM to stop, or use vaigai --attach)\n");
-        while (g_run) {
-            arp_mgmt_tick();
-            icmp_mgmt_tick();
-            pktrace_flush();
-            cli_server_poll(dispatch);
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100 ms */
-            nanosleep(&ts, NULL);
-        }
-        cli_server_destroy();
-        return;
-    }
-
-    const char *prompt = "vaigai> ";
-    if (isatty(STDIN_FILENO))
-        printf("vaigai CLI  (type 'help' for commands, 'quit' to exit)\n");
-
-#ifdef HAVE_READLINE
-    rl_bind_key('\t', rl_complete);
-    /* Process ARP + remote clients while readline waits for input */
-    rl_event_hook = (rl_hook_func_t *)mgmt_tick;
-    char *line;
-    while ((line = readline(prompt)) != NULL) {
-        if (*line) add_history(line);
-        if (strcmp(line, "quit") == 0 || strcmp(line, "exit") == 0) {
-            free(line); break;
-        }
-        dispatch(line);
-        free(line);
-    }
-#else
-    char buf[1024];
-    for (;;) {
-        printf("%s", prompt);
-        fflush(stdout);
-        /* Poll stdin with short timeout, calling arp_mgmt_tick while idle.
-         * Without this, incoming ARP requests pile up unprocessed when
-         * no tps command is active. */
-        struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
-        while (poll(&pfd, 1, 10 /* ms */) == 0) {
-            arp_mgmt_tick();
-            icmp_mgmt_tick();
-            pktrace_flush();
-            cli_server_poll(dispatch);
-        }
-        if (!fgets(buf, sizeof(buf), stdin)) break;
-        buf[strcspn(buf, "\n")] = '\0';
-        if (strcmp(buf, "quit") == 0 || strcmp(buf, "exit") == 0) break;
-        dispatch(buf);
-    }
-#endif
+    /* Delegate to the cooperative event loop */
+    mgmt_loop_run(dispatch);
 
     cli_server_destroy();
 }

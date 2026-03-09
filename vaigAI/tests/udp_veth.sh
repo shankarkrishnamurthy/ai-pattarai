@@ -188,8 +188,8 @@ else
                    --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
 fi
 
-# Extract vaigai counters
-VAIGAI_TX=$(echo "$OUTPUT" | grep -oP '"udp_tx": \K[0-9]+' || echo "0")
+# Extract vaigai counters (text format: "  udp_tx: 1031")
+VAIGAI_TX=$(echo "$OUTPUT" | grep -oP 'udp_tx:\s*\K[0-9]+' || echo "0")
 VAIGAI_PKTS=$(echo "$OUTPUT" | grep -oP '^\d+(?= packets transmitted)' || echo "0")
 
 sleep 0.2  # kernel may lag slightly

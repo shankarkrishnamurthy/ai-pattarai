@@ -17,7 +17,7 @@ extern "C" {
 /** Global run flag — cleared by management to stop all workers. */
 extern volatile int g_run;
 /** Traffic flag — set by /start, cleared by /stop; process stays alive. */
-extern volatile int g_traffic;
+extern _Atomic int g_traffic;
 
 /** Per-worker context (one per worker lcore). */
 typedef struct {
