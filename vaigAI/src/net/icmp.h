@@ -21,6 +21,9 @@ void icmp_input(uint32_t worker_idx, struct rte_mbuf *m);
 /** Management: process one ICMP frame; may generate a reply. */
 void icmp_mgmt_process(uint16_t port_id, struct rte_mbuf *m);
 
+/** Management: periodic tick — drain ICMP rings and respond to echo requests. */
+void icmp_mgmt_tick(void);
+
 /** Management: send ICMP Destination Unreachable (code 2 or 3). */
 int icmp_send_unreachable(uint16_t port_id, uint8_t code,
                            struct rte_mbuf *orig_m);
@@ -28,9 +31,13 @@ int icmp_send_unreachable(uint16_t port_id, uint8_t code,
 /** Management: send ICMP Time Exceeded (type 11, code 0). */
 int icmp_send_time_exceeded(uint16_t port_id, struct rte_mbuf *orig_m);
 
-/** Management: ping client — sends Echo Requests; returns sent count. */
+/** Management: ping client — sends Echo Requests; returns sent count.
+ *  @param poll_fn  Optional callback invoked during wait loops to allow
+ *                  concurrent command processing (e.g., remote CLI stat). */
+typedef void (*icmp_mgmt_poll_fn)(void);
 int icmp_ping_start(uint16_t port_id, uint32_t dst_ip_net,
-                    uint32_t count, uint32_t size, uint32_t interval_ms);
+                    uint32_t count, uint32_t size, uint32_t interval_ms,
+                    icmp_mgmt_poll_fn poll_fn);
 
 /** Management: drain ICMP ring; returns one mbuf reply or NULL. */
 struct rte_mbuf *icmp_mgmt_drain(uint16_t port_id);

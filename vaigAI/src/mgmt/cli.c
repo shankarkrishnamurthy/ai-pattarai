@@ -407,6 +407,14 @@ cmd_trace(int argc, char **argv)
     }
 }
 
+/* Callback for icmp_ping_start to allow remote CLI during ping */
+static void
+ping_poll_cb(void)
+{
+    pktrace_flush();
+    cli_server_poll(dispatch);
+}
+
 static void
 cmd_ping(int argc, char **argv)
 {
@@ -424,7 +432,7 @@ cmd_ping(int argc, char **argv)
     uint32_t interval_ms = (argc >= 5) ? (uint32_t)strtoul(argv[4], NULL, 10) : 1000;
     uint16_t port_id     = 0; /* always use port 0 for diagnostic ping */
     printf("PING %s: %u bytes of data, %u packet(s)\n", argv[1], size, count);
-    icmp_ping_start(port_id, dst_ip, count, size, interval_ms);
+    icmp_ping_start(port_id, dst_ip, count, size, interval_ms, ping_poll_cb);
 }
 
 /* ------------------------------------------------------------------ */
@@ -444,6 +452,7 @@ typedef struct {
     uint32_t    streams;
     bool        reuse;
     bool        tls;
+    bool        one;        /* --one: single request/handshake/connection */
     bool        has_ip;
     bool        has_port;
     bool        has_duration;
@@ -456,7 +465,8 @@ start_usage(void)
            "             [--proto tcp|http|https|udp|icmp|tls]\n"
            "             [--rate <pps>] [--size <bytes>]\n"
            "             [--reuse] [--streams <N>]\n"
-           "             [--url <path>] [--host <name>] [--tls]\n";
+           "             [--url <path>] [--host <name>] [--tls]\n"
+           "             [--one]  (single request; mutually exclusive with --duration/--rate)\n";
 }
 
 static int
@@ -491,6 +501,8 @@ parse_start_args(int argc, char **argv, start_args_t *a)
             a->reuse = true;
         } else if (strcmp(argv[i], "--tls") == 0) {
             a->tls = true;
+        } else if (strcmp(argv[i], "--one") == 0) {
+            a->one = true;
         } else {
             printf("Unknown flag: %s\n", argv[i]);
             return -1;
@@ -538,7 +550,19 @@ cmd_start(int argc, char **argv)
     /* Validate required flags */
     if (!a.has_ip)       { printf("start: --ip is required\n%s",       start_usage()); return; }
     if (!a.has_port)     { printf("start: --port is required\n%s",     start_usage()); return; }
-    if (!a.has_duration) { printf("start: --duration is required\n%s", start_usage()); return; }
+
+    /* --one is mutually exclusive with --duration and --rate */
+    if (a.one) {
+        if (a.has_duration || a.rate) {
+            printf("start: --one is mutually exclusive with --duration and --rate\n");
+            return;
+        }
+        a.duration     = 10;  /* safety timeout */
+        a.rate         = 1;
+        a.has_duration = true;
+    }
+
+    if (!a.has_duration) { printf("start: --duration is required (or use --one)\n%s", start_usage()); return; }
     if (a.duration == 0) { printf("start: --duration must be > 0\n");  return; }
 
     /* Parse destination IP */
@@ -632,6 +656,9 @@ cmd_start(int argc, char **argv)
                a.proto, a.ip, a.port, a.streams, a.duration,
                a.tls ? " [TLS]" : "");
         printf("[ ID]  Interval       Transfer     Throughput\n");
+    } else if (a.one) {
+        printf("Single %s → %s:%u%s\n",
+               a.proto, a.ip, a.port, a.tls ? " [TLS]" : "");
     } else {
         printf("Traffic %s → %s:%u  %u-byte payload, %s, %u seconds%s\n",
                a.proto, a.ip, a.port, a.size,
@@ -647,10 +674,28 @@ cmd_start(int argc, char **argv)
             nanosleep(&ts, NULL);
             arp_mgmt_tick();
             pktrace_flush();
+            /* Allow remote CLI clients to run commands (e.g. stat)
+             * while traffic generation is active. */
+            cli_server_poll(dispatch);
             if (!g_run) break;
+
+            /* --one: exit early once at least one TX packet has been sent
+             * and either an RX response arrived or a connection completed */
+            if (a.one) {
+                metrics_snapshot_t ms;
+                metrics_snapshot(&ms, n_workers);
+                bool done = false;
+                if (strcmp(a.proto, "icmp") == 0 || strcmp(a.proto, "udp") == 0)
+                    done = (ms.total.tx_pkts >= 1);
+                else if (strcmp(a.proto, "http") == 0 || strcmp(a.proto, "https") == 0)
+                    done = (ms.total.http_rsp_rx >= 1);
+                else /* tcp, tls */
+                    done = (ms.total.tcp_conn_open >= 1);
+                if (done) { s = a.duration; break; }
+            }
         }
         if (!g_run) break;
-        if (is_tty && !a.reuse) {
+        if (is_tty && !a.reuse && !a.one) {
             metrics_snapshot_t snap;
             metrics_snapshot(&snap, n_workers);
             printf("\r  [%u/%us] %" PRIu64 " pkts",
@@ -858,11 +903,12 @@ cmd_show(int argc, char **argv)
     }
 }
 
-/* ── Management tick: runs ARP + pktrace flush + remote CLI ───────────────── */
+/* ── Management tick: runs ARP + ICMP + pktrace flush + remote CLI ────────── */
 static int
 mgmt_tick(void)
 {
     arp_mgmt_tick();
+    icmp_mgmt_tick();
     pktrace_flush();
     cli_server_poll(dispatch);
     return 0;
@@ -944,6 +990,7 @@ cli_run(void)
                   "(send SIGTERM to stop, or use vaigai --attach)\n");
         while (g_run) {
             arp_mgmt_tick();
+            icmp_mgmt_tick();
             pktrace_flush();
             cli_server_poll(dispatch);
             struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100 ms */
@@ -981,6 +1028,7 @@ cli_run(void)
         struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
         while (poll(&pfd, 1, 10 /* ms */) == 0) {
             arp_mgmt_tick();
+            icmp_mgmt_tick();
             pktrace_flush();
             cli_server_poll(dispatch);
         }

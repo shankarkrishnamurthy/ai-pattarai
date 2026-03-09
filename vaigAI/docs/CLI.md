@@ -118,14 +118,15 @@ start --ip <addr> --port <N> --duration <secs> [options]
 |--------------|------------------------------------|
 | `--ip`       | Destination IPv4 address           |
 | `--port`     | Destination TCP/UDP port           |
-| `--duration` | Test duration in seconds (> 0)     |
+| `--duration` | Test duration in seconds (> 0). Not needed with `--one`. |
 
 ### Optional flags
 
 | Flag          | Default | Description                                   |
 |---------------|---------|-----------------------------------------------|
 | `--proto`     | `tcp`   | Protocol: `tcp`, `http`, `https`, `udp`, `icmp`, `tls` |
-| `--rate`      | 0       | Rate limit in packets/sec (0 = unlimited)     |
+| `--rate`      | 0       | Rate limit in packets/sec (0 = unlimited). Mutually exclusive with `--one`. |
+| `--one`       | off     | Send exactly one request/handshake/connection and stop. Mutually exclusive with `--duration` and `--rate`. |
 | `--size`      | 56      | Payload size in bytes                         |
 | `--streams`   | 1       | Number of concurrent streams (max 16)         |
 | `--reuse`     | off     | Enable connection reuse (throughput mode)     |
@@ -150,6 +151,15 @@ vaigai> start --ip 10.0.0.2 --port 5001 --proto udp --size 1024 --duration 5
 
 # ICMP flood for 3 seconds
 vaigai> start --ip 10.0.0.2 --port 0 --proto icmp --duration 3
+
+# Single HTTP request (curl equivalent)
+vaigai> start --ip 10.0.0.2 --port 80 --proto http --one --url /index.html
+
+# Single TLS handshake
+vaigai> start --ip 10.0.0.2 --port 4433 --proto tls --one
+
+# Single HTTPS request
+vaigai> start --ip 10.0.0.2 --port 443 --proto https --one --url /
 ```
 
 ---

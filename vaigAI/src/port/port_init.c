@@ -254,9 +254,13 @@ int tgen_ports_init(uint32_t num_rx_desc, uint32_t num_tx_desc)
         if (port_setup(port_id, n_queues, n_txq,
                        num_rx_desc, num_tx_desc, mp) < 0)
             return -1;
-        /* TAP shares worker queue 0 (no extra mgmt TX queue) */
-        g_port_caps[port_id].mgmt_tx_q =
-            (g_port_caps[port_id].driver == DRIVER_TAP) ? 0 : (uint16_t)n_queues;
+        /* If the driver only supports 1 TX queue (af_packet, TAP, etc.),
+         * mgmt must share worker queue 0.  Otherwise use the dedicated
+         * extra queue at index n_queues. */
+        if (g_port_caps[port_id].max_tx_queues <= n_queues)
+            g_port_caps[port_id].mgmt_tx_q = 0;
+        else
+            g_port_caps[port_id].mgmt_tx_q = (uint16_t)n_queues;
 
         /* Run soft NIC post-init if needed */
         soft_nic_post_init(port_id, &g_port_caps[port_id]);

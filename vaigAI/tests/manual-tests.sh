@@ -127,8 +127,22 @@ qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \
     -nographic
 
 # -- Post-boot setup --
+#  Note: eth0 = virtio NIC (SSH/NAT), the passthrough i40e NIC is a
+#  separate interface.  Auto-detect its name by looking for PCI devices
+#  that are NOT virtio (i.e., the i40e NIC passed through via vfio-pci).
 sleep 15
-ssh -o StrictHostKeyChecking=no -p 2222 root@localhost 'ip addr add 10.0.0.2/24 dev eth0 && ip link set eth0 up'
+ssh -o StrictHostKeyChecking=no -p 2222 root@localhost '
+    # Find the passthrough NIC — it is the non-virtio Ethernet interface
+    DATA_IF=$(ip -o link show | awk -F": " "/^[0-9]+: eth/{print \$2}" |
+              while read iface; do
+                  driver=$(readlink -f /sys/class/net/$iface/device/driver 2>/dev/null | xargs basename 2>/dev/null)
+                  [ "$driver" != "virtio_net" ] && echo "$iface" && break
+              done)
+    [ -z "$DATA_IF" ] && DATA_IF=eth1  # fallback
+    echo "Data interface: $DATA_IF"
+    ip addr add 10.0.0.2/24 dev "$DATA_IF"
+    ip link set "$DATA_IF" up
+'
 ssh -p 2222 root@localhost 'nginx -t && rc-service nginx start; ss -tlnp'
 ssh -p 2222 root@localhost 'lspci | grep Co-pro && dmesg | grep -i qat | tail -3'
 
@@ -198,9 +212,40 @@ sleep 5
 ping -c 1 "$VM_IP"
 
 # -- vaigai --
-# IMPORTANT: After vaigai starts, attach tap-vaigai to bridge:
-#   ip link set tap-vaigai master br-vaigai && ip link set tap-vaigai up
-./build/vaigai -l 0-1 --no-pci --vdev "net_tap0,iface=tap-vaigai" -- -I 192.168.204.1
+# Run vaigai in the background (daemon-like).  DPDK TAP PMD will create
+# tap-vaigai internally.  We wait for it, attach it to the bridge, then
+# interact via the remote CLI (vaigai --attach).
+nohup ./build/vaigai -l 0-1 --no-pci --vdev "net_tap0,iface=tap-vaigai" \
+    -- -I 192.168.204.1 </dev/null >/tmp/vaigai-fc.log 2>&1 &
+VAIGAI_PID=$!
+echo "vaigai PID: $VAIGAI_PID"
+
+# Wait for DPDK to create tap-vaigai (up to 15 seconds)
+for i in $(seq 1 30); do
+    ip link show tap-vaigai >/dev/null 2>&1 && break
+    sleep 0.5
+done
+if ! ip link show tap-vaigai >/dev/null 2>&1; then
+    echo "ERROR: tap-vaigai not created after 15 seconds"
+    kill $VAIGAI_PID 2>/dev/null
+    exit 1
+fi
+
+# Attach tap-vaigai to the bridge
+ip link set tap-vaigai master "$BRIDGE"
+ip link set tap-vaigai up
+echo "tap-vaigai attached to $BRIDGE"
+
+# Verify bridge setup
+bridge link show
+ping -c 1 -W 2 "$VM_IP" && echo "VM reachable from host via bridge"
+
+# Now interact with vaigai via remote CLI:
+#   ./build/vaigai --attach
+# Example:
+#   vaigai> ping 192.168.204.2
+#   vaigai> start --ip 192.168.204.2 --port 80 --proto http --duration 10 --url /
+#   vaigai> stat net --rate
 # SERVER_IP=192.168.204.2
 
 
@@ -215,17 +260,22 @@ ping -c 1 "$VM_IP"
 VETH_HOST=veth-vaigai
 VETH_PEER=veth-peer
 
+# Start the container first, then create+move the veth peer
+podman run -d --name vaigai-server --network=none alpine:latest sleep infinity
+CTR_PID=$(podman inspect -f '{{.State.Pid}}' vaigai-server)
+
 ip link add "$VETH_HOST" type veth peer name "$VETH_PEER"
 ip link set "$VETH_HOST" up
 ip addr add 192.168.200.1/24 dev "$VETH_HOST"
 
-podman run -d --name vaigai-server --network=none alpine:latest sleep infinity
-CTR_PID=$(podman inspect -f '{{.State.Pid}}' vaigai-server)
-
-ip link set "$VETH_PEER" netns "/proc/$CTR_PID/ns/net" 2>/dev/null || \
-    nsenter -t "$CTR_PID" -n ip link set "$VETH_PEER" up  # fallback
+# Move veth peer into the container's network namespace
+ip link set "$VETH_PEER" netns "$CTR_PID"
 nsenter -t "$CTR_PID" -n ip addr add 192.168.200.2/24 dev "$VETH_PEER"
 nsenter -t "$CTR_PID" -n ip link set "$VETH_PEER" up
+nsenter -t "$CTR_PID" -n ip link set lo up
+
+# Verify connectivity from host side
+ping -c 1 -W 2 192.168.200.2 && echo "Container reachable"
 
 # -- Server: install and start services inside container --
 podman exec vaigai-server sh -c '
@@ -245,7 +295,11 @@ podman exec vaigai-server sh -c '
 podman exec vaigai-server ss -tlnp
 
 # -- vaigai (AF_XDP) --
-./build/vaigai -l 0-1 --no-pci --vdev "net_af_xdp0,iface=veth-vaigai" -- -I 192.168.200.1
+# AF_XDP on veth requires xdp_prog in skb mode (generic XDP).
+# The DPDK af_xdp PMD needs start_queue=0 and force_copy=1 for veth.
+./build/vaigai -l 0-1 --no-pci \
+    --vdev "net_af_xdp0,iface=veth-vaigai,start_queue=0,force_copy=1" \
+    -- -I 192.168.200.1
 # SERVER_IP=192.168.200.2
 
 
@@ -274,8 +328,11 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
 # -- Server: nginx + openssl s_server + socat --
 cat > /tmp/vaigai-native-nginx.conf << 'EOF'
 worker_processes 1;
+pid /tmp/vaigai-native-nginx.pid;
+error_log /tmp/vaigai-native-nginx-error.log;
 events { worker_connections 4096; }
 http {
+    access_log /tmp/vaigai-native-nginx-access.log;
     server {
         listen 192.168.201.2:80;
         location / { root /tmp/vaigai-native-www; }
@@ -291,16 +348,44 @@ EOF
 mkdir -p /tmp/vaigai-native-www
 echo "OK" > /tmp/vaigai-native-www/index.html
 dd if=/dev/urandom of=/tmp/vaigai-native-www/100k.bin bs=1024 count=100 2>/dev/null
-nginx -c /tmp/vaigai-native-nginx.conf
 
+# Wait for the veth interface IP to be ready before binding servers
+for i in $(seq 1 20); do
+    ip addr show "$VETH_NATIVE" | grep -q '192.168.201.2' && break
+    sleep 0.25
+done
+
+nginx -c /tmp/vaigai-native-nginx.conf
+if ! nginx -c /tmp/vaigai-native-nginx.conf -t 2>/dev/null; then
+    echo "ERROR: nginx config test failed"
+fi
+
+# openssl s_server: -accept takes [host]:port — use the bare port number and
+# bind to the specific address via -nbio to avoid blocking, or use the
+# -accept host:port syntax supported by OpenSSL 1.1+.
 openssl s_server -cert /tmp/vaigai-native-tls/server.crt \
     -key /tmp/vaigai-native-tls/server.key \
-    -accept 192.168.201.2:4433 -www -quiet &
+    -accept 4433 -www -quiet &
+OPENSSL_PID=$!
 
 socat TCP-LISTEN:5000,bind=192.168.201.2,fork,reuseaddr PIPE &
+SOCAT1_PID=$!
 socat TCP-LISTEN:5001,bind=192.168.201.2,fork,reuseaddr /dev/null &
+SOCAT2_PID=$!
 
+# Give servers a moment to start
+sleep 1
+
+# Verify all ports are listening
+echo "=== Listening ports ==="
 ss -tlnp | grep -E ':(80|443|4433|5000|5001)\b'
+EXPECTED=5
+ACTUAL=$(ss -tlnp | grep -cE ':(80|443|4433|5000|5001)\b')
+if [ "$ACTUAL" -lt "$EXPECTED" ]; then
+    echo "WARNING: Only $ACTUAL of $EXPECTED server ports are listening."
+    echo "Full ss output:"
+    ss -tlnp
+fi
 
 # -- vaigai --
 ./build/vaigai -l 0-1 --no-pci --vdev "net_af_packet0,iface=veth-vaigai" -- -I 192.168.201.1
@@ -358,7 +443,16 @@ start --ip SERVER_IP --port 5001 --proto udp --size 512 --duration 30 --rate 100
 start --ip SERVER_IP --port 0 --proto icmp --duration 10
 
 # ── curl equivalent (single HTTP GET) ──
-start --ip SERVER_IP --port 80 --proto http --duration 1 --rate 1 --url /index.html
+start --ip SERVER_IP --port 80 --proto http --one --url /index.html
+
+# ── Single TCP connection (SYN → ... → FIN) ──
+start --ip SERVER_IP --port 5000 --proto tcp --one
+
+# ── Single TLS handshake ──
+start --ip SERVER_IP --port 4433 --proto tls --one
+
+# ── Single HTTPS request ──
+start --ip SERVER_IP --port 443 --proto https --one --url /
 
 # ── Stop active traffic ──
 stop
@@ -369,6 +463,10 @@ reset
 
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║  3. MONITORING & DEBUG  (run at vaigai> prompt during or after tests)       ║
+# ║                                                                             ║
+# ║  NOTE: stat/trace/show/ping commands now work CONCURRENTLY with running     ║
+# ║  traffic.  Use a second terminal with `vaigai --attach` to monitor live     ║
+# ║  stats while traffic is running.                                            ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 # ── Stats ──
@@ -420,6 +518,7 @@ echo "" > /sys/bus/pci/devices/$NIC_VM/driver_override
 echo "$NIC_VM" > /sys/bus/pci/drivers/mlx5_core/bind 2>/dev/null
 
 # Firecracker cleanup
+kill $VAIGAI_PID 2>/dev/null  # kill daemon-mode vaigai
 kill $FC_PID 2>/dev/null
 rm -f "$FC_SOCKET" "$ROOTFS_COW"
 ip link del tap-fc0 2>/dev/null
@@ -431,7 +530,8 @@ ip link del veth-vaigai 2>/dev/null
 
 # Native cleanup
 nginx -s stop -c /tmp/vaigai-native-nginx.conf 2>/dev/null
-# kill openssl and socat PIDs
+kill $OPENSSL_PID $SOCAT1_PID $SOCAT2_PID 2>/dev/null
 ip link del veth-vaigai 2>/dev/null
 rm -rf /tmp/vaigai-native-tls /tmp/vaigai-native-www /tmp/vaigai-native-nginx.conf
+rm -f /tmp/vaigai-native-nginx.pid /tmp/vaigai-native-nginx-error.log /tmp/vaigai-native-nginx-access.log
 

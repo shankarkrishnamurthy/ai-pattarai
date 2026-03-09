@@ -69,10 +69,15 @@ void icmp_input(uint32_t worker_idx, struct rte_mbuf *m)
         rte_pktmbuf_free(m);
 }
 
-/* Build an ICMP Echo Reply */
+/* Build an ICMP Echo Reply.
+ * @param port_id    DPDK port ID for source MAC lookup
+ * @param requester_ip  IP of the host that sent the echo request (net order)
+ * @param req        Pointer to the ICMP header of the echo request
+ * @param icmp_data_len  Length of ICMP payload after the 8-byte ICMP header */
 static struct rte_mbuf *build_echo_reply(uint16_t port_id,
-                                          const struct rte_ipv4_hdr *orig_ip,
-                                          const struct rte_icmp_hdr *req)
+                                          uint32_t requester_ip,
+                                          const struct rte_icmp_hdr *req,
+                                          uint16_t icmp_data_len)
 {
     struct rte_mempool *mp = g_worker_mempools[0];
     if (!mp) return NULL;
@@ -80,10 +85,7 @@ static struct rte_mbuf *build_echo_reply(uint16_t port_id,
     struct rte_mbuf *m = rte_pktmbuf_alloc(mp);
     if (!m) return NULL;
 
-    /* Copy original ICMP payload (identifier + seq + data) */
-    uint16_t icmp_data_len = (uint16_t)(rte_be_to_cpu_16(orig_ip->total_length)
-                             - (orig_ip->version_ihl & 0x0F) * 4
-                             - ICMP_HDR_LEN);
+    /* icmp_data_len is the payload AFTER the 8-byte ICMP header */
 
     size_t total = sizeof(struct rte_ether_hdr) +
                    sizeof(struct rte_ipv4_hdr) +
@@ -95,8 +97,14 @@ static struct rte_mbuf *build_echo_reply(uint16_t port_id,
     /* Ethernet */
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)buf;
     rte_ether_addr_copy(&g_arp[port_id].local_mac, &eth->src_addr);
-    /* dst comes from ARP cache; skip for now (set to zero) */
-    memset(eth->dst_addr.addr_bytes, 0, 6);
+    /* Resolve destination MAC from ARP cache using the requester's IP */
+    struct rte_ether_addr resolved_mac;
+    if (arp_lookup(port_id, requester_ip, &resolved_mac)) {
+        rte_ether_addr_copy(&resolved_mac, &eth->dst_addr);
+    } else {
+        /* Fallback: broadcast — remote stack will accept it */
+        memset(eth->dst_addr.addr_bytes, 0xFF, 6);
+    }
     eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 
     /* IPv4 */
@@ -112,7 +120,7 @@ static struct rte_mbuf *build_echo_reply(uint16_t port_id,
     ip->next_proto_id = IPPROTO_ICMP;
     ip->hdr_checksum  = 0;
     ip->src_addr      = g_arp[port_id].local_ip;
-    ip->dst_addr      = orig_ip->src_addr;
+    ip->dst_addr      = requester_ip;
     ip->hdr_checksum  = rte_ipv4_cksum(ip);
 
     /* ICMP echo reply */
@@ -121,28 +129,29 @@ static struct rte_mbuf *build_echo_reply(uint16_t port_id,
     icmp->icmp_type   = RTE_ICMP_TYPE_ECHO_REPLY;
     icmp->icmp_code   = 0;
     icmp->icmp_cksum  = 0;
-    /* Copy identifier + sequence + payload verbatim */
+    /* Copy identifier + sequence + payload verbatim from the request.
+     * req+4 starts at the identifier field (after type/code/checksum).
+     * We need 4 bytes (id+seq) + icmp_data_len bytes (payload). */
     memcpy((uint8_t *)icmp + 4,
            (const uint8_t *)req + 4,
-           icmp_data_len);
+           4 + icmp_data_len);
     uint16_t ck_reply = rte_raw_cksum(icmp, ICMP_HDR_LEN + icmp_data_len);
     icmp->icmp_cksum = (ck_reply == 0xFFFF) ? ck_reply : (uint16_t)~ck_reply;
 
     return m;
 }
 
-/* Management: process one ICMP frame */
+/* Management: process one ICMP frame.
+ * The mbuf data pointer is at the ICMP header (IP header was stripped by
+ * ipv4_validate_and_strip).  The original source IP is saved in m->hash.usr
+ * by ipv4_input before stripping. */
 void icmp_mgmt_process(uint16_t port_id, struct rte_mbuf *m)
 {
-    /* The mbuf data pointer is now at start of IP header */
-    const struct rte_ipv4_hdr *ip = rte_pktmbuf_mtod(m, struct rte_ipv4_hdr *);
-    size_t ip_hlen = (ip->version_ihl & 0x0F) * 4;
     const struct rte_icmp_hdr *icmp =
-        (const struct rte_icmp_hdr *)((const uint8_t *)ip + ip_hlen);
+        rte_pktmbuf_mtod(m, const struct rte_icmp_hdr *);
+    uint16_t icmp_len = (uint16_t)m->data_len;
 
     /* Validate ICMP checksum */
-    uint16_t total = rte_be_to_cpu_16(ip->total_length);
-    uint16_t icmp_len = (uint16_t)(total - (uint16_t)ip_hlen);
     if (rte_raw_cksum(icmp, icmp_len) != 0xFFFF) {
         worker_metrics_add_icmp_bad_cksum(0);
         rte_pktmbuf_free(m);
@@ -150,7 +159,12 @@ void icmp_mgmt_process(uint16_t port_id, struct rte_mbuf *m)
     }
 
     if (icmp->icmp_type == RTE_ICMP_TYPE_ECHO_REQUEST) {
-        struct rte_mbuf *reply = build_echo_reply(port_id, ip, icmp);
+        /* Recover requester's IP from mbuf metadata (saved by ipv4_input) */
+        uint32_t requester_ip = m->hash.usr;
+        uint16_t icmp_data_len = (icmp_len > ICMP_HDR_LEN)
+                                 ? (uint16_t)(icmp_len - ICMP_HDR_LEN) : 0;
+        struct rte_mbuf *reply =
+            build_echo_reply(port_id, requester_ip, icmp, icmp_data_len);
         if (reply) {
             uint16_t txq = g_port_caps[port_id].mgmt_tx_q;
             rte_eth_tx_burst(port_id, txq, &reply, 1);
@@ -160,7 +174,38 @@ void icmp_mgmt_process(uint16_t port_id, struct rte_mbuf *m)
     rte_pktmbuf_free(m);
 }
 
-/* Management: drain ICMP ring */
+/* Management: periodic ICMP tick — drain rings and process echo requests.
+ * Echo replies are left in the ring for icmp_ping_start/icmp_mgmt_drain. */
+void icmp_mgmt_tick(void)
+{
+    uint32_t n_ports = rte_eth_dev_count_avail();
+    for (uint32_t p = 0; p < n_ports && p < TGEN_MAX_PORTS; p++) {
+        if (!g_icmp_rings[p]) continue;
+
+        /* Batch dequeue and selectively process */
+        void *ptrs[32];
+        unsigned n = rte_ring_dequeue_burst(g_icmp_rings[p], ptrs, 32,
+                                            NULL);
+        for (unsigned i = 0; i < n; i++) {
+            struct rte_mbuf *m = (struct rte_mbuf *)ptrs[i];
+            /* Data pointer is at ICMP header (IP was stripped).
+             * Peek at ICMP type to distinguish requests from replies. */
+            if (m->data_len >= ICMP_HDR_LEN) {
+                const struct rte_icmp_hdr *icmp =
+                    rte_pktmbuf_mtod(m, const struct rte_icmp_hdr *);
+                if (icmp->icmp_type == RTE_ICMP_TYPE_ECHO_REQUEST) {
+                    icmp_mgmt_process((uint16_t)p, m);
+                    continue;
+                }
+            }
+            /* Not an echo request — re-enqueue for icmp_mgmt_drain */
+            if (rte_ring_enqueue(g_icmp_rings[p], m) != 0)
+                rte_pktmbuf_free(m);
+        }
+    }
+}
+
+/* Management: drain ICMP ring (for ping client — returns raw mbuf) */
 struct rte_mbuf *icmp_mgmt_drain(uint16_t port_id)
 {
     if (port_id >= TGEN_MAX_PORTS || !g_icmp_rings[port_id]) return NULL;
@@ -187,7 +232,8 @@ int icmp_send_time_exceeded(uint16_t port_id, struct rte_mbuf *orig_m)
 }
 
 int icmp_ping_start(uint16_t port_id, uint32_t dst_ip_net,
-                    uint32_t count, uint32_t size, uint32_t interval_ms)
+                    uint32_t count, uint32_t size, uint32_t interval_ms,
+                    icmp_mgmt_poll_fn poll_fn)
 {
     if (count == 0) count = 5;
     if (size  == 0) size  = 56;
@@ -298,6 +344,7 @@ int icmp_ping_start(uint16_t port_id, uint32_t dst_ip_net,
             }
             /* Also keep draining ARP ring to avoid stalls */
             arp_mgmt_tick();
+            if (poll_fn) poll_fn();
             rte_delay_ms(1);
         }
         if (!got_reply)
