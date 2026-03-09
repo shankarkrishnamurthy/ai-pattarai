@@ -342,11 +342,22 @@ cmd_stat(int argc, char **argv)
 
     /* --watch wraps in a loop */
     if (opts.watch) {
-        if (!isatty(STDOUT_FILENO)) {
+        /* When dispatched from a remote CLI client (vaigai --attach),
+         * stdout is a memstream with no file descriptor.  The remote
+         * client has no way to press a key to exit the loop, so fall
+         * back to a single --rate sample instead of blocking the
+         * management core indefinitely. */
+        if (fileno(stdout) < 0) {
+            opts.watch = false;
+            /* opts.rate is already true (--watch implies --rate);
+             * fall through to the single-shot path below. */
+        } else if (!isatty(STDOUT_FILENO)) {
             printf("--watch requires a TTY\n");
             return;
         }
-        /* Non-blocking stdin check for Ctrl+C */
+    }
+
+    if (opts.watch) {
         while (g_run) {
             printf("\033[H\033[2J"); /* clear screen */
             if (strcmp(sub, "cpu") == 0)       stat_cpu(&opts);
@@ -356,9 +367,22 @@ cmd_stat(int argc, char **argv)
             else { printf("Unknown stat sub-command: %s\n", sub); return; }
             fflush(stdout);
 
-            /* Check for key press to break */
+            /* Service ARP / ICMP / pcap-trace between iterations.
+             * The stat_*() functions already slept ~1 s for rate
+             * sampling; this loop adds ~100 ms of management ticks
+             * so the control plane (ARP replies, ICMP echo, packet
+             * capture flush) keeps working and does not starve
+             * ongoing traffic generation. */
             struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
-            if (poll(&pfd, 1, 100) > 0) break;
+            bool quit = false;
+            for (int t = 0; t < 10 && !quit; t++) {
+                arp_mgmt_tick();
+                icmp_mgmt_tick();
+                pktrace_flush();
+                if (poll(&pfd, 1, 10) > 0)
+                    quit = true;
+            }
+            if (quit) break;
         }
         return;
     }
@@ -963,8 +987,8 @@ cli_print_stats(void)
 {
     metrics_snapshot_t snap;
     metrics_snapshot(&snap, g_core_map.num_workers);
-    char buf[4096];
-    export_json(&snap, buf, sizeof(buf));
+    char buf[8192];
+    export_net_text(&snap, buf, sizeof(buf));
     puts(buf);
 }
 
