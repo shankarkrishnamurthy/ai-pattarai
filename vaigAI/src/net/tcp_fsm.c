@@ -187,9 +187,11 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     else
         tx_q = g_port_caps[port_id].mgmt_tx_q;
     uint16_t sent = rte_eth_tx_burst(port_id, tx_q, &m, 1);
-
     if (sent == 0) { rte_pktmbuf_free(m); return -1; }
     worker_metrics_add_tx(worker_idx, 1, (uint32_t)seg_len);
+    /* Piggybacking an ACK clears any pending delayed-ACK. */
+    if ((flags & RTE_TCP_ACK_FLAG) && !(flags & RTE_TCP_SYN_FLAG))
+        tcb->pending_ack = false;
     return 0;
 }
 
@@ -317,16 +319,15 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
     uint16_t src_port = rte_be_to_cpu_16(tcp->src_port);
     uint16_t dst_port = rte_be_to_cpu_16(tcp->dst_port);
 
-    /* TCP checksum verification (RFC 9293 §3.1) */
-    if (!(m->ol_flags & RTE_MBUF_F_RX_L4_CKSUM_GOOD)) {
-        /* Reconstruct IP header pointer for checksum verification */
-        const struct rte_ipv4_hdr *ip_hdr =
-            (const struct rte_ipv4_hdr *)((const uint8_t *)tcp -
-                                           sizeof(struct rte_ipv4_hdr));
-        if (tcp_checksum_verify(ip_hdr, tcp) != 0) {
-            worker_metrics_add_tcp_bad_cksum(worker_idx);
-            goto bad;
-        }
+    /* TCP checksum verification.
+     * Hardware offload: drop on explicit BAD; GOOD passes without SW verify.
+     * Software PMDs (AF_PACKET, TAP): skip SW verification — the Linux kernel
+     * uses TX checksum offload on veth/tap so received partial checksums look
+     * invalid even for correct packets.  A traffic generator trusts the test
+     * network; HW BAD-flag detection is sufficient for real NICs. */
+    if (m->ol_flags & RTE_MBUF_F_RX_L4_CKSUM_BAD) {
+        worker_metrics_add_tcp_bad_cksum(worker_idx);
+        goto bad;
     }
 
     tcb_store_t *store = &g_tcb_stores[worker_idx];
@@ -610,14 +611,25 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                             tcp_fsm_send(worker_idx, tcb,
                                                          ct_buf, (uint32_t)ct_len);
                                         worker_metrics_add_http_req(worker_idx);
+                                        tcb->http_req_sent_tsc = rte_rdtsc();
                                         tcb->app_state = 5; /* HTTP response pending */
                                     }
                                 } else if (!tcb->app_ctx) {
-                                    /* TLS-only mode: close after handshake. */
-                                    if (tcb->graceful_close)
+                                    /* TLS-only mode: send close_notify then FIN. */
+                                    if (tcb->graceful_close) {
+                                        uint8_t cl_buf[64];
+                                        size_t cl_len = 0;
+                                        tls_shutdown(ts, cl_buf,
+                                                     sizeof(cl_buf),
+                                                     &cl_len);
+                                        if (cl_len > 0)
+                                            tcp_fsm_send(worker_idx, tcb,
+                                                         cl_buf,
+                                                         (uint32_t)cl_len);
                                         tcp_fsm_close(worker_idx, tcb);
-                                    else
+                                    } else {
                                         tcp_fsm_reset(worker_idx, tcb);
+                                    }
                                     goto done;
                                 }
                                 /* else: throughput mode marker — keep connection open,
@@ -653,10 +665,26 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                         tcb->app_state = 4;
                                     } else {
                                         tcb->app_state = 0;
-                                        if (tcb->graceful_close)
-                                            tcp_fsm_close(worker_idx, tcb);
-                                        else
+                                        if (tcb->graceful_close) {
+                                            /* Send TLS close_notify before FIN */
+                                            uint8_t cl_buf[64];
+                                            size_t cl_len = 0;
+                                            int ts_ret = tls_shutdown(ts,
+                                                         cl_buf,
+                                                         sizeof(cl_buf),
+                                                         &cl_len);
+                                            if (cl_len > 0) {
+                                                int fs_ret = tcp_fsm_send(worker_idx,
+                                                             tcb, cl_buf,
+                                                             (uint32_t)cl_len);
+                                                (void)fs_ret;
+                                            }
+                                            int fc_ret = tcp_fsm_close(worker_idx, tcb);
+                                            (void)ts_ret;
+                                            (void)fc_ret;
+                                        } else {
                                             tcp_fsm_reset(worker_idx, tcb);
+                                        }
                                         goto done;
                                     }
                                 }

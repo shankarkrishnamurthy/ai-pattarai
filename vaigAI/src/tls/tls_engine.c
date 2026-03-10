@@ -275,14 +275,15 @@ tls_decrypt(tls_session_t *sess,
 /* ------------------------------------------------------------------ */
 int
 tls_shutdown(tls_session_t *sess,
-             uint8_t *ciphertext_out, size_t *ct_out_len)
+             uint8_t *ciphertext_out, size_t ct_buf_len,
+             size_t *ct_out_len)
 {
     *ct_out_len = 0;
     if (sess->shutdown_sent)
         return 0;
     SSL_shutdown(sess->ssl);
     sess->shutdown_sent = true;
-    int got = BIO_read(sess->wbio, ciphertext_out, (int)*ct_out_len);
+    int got = BIO_read(sess->wbio, ciphertext_out, (int)ct_buf_len);
     *ct_out_len = got > 0 ? (size_t)got : 0;
     return 0;
 }

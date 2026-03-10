@@ -113,9 +113,14 @@ int  tls_decrypt(tls_session_t *sess,
                  const uint8_t *ciphertext,  size_t ct_len,
                  uint8_t       *plaintext,   size_t pt_buf_len);
 
-/** Initiate a TLS close_notify shutdown. */
+/**
+ * Initiate a TLS close_notify shutdown.
+ * @param ct_buf_len  Size of ciphertext_out buffer.
+ * @param ct_out_len  Set to bytes written into ciphertext_out.
+ */
 int  tls_shutdown(tls_session_t *sess,
-                  uint8_t *ciphertext_out, size_t *ct_out_len);
+                  uint8_t *ciphertext_out, size_t ct_buf_len,
+                  size_t *ct_out_len);
 
 #ifdef __cplusplus
 }

@@ -702,7 +702,14 @@ cmd_start(int argc, char **argv)
     cmd.cmd = CFG_CMD_START;
     cmd.seq = 1;
     memcpy(cmd.payload, &gcfg, sizeof(gcfg));
-    tgen_ipc_broadcast(&cmd);
+    /* --one: only one worker should initiate the connection. Worker 0 is
+     * chosen because tcp_port_pool_apply_rss_filter has already seeded
+     * its pool with ports whose RSS hash routes responses back to queue 0.
+     * Broadcasting max_initiations=1 to every worker would send N SYNs. */
+    if (a.one)
+        tgen_ipc_send(0, &cmd);
+    else
+        tgen_ipc_broadcast(&cmd);
 
     /* ── Print initial progress ──────────────────────────────────────── */
     if (a.reuse) {
@@ -735,10 +742,11 @@ cmd_start(int argc, char **argv)
     tgs.streams    = a.streams;
     strncpy(tgs.proto, a.proto, sizeof(tgs.proto) - 1);
 
-    /* Pipe mode: keep blocking behavior for scripts that expect start
-     * to block until completion (e.g. `echo "start ..." | vaigai`). */
+    /* --one blocks until the single request completes (or times out),
+     * then prints the result and returns the prompt. */
     bool pipe_mode = !isatty(STDIN_FILENO);
-    if (pipe_mode) {
+    (void)pipe_mode;
+    if (a.one) {
         mgmt_traffic_start(&tgs);
         while (g_traffic_state.active && g_run) {
             arp_mgmt_tick();
@@ -787,12 +795,7 @@ cmd_stop_gen(int argc, char **argv)
         mgmt_traffic_stop();
         printf("Traffic generation stopped.\n");
     } else {
-        config_update_t cmd;
-        memset(&cmd, 0, sizeof(cmd));
-        cmd.cmd = CFG_CMD_STOP;
-        cmd.seq = 2;
-        tgen_ipc_broadcast(&cmd);
-        printf("Traffic generation stopped.\n");
+        printf("It's already in stopped state.\n");
     }
 }
 
