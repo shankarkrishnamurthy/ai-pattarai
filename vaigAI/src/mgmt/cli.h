@@ -21,10 +21,12 @@ void cli_run(void);
  * Register an application-specific command.
  * @param name   Command name (e.g. "show-stats")
  * @param help   One-line help string
+ * @param usage  Multi-line usage string shown by "help <cmd>" (NULL = none)
  * @param fn     Callback: fn(argc, argv)
  */
 typedef void (*cli_cmd_fn_t)(int argc, char **argv);
-void cli_register(const char *name, const char *help, cli_cmd_fn_t fn);
+void cli_register(const char *name, const char *help, const char *usage,
+                  cli_cmd_fn_t fn);
 
 /** Print current statistics to stdout. */
 void cli_print_stats(void);

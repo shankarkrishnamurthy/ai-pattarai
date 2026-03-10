@@ -49,6 +49,7 @@
 typedef struct {
     char           name[64];
     char           help[128];
+    const char    *usage;
     cli_cmd_fn_t   fn;
 } cli_entry_t;
 
@@ -61,10 +62,22 @@ static uint32_t    g_n_cmds;
 static void
 cmd_help(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    if (argc >= 2) {
+        for (uint32_t i = 0; i < g_n_cmds; i++) {
+            if (strcmp(argv[1], g_cmds[i].name) == 0) {
+                printf("  %s — %s\n", g_cmds[i].name, g_cmds[i].help);
+                if (g_cmds[i].usage)
+                    printf("\n%s", g_cmds[i].usage);
+                return;
+            }
+        }
+        printf("Unknown command: %s (type 'help' for list)\n", argv[1]);
+        return;
+    }
     printf("Available commands:\n");
     for (uint32_t i = 0; i < g_n_cmds; i++)
         printf("  %-24s  %s\n", g_cmds[i].name, g_cmds[i].help);
+    printf("\nType 'help <command>' for detailed usage.\n");
 }
 
 /* Forward declarations */
@@ -981,11 +994,13 @@ cmd_show(int argc, char **argv)
 /* Public API                                                           */
 /* ------------------------------------------------------------------ */
 void
-cli_register(const char *name, const char *help, cli_cmd_fn_t fn)
+cli_register(const char *name, const char *help, const char *usage,
+             cli_cmd_fn_t fn)
 {
     if (g_n_cmds >= MAX_CMDS) return;
     strncpy(g_cmds[g_n_cmds].name, name, sizeof(g_cmds[0].name)-1);
     strncpy(g_cmds[g_n_cmds].help, help, sizeof(g_cmds[0].help)-1);
+    g_cmds[g_n_cmds].usage = usage;
     g_cmds[g_n_cmds].fn = fn;
     g_n_cmds++;
 }
@@ -1035,16 +1050,125 @@ void
 cli_run(void)
 {
     /* Register built-ins */
-    cli_register("help",     "Show this help",           cmd_help);
-    cli_register("stat",     "Statistics: stat [cpu|mem|net|port] [--rate] [--watch] [--core N]", cmd_stat);
-    cli_register("stats",    "Alias for 'stat net'",     cmd_stats);
-    cli_register("ping",     "ICMP ping: ping <ip> [count] [size] [ms] [port]", cmd_ping);
-    cli_register("start",    "Start traffic: start --ip <ip> --port <N> --duration <s> [flags]", cmd_start);
-    cli_register("stop",     "Stop active traffic generation",          cmd_stop_gen);
-    cli_register("reset",   "Reset all TCP state (connections, ports)", cmd_reset);
-    cli_register("trace",    "Packet capture: trace start/stop",          cmd_trace);
-    cli_register("show",     "Show interface details: show interface [port]", cmd_show);
-    cli_register("set",      "Set config: set ip <port> <ip> <gateway> <netmask>", cmd_set);
+    cli_register("help",     "Show this help",
+        "Usage: help [command]\n"
+        "\n"
+        "Without arguments, lists all available commands.\n"
+        "With a command name, shows detailed usage for that command.\n",
+        cmd_help);
+
+    cli_register("stat",     "Statistics: stat [cpu|mem|net|port] [--rate] [--watch] [--core N]",
+        "Usage: stat [cpu|mem|net|port] [--rate] [--watch] [--core N]\n"
+        "\n"
+        "Sub-commands:\n"
+        "  cpu    Per-core CPU utilisation (RX%, TX%, Timer%, Idle%)\n"
+        "  mem    Memory usage: mbufs, heap, connections, hugepages\n"
+        "  net    Network packet counters (same as 'stats')\n"
+        "  port   Per-NIC hardware statistics from the DPDK driver\n"
+        "\n"
+        "Flags:\n"
+        "  --rate       1-second delta sample (pps, Mbps, %)\n"
+        "  --watch      Continuous refresh (implies --rate; press any key to stop)\n"
+        "  --core N     Filter output to worker N\n"
+        "\n"
+        "Without a sub-command, prints a brief summary of all domains.\n",
+        cmd_stat);
+
+    cli_register("stats",    "Alias for 'stat net'", NULL, cmd_stats);
+
+    cli_register("ping",     "ICMP ping: ping <ip> [count] [size] [ms] [port]",
+        "Usage: ping <dst_ip> [count] [size] [interval_ms] [port]\n"
+        "\n"
+        "Arguments:\n"
+        "  dst_ip        Destination IPv4 address (required)\n"
+        "  count         Number of echo requests (default: 5)\n"
+        "  size          Payload size in bytes (default: 56)\n"
+        "  interval_ms   Interval between requests in ms (default: 1000)\n"
+        "  port          DPDK port ID to send from (default: 0)\n"
+        "\n"
+        "Examples:\n"
+        "  ping 10.0.0.2\n"
+        "  ping 10.0.0.2 10 128 500\n"
+        "  ping 10.10.10.10 3 56 1000 1\n",
+        cmd_ping);
+
+    cli_register("start",    "Start traffic: start --ip <ip> --port <N> --duration <s> [flags]",
+        "Usage: start --ip <addr> --port <N> --duration <secs>\n"
+        "             [--proto tcp|http|https|udp|icmp|tls]\n"
+        "             [--rate <pps>] [--size <bytes>]\n"
+        "             [--reuse] [--streams <N>]\n"
+        "             [--url <path>] [--host <name>] [--tls]\n"
+        "             [--one]\n"
+        "\n"
+        "Required:\n"
+        "  --ip <addr>       Destination IPv4 address\n"
+        "  --port <N>        Destination TCP/UDP port\n"
+        "  --duration <s>    Test duration in seconds (not needed with --one)\n"
+        "\n"
+        "Optional:\n"
+        "  --proto <name>    Protocol: tcp, http, https, udp, icmp, tls (default: tcp)\n"
+        "  --rate <pps>      Rate limit in packets/sec (0 = unlimited)\n"
+        "  --size <bytes>    Payload size in bytes (default: 56)\n"
+        "  --streams <N>     Concurrent streams, max 16 (default: 1)\n"
+        "  --reuse           Enable connection reuse (throughput mode)\n"
+        "  --url <path>      HTTP request path (default: /)\n"
+        "  --host <name>     HTTP Host header (default: --ip value)\n"
+        "  --tls             Enable TLS encryption\n"
+        "  --one             Single request/handshake then stop\n"
+        "\n"
+        "Examples:\n"
+        "  start --ip 10.0.0.2 --port 5000 --duration 10\n"
+        "  start --ip 10.0.0.2 --port 80 --proto http --duration 5 --rate 100\n"
+        "  start --ip 10.0.0.2 --port 443 --proto https --one --url /\n",
+        cmd_start);
+
+    cli_register("stop",     "Stop active traffic generation", NULL, cmd_stop_gen);
+
+    cli_register("reset",   "Reset all TCP state (connections, ports)",
+        "Usage: reset\n"
+        "\n"
+        "Sends RST for all active connections, clears TCB stores,\n"
+        "frees port pools, and resets metrics.\n"
+        "Traffic generation must be stopped first.\n",
+        cmd_reset);
+
+    cli_register("trace",    "Packet capture: trace start/stop",
+        "Usage: trace start <file.pcapng> [port] [queue]\n"
+        "       trace stop\n"
+        "\n"
+        "Arguments (start):\n"
+        "  file.pcapng   Output file path (required)\n"
+        "  port          DPDK port ID to capture on (default: 0)\n"
+        "  queue         Queue index to capture on (default: 0)\n"
+        "\n"
+        "Examples:\n"
+        "  trace start capture.pcapng\n"
+        "  trace start /tmp/debug.pcapng 0 0\n"
+        "  trace stop\n",
+        cmd_trace);
+
+    cli_register("show",     "Show interface details: show interface [port]",
+        "Usage: show interface [port_id]\n"
+        "\n"
+        "Displays driver, MAC, IP, gateway, netmask, link status,\n"
+        "offload capabilities, and packet statistics.\n"
+        "Without port_id, shows all ports.\n"
+        "\n"
+        "Examples:\n"
+        "  show interface\n"
+        "  show interface 0\n",
+        cmd_show);
+
+    cli_register("set",      "Set config: set ip <port> <ip> <gateway> <netmask>",
+        "Usage: set ip <port> <ip> <gateway> <netmask>\n"
+        "\n"
+        "Set or change the IP address, gateway, and netmask for a port.\n"
+        "Use 0.0.0.0 as gateway for same-subnet direct-link traffic.\n"
+        "\n"
+        "Examples:\n"
+        "  set ip 0 10.88.33.65 10.88.32.1 255.255.252.0\n"
+        "  set ip 1 10.10.10.11 0.0.0.0 255.255.255.0\n",
+        cmd_set);
 
     /* Start CLI socket server for remote attach */
     cli_server_init(NULL);

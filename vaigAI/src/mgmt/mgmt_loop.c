@@ -341,7 +341,7 @@ mgmt_loop_run(mgmt_dispatch_fn_t dispatch)
     } else {
         if (isatty(STDIN_FILENO))
             printf("vaigai CLI  (type 'help' for commands, "
-                   "'quit' to exit)\n");
+                   "'help <cmd>' for details, 'quit' to exit)\n");
         cli_stdin_init(dispatch);
     }
 

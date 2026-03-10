@@ -76,10 +76,23 @@ tshark -r capture.pcapng -o tls.keylog_file:/tmp/keys.log
 
 ## help
 
-Show all available commands.
+Show all available commands, or detailed usage for a specific command.
 
 ```
 vaigai> help
+vaigai> help <command>
+```
+
+Without arguments, lists all commands with one-line descriptions.
+With a command name, shows detailed usage including arguments, flags, and examples.
+
+```
+vaigai> help start
+  start — Start traffic: start --ip <ip> --port <N> --duration <s> [flags]
+
+Usage: start --ip <addr> --port <N> --duration <secs>
+             [--proto tcp|http|https|udp|icmp|tls]
+             ...
 ```
 
 ---
