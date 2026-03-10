@@ -191,7 +191,64 @@ The system auto-scales management overhead based on available cores:
 | 129+             | 4          | PRIMARY_MGMT + TELEMETRY + CLI_API + WATCHDOG  |
 
 All remaining lcores become **workers**. Workers are distributed to ports round-robin
-on the same NUMA socket. Each worker gets one RX queue and one TX queue per port.
+on the same NUMA socket. Each worker gets one RX queue and one TX queue per port,
+**but only if the port has a free queue**. A worker whose position in the port's
+worker list equals or exceeds the port's RX queue count is **not assigned** to that
+port — this prevents multiple workers from polling the same RX queue (a DPDK
+requirement: each RX queue must be read by exactly one lcore).
+
+#### Worker-to-Queue Mapping (3 cases)
+
+**Rule:** Worker at position `W` in a port's worker list gets `RX queue W`.
+If `W >= max_rx_queues`, that worker skips the port entirely.
+
+```
+Case 1: Workers < Queues  (2 workers, 1 port with 8 queues)
+─────────────────────────────────────────────────────────────
+  Port 0 (8 RX queues)
+  ├── RX Q0 ← Worker 0  ✅  (position 0 < 8)
+  ├── RX Q1 ← Worker 1  ✅  (position 1 < 8)
+  ├── RX Q2    (idle)
+  ├── RX Q3    (idle)
+  ├── RX Q4    (idle)
+  ├── RX Q5    (idle)
+  ├── RX Q6    (idle)
+  └── RX Q7    (idle)
+
+  → Queues 2–7 unused.  Add more workers (-l 0-8) to use them.
+
+Case 2: Workers = Queues  (4 workers, 1 port with 4 queues)
+─────────────────────────────────────────────────────────────
+  Port 0 (4 RX queues)
+  ├── RX Q0 ← Worker 0  ✅  (position 0 < 4)
+  ├── RX Q1 ← Worker 1  ✅  (position 1 < 4)
+  ├── RX Q2 ← Worker 2  ✅  (position 2 < 4)
+  └── RX Q3 ← Worker 3  ✅  (position 3 < 4)
+
+  → Perfect 1:1 mapping.  All queues active, no idle workers.
+
+Case 3: Workers > Queues  (3 workers, 2 AF_PACKET ports with 1 queue each)
+───────────────────────────────────────────────────────────────────────────
+  Port 0 (1 RX queue)              Port 1 (1 RX queue)
+  ├── RX Q0 ← Worker 0  ✅         ├── RX Q0 ← Worker 0  ✅
+  ├──        Worker 1  ❌ skip     ├──        Worker 1  ❌ skip
+  └──        Worker 2  ❌ skip     └──        Worker 2  ❌ skip
+        (pos 1 >= 1)                      (pos 1 >= 1)
+
+  → Workers 1 and 2 have no ports — they spin idle.
+    AF_PACKET/TAP always have 1 queue; use fewer workers or
+    add more ports.
+
+Case 3b: Workers > Queues  (3 workers, 2 NIC ports with 2 queues each)
+──────────────────────────────────────────────────────────────────────
+  Port 0 (2 RX queues)             Port 1 (2 RX queues)
+  ├── RX Q0 ← Worker 0  ✅         ├── RX Q0 ← Worker 0  ✅
+  ├── RX Q1 ← Worker 1  ✅         ├── RX Q1 ← Worker 1  ✅
+  └──        Worker 2  ❌ skip     └──        Worker 2  ❌ skip
+        (pos 2 >= 2)                      (pos 2 >= 2)
+
+  → Worker 2 idle.  Each port fully served by 2 workers.
+```
 
 ### 1.6 Memory Layout
 
