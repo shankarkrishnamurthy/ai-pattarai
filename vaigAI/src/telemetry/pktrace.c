@@ -20,7 +20,7 @@
 #include <rte_mbuf.h>
 #include <rte_errno.h>
 
-#include <stdatomic.h>
+#include "../port/port_init.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -233,7 +233,14 @@ pktrace_start(uint16_t port_id, uint16_t queue_id, uint32_t max_pkts,
             g_out_fd = -1;
             return -EIO;
         }
-        rte_pcapng_add_interface(g_writer, port_id, NULL, NULL, NULL);
+        /* Add an IDB for every active port so that the sequential interface
+         * index in the pcapng file equals the DPDK port number.
+         * rte_pcapng_copy() uses port_id directly as the EPB interface_id,
+         * so interface 0 must be port 0, interface 1 must be port 1, etc.
+         * Capturing port N without adding ports 0..N-1 first causes packets
+         * to reference a non-existent interface_id and the file is malformed. */
+        for (uint16_t p = 0; p < (uint16_t)g_n_ports; p++)
+            rte_pcapng_add_interface(g_writer, p, NULL, NULL, NULL);
         g_streaming = true;
     }
 
