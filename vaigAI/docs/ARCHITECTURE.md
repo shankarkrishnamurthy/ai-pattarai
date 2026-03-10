@@ -352,6 +352,36 @@ Mempool allocation uses a 3-tier NUMA fallback: worker's socket with 1 GB pages 
 | 6    | `arp_mgmt_process()`         | `arp.c`             | **Mgmt** |
 | 7    | ARP reply TX on queue 0      | `arp.c`             | **Mgmt** |
 
+**Next-hop routing — `arp_nexthop()`:**
+
+All ARP lookups go through `arp_nexthop(port_id, dst_ip)` which determines
+the L2 next-hop for a given destination:
+
+```
+  dst_ip
+    │
+    ▼
+  gateway or netmask set?
+    │             │
+   NO            YES
+    │             │
+    ▼             ▼
+  return       (dst_ip & mask) == (local_ip & mask)?
+  dst_ip         │                    │
+  (direct)      YES                  NO
+                 │                    │
+                 ▼                    ▼
+              return               return
+              dst_ip               gateway_ip
+              (on-link)            (off-link)
+```
+
+- **On-link:** ARP resolves the destination directly (e.g. 10.10.10.10 on same /24)
+- **Off-link:** ARP resolves the gateway, IP header keeps the real destination
+- **No gateway (`0.0.0.0`):** All traffic treated as on-link (same-subnet direct-link)
+
+Callers: `icmp_ping_start()`, `build_echo_reply()`, `tcp_fsm.c` (SYN + RST).
+
 **Function trace — TCP data:**
 
 | Step | Function                     | File                | Core     |

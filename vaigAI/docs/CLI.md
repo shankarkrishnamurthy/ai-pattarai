@@ -89,7 +89,7 @@ vaigai> help
 Send ICMP echo requests to a destination.
 
 ```
-ping <dst_ip> [count] [size] [interval_ms]
+ping <dst_ip> [count] [size] [interval_ms] [port]
 ```
 
 | Parameter     | Default | Description                      |
@@ -98,10 +98,12 @@ ping <dst_ip> [count] [size] [interval_ms]
 | `count`       | 5       | Number of echo requests to send  |
 | `size`        | 56      | Payload size in bytes            |
 | `interval_ms` | 1000    | Interval between requests (ms)   |
+| `port`        | 0       | DPDK port ID to send from        |
 
 ```
 vaigai> ping 10.0.0.2
 vaigai> ping 10.0.0.2 10 128 500
+vaigai> ping 10.10.10.10 3 56 1000 1    # ping via port 1
 ```
 
 ---
@@ -409,6 +411,7 @@ set ip <port> <ip> <gateway> <netmask>
 ```
 
 Each port can have its own independent IP, gateway, and netmask.
+Use `0.0.0.0` as the gateway for same-subnet direct-link traffic (no gateway needed).
 
 ### Examples
 
@@ -418,6 +421,9 @@ Port 0: ip 10.88.33.65  gateway 10.88.32.1  netmask 255.255.252.0
 
 vaigai> set ip 1 192.168.1.10 192.168.1.1 255.255.255.0
 Port 1: ip 192.168.1.10  gateway 192.168.1.1  netmask 255.255.255.0
+
+vaigai> set ip 1 10.10.10.11 0.0.0.0 255.255.255.0    # no gateway (direct-link)
+Port 1: ip 10.10.10.11  gateway 0.0.0.0  netmask 255.255.255.0
 ```
 
 Use `show interface` to verify the current settings.
