@@ -2,7 +2,7 @@
  * vaigAI: Readline-based interactive CLI (§5.3).
  *
  * Runs on a management thread.  Commands are dispatched synchronously;
- * config changes are pushed to workers via config_push_to_workers().
+ * runtime changes are pushed to workers via the IPC ring.
  */
 #ifndef TGEN_CLI_H
 #define TGEN_CLI_H

@@ -8,7 +8,7 @@
  *  4.  Mempool creation
  *  5.  Port initialisation
  *  6.  IPC ring creation
- *  7.  Load configuration (JSON)
+ *  7.  Populate runtime config from args
  *  8.  TLS context init
  *  9.  TCP state init (TCB stores, port pools)
  * 10.  Cryptodev init

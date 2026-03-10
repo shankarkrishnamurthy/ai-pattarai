@@ -224,8 +224,8 @@ bash scripts/setup.sh --hugepages-1g 16 <pci-addr>
 # Physical NIC:
 ./build/vaigai --lcores 0-7 -a 0000:01:00.0
 
-# With config file:
-VAIGAI_CONFIG=/path/to/config.json ./build/vaigai --lcores 0-3 -a 0000:01:00.0
+# With TLS key logging:
+SSLKEYLOGFILE=/tmp/keys.log ./build/vaigai --lcores 0-3 -a 0000:01:00.0
 ```
 
 ## Recreating the Environment on a New System

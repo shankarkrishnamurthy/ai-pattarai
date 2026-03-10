@@ -107,7 +107,7 @@ src/
 │   ├── cli_server.h/c         # Unix domain socket server for remote CLI attach
 │   ├── cli_client.c           # Thin readline client for `vaigai --attach`
 │   ├── rest.h/c               # libmicrohttpd REST API (JSON)
-│   └── config_mgr.h/c         # JSON config load/save/validate/push
+│   └── config_mgr.h/c         # Runtime config state (populated from CLI args)
 │
 └── telemetry/                 ── Observability ──
     ├── metrics.h/c            # Per-worker lock-free counter slabs
@@ -162,9 +162,8 @@ main()
   │     Apply --src-ip to all ports  Set g_arp[p].local_ip for ARP + TX
   │     Apply --gateway/--netmask   Set g_arp[p].gateway_ip/netmask for next-hop routing
   ├─6── tgen_ipc_init()              Create SPSC rings (cmd + ACK)
-  ├─7── config_load_json()           Load JSON config from $VAIGAI_CONFIG
-  │                                  Top-level `"protocol"` field selects TCP/UDP/ICMP/TLS/HTTP/HTTPS
-  │     config_push_to_workers()     Push flow profiles to ARP subsystem
+  ├─7── g_config population         Populate runtime config from CLI args
+  │                                  (max_concurrent, rest_port, tls settings)
   ├─8── cert_mgr_init()              TLS client/server SSL contexts
   │     tls_session_store_init()
   │     tls_keylog_enable()          SSLKEYLOG via --sslkeylog or $SSLKEYLOGFILE
@@ -1106,35 +1105,20 @@ vaigai process (mgmt core)
 All responses are JSON with CORS headers (`Access-Control-Allow-Origin: *`).
 REST server runs on the management core via `libmicrohttpd`.
 
-### 4.7 Configuration Schema
+### 4.7 Runtime Configuration
 
-```json
-{
-  "protocol": "tcp|udp|icmp|http|tls|https",
-  "tls_enabled": true,
-  "rest_port": 8080,
+All configuration is supplied via CLI flags at startup or the `set ip` / `start` commands at runtime.
+The `tgen_config_t` struct (`config_mgr.h`) holds the live state populated from parsed args:
 
-  "flows": [{
-    "dst_ip": "10.0.0.2",
-    "src_ip_lo": "10.0.0.1",    "src_ip_hi": "10.0.0.1",
-    "dst_port": 443,
-    "vlan_id": 0,
-    "enable_tls": true,
-    "sni": "example.com",
-    "http_url": "/index.html",  "http_host": "example.com",
-    "http_body_len": 0,         "icmp_ping": false
-  }],
+| Field | Source | Description |
+|-------|--------|-------------|
+| `tls_enabled` | `--tls` / cert detection | TLS on/off |
+| `rest_port` | `--rest-port` | REST API listen port (0 = disabled) |
+| `max_concurrent` | `--max-conn` | Max concurrent TCP connections per worker |
+| `cert` | `--cert` / `--key` | TLS certificate and key paths |
 
-  "load": {
-    "target_cps": 10000,   "target_rps": 0,
-    "max_concurrent": 4096,"duration_secs": 30,
-    "ramp_up_secs": 0,     "ramp_down_secs": 0
-  }
-}
-```
-
-Loaded from `$VAIGAI_CONFIG` env var at startup.
-`config_push_to_workers()` distributes flow profiles to the ARP subsystem.
+Per-port IP / gateway / netmask is held in `g_arp[port]` and set via
+`--src-ip` / `--gateway` / `--netmask` at startup or `set ip` at runtime.
 
 ### 4.8 How They Work Together — Concrete Scenarios
 

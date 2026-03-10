@@ -41,7 +41,6 @@ vaigai accepts DPDK EAL arguments followed by `--` and then app-level arguments:
 
 | Variable | Description |
 |----------|-------------|
-| `VAIGAI_CONFIG` | Path to JSON config file loaded at startup |
 | `SSLKEYLOGFILE` | TLS key log file path (fallback if `--sslkeylog` is not set) |
 
 ### `--sslkeylog` — TLS Key Logging
