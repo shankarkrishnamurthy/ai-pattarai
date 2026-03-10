@@ -127,9 +127,9 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     uint16_t port_id = 0; /* TODO: route to correct port */
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)buf;
     rte_ether_addr_copy(&g_port_caps[port_id].mac_addr, &eth->src_addr);
-    /* Resolve destination MAC via ARP */
+    /* Resolve destination MAC via ARP (use gateway for off-link) */
     struct rte_ether_addr dst_mac;
-    if (!arp_lookup(port_id, tcb->dst_ip, &dst_mac))
+    if (!arp_lookup(port_id, arp_nexthop(port_id, tcb->dst_ip), &dst_mac))
         memset(dst_mac.addr_bytes, 0xFF, 6);
     rte_ether_addr_copy(&dst_mac, &eth->dst_addr);
     eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
@@ -242,7 +242,7 @@ static void tcp_send_rst_no_tcb(uint32_t worker_idx, struct rte_mbuf *m,
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)buf;
     rte_ether_addr_copy(&g_port_caps[port_id].mac_addr, &eth->src_addr);
     struct rte_ether_addr dst_mac;
-    if (!arp_lookup(port_id, remote_ip, &dst_mac))
+    if (!arp_lookup(port_id, arp_nexthop(port_id, remote_ip), &dst_mac))
         memset(dst_mac.addr_bytes, 0xFF, 6);
     rte_ether_addr_copy(&dst_mac, &eth->dst_addr);
     eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);

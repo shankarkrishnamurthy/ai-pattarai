@@ -290,6 +290,19 @@ int arp_request(uint16_t port_id, uint32_t ip_net)
     return 0;
 }
 
+/* ── Next-hop resolution (gateway vs direct) ─────────────────────────────── */
+uint32_t arp_nexthop(uint16_t port_id, uint32_t dst_ip_net)
+{
+    if (port_id >= TGEN_MAX_PORTS)
+        return dst_ip_net;
+    const arp_state_t_port *a = &g_arp[port_id];
+    if (!a->gateway_ip || !a->netmask)
+        return dst_ip_net;                      /* no gateway configured */
+    if ((dst_ip_net & a->netmask) == (a->local_ip & a->netmask))
+        return dst_ip_net;                      /* on-link */
+    return a->gateway_ip;                       /* off-link → gateway */
+}
+
 void arp_destroy(void)
 {
     for (uint32_t p = 0; p < TGEN_MAX_PORTS; p++) {

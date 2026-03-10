@@ -48,6 +48,8 @@ typedef struct {
     arp_entry_t         entries[TGEN_ARP_CACHE_SZ];
     rte_rwlock_t        lock;
     uint32_t            local_ip;     /* local IPv4 in network byte order */
+    uint32_t            gateway_ip;   /* default gateway, network byte order (0 = none) */
+    uint32_t            netmask;      /* subnet mask, network byte order (0 = none) */
     struct rte_ether_addr local_mac;
     uint16_t            port_id;
     /* Token bucket for rate limiting */
@@ -78,6 +80,9 @@ bool arp_lookup(uint16_t port_id, uint32_t ip_net,
 
 /** Management: send an ARP request for ip_net out of port_id. */
 int arp_request(uint16_t port_id, uint32_t ip_net);
+
+/** Return the next-hop IP to ARP for: gateway if off-link, dst if on-link. */
+uint32_t arp_nexthop(uint16_t port_id, uint32_t dst_ip_net);
 
 /** Destroy ARP state. */
 void arp_destroy(void);

@@ -25,6 +25,7 @@
 
 #include <rte_eal.h>
 #include <rte_ethdev.h>
+#include <rte_byteorder.h>
 #include <rte_launch.h>
 #include <rte_lcore.h>
 #include <rte_log.h>
@@ -191,10 +192,23 @@ main(int argc, char **argv)
     /* Apply --src-ip to all ports so ARP and TX use the correct address */
     if (eal_args.src_ip) {
         for (uint32_t p = 0; p < rte_eth_dev_count_avail() &&
-                             p < TGEN_MAX_PORTS; p++)
-            g_arp[p].local_ip = eal_args.src_ip;
+                             p < TGEN_MAX_PORTS; p++) {
+            g_arp[p].local_ip   = eal_args.src_ip;
+            g_arp[p].gateway_ip = eal_args.gateway;
+            g_arp[p].netmask    = eal_args.netmask;
+        }
         RTE_LOG(INFO, USER1, "Source IP set on %u port(s)\n",
                 rte_eth_dev_count_avail());
+        if (eal_args.gateway) {
+            uint32_t gw = rte_be_to_cpu_32(eal_args.gateway);
+            uint32_t nm = rte_be_to_cpu_32(eal_args.netmask);
+            RTE_LOG(INFO, USER1,
+                "Gateway %u.%u.%u.%u  Netmask %u.%u.%u.%u\n",
+                (gw >> 24) & 0xFF, (gw >> 16) & 0xFF,
+                (gw >>  8) & 0xFF,  gw        & 0xFF,
+                (nm >> 24) & 0xFF, (nm >> 16) & 0xFF,
+                (nm >>  8) & 0xFF,  nm        & 0xFF);
+        }
     }
     rc = icmp_init();
     if (rc < 0) {

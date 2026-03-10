@@ -99,7 +99,7 @@ static struct rte_mbuf *build_echo_reply(uint16_t port_id,
     rte_ether_addr_copy(&g_arp[port_id].local_mac, &eth->src_addr);
     /* Resolve destination MAC from ARP cache using the requester's IP */
     struct rte_ether_addr resolved_mac;
-    if (arp_lookup(port_id, requester_ip, &resolved_mac)) {
+    if (arp_lookup(port_id, arp_nexthop(port_id, requester_ip), &resolved_mac)) {
         rte_ether_addr_copy(&resolved_mac, &eth->dst_addr);
     } else {
         /* Fallback: broadcast — remote stack will accept it */
@@ -242,16 +242,17 @@ int icmp_ping_start(uint16_t port_id, uint32_t dst_ip_net,
     struct rte_ether_addr dst_mac;
 
     /* ── Step 1: ARP resolve destination ─────────────────────────── */
-    if (!arp_lookup(port_id, dst_ip_net, &dst_mac)) {
-        arp_request(port_id, dst_ip_net);
+    uint32_t nexthop = arp_nexthop(port_id, dst_ip_net);
+    if (!arp_lookup(port_id, nexthop, &dst_mac)) {
+        arp_request(port_id, nexthop);
         uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
         while (rte_rdtsc() < deadline) {
             arp_mgmt_tick();          /* drains ARP ring from workers */
-            if (arp_lookup(port_id, dst_ip_net, &dst_mac)) break;
+            if (arp_lookup(port_id, nexthop, &dst_mac)) break;
             rte_delay_ms(10);
         }
     }
-    if (!arp_lookup(port_id, dst_ip_net, &dst_mac)) {
+    if (!arp_lookup(port_id, nexthop, &dst_mac)) {
         uint32_t h = rte_be_to_cpu_32(dst_ip_net);
         RTE_LOG(ERR, USER1, "ping: ARP timeout for %u.%u.%u.%u\n",
                 (h >> 24) & 0xFF, (h >> 16) & 0xFF,

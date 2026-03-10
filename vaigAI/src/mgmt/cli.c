@@ -612,16 +612,17 @@ cmd_start(int argc, char **argv)
 
     /* ── ARP-resolve destination ────────────────────────────────────── */
     struct rte_ether_addr dst_mac;
-    if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
-        arp_request(port_id, dst_ip);
+    uint32_t nexthop = arp_nexthop(port_id, dst_ip);
+    if (!arp_lookup(port_id, nexthop, &dst_mac)) {
+        arp_request(port_id, nexthop);
         uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
         while (rte_rdtsc() < deadline) {
             arp_mgmt_tick();
-            if (arp_lookup(port_id, dst_ip, &dst_mac)) break;
+            if (arp_lookup(port_id, nexthop, &dst_mac)) break;
             rte_delay_ms(10);
         }
     }
-    if (!arp_lookup(port_id, dst_ip, &dst_mac)) {
+    if (!arp_lookup(port_id, nexthop, &dst_mac)) {
         printf("start: ARP resolution failed for %s\n", a.ip);
         return;
     }

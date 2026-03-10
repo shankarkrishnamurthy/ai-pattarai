@@ -18,6 +18,8 @@ vaigai accepts DPDK EAL arguments followed by `--` and then app-level arguments:
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--src-ip <addr>` | `-I` | Source IPv4 address for all ports |
+| `--gateway <addr>` | `-G` | Default gateway IPv4 address (required for off-link destinations) |
+| `--netmask <mask>` | `-N` | Subnet mask (e.g. `255.255.252.0`; used with `--gateway`) |
 | `--sslkeylog <path>` | `-K` | Write TLS session keys in NSS Key Log format |
 | `--num-worker-cores <N>` | `-W` | Number of worker lcores (0 = auto) |
 | `--num-mgmt-cores <N>` | `-M` | Number of management lcores (0 = auto) |
