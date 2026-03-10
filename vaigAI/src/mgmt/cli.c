@@ -827,6 +827,62 @@ cmd_reset(int argc, char **argv)
     printf("TCP state reset: all connections closed, ports freed, metrics cleared.\n");
 }
 
+/* ── Set runtime configuration ───────────────────────────────────────────── */
+static void
+cmd_set(int argc, char **argv)
+{
+    if (argc < 2 || strcmp(argv[1], "ip") != 0) {
+        printf("Usage: set ip <port> <ip> <gateway> <netmask>\n"
+               "  Example: set ip 0 10.88.33.65 10.88.32.1 255.255.252.0\n");
+        return;
+    }
+
+    if (argc < 6) {
+        printf("Usage: set ip <port> <ip> <gateway> <netmask>\n");
+        return;
+    }
+
+    uint16_t port_id = (uint16_t)strtoul(argv[2], NULL, 10);
+    if (port_id >= g_n_ports) {
+        printf("set ip: port %u does not exist (have %u port(s))\n",
+               port_id, g_n_ports);
+        return;
+    }
+
+    uint32_t new_ip = 0, new_gw = 0, new_mask = 0;
+    if (tgen_parse_ipv4(argv[3], &new_ip) < 0) {
+        printf("set ip: invalid IP '%s'\n", argv[3]);
+        return;
+    }
+    if (tgen_parse_ipv4(argv[4], &new_gw) < 0) {
+        printf("set ip: invalid gateway '%s'\n", argv[4]);
+        return;
+    }
+    if (tgen_parse_ipv4(argv[5], &new_mask) < 0) {
+        printf("set ip: invalid netmask '%s'\n", argv[5]);
+        return;
+    }
+
+    /* Validate: gateway must be on the same subnet as the new IP */
+    if ((new_ip & new_mask) != (new_gw & new_mask)) {
+        printf("set ip: gateway is not on the same subnet as the IP\n");
+        return;
+    }
+
+    rte_rwlock_write_lock(&g_arp[port_id].lock);
+    g_arp[port_id].local_ip   = new_ip;
+    g_arp[port_id].gateway_ip = new_gw;
+    g_arp[port_id].netmask    = new_mask;
+    rte_rwlock_write_unlock(&g_arp[port_id].lock);
+
+    char ip_buf[INET_ADDRSTRLEN], gw_buf[INET_ADDRSTRLEN], nm_buf[INET_ADDRSTRLEN];
+    tgen_ipv4_str(new_ip,   ip_buf, sizeof(ip_buf));
+    tgen_ipv4_str(new_gw,   gw_buf, sizeof(gw_buf));
+    tgen_ipv4_str(new_mask, nm_buf, sizeof(nm_buf));
+    printf("Port %u: ip %s  gateway %s  netmask %s\n",
+           port_id, ip_buf, gw_buf, nm_buf);
+}
+
 /* ── Show interface details ──────────────────────────────────────────────── */
 static void
 cmd_show(int argc, char **argv)
@@ -871,10 +927,22 @@ cmd_show(int argc, char **argv)
         else
             snprintf(ip_buf, sizeof(ip_buf), "not set");
 
+        char gw_buf[INET_ADDRSTRLEN], nm_buf[INET_ADDRSTRLEN];
+        if (g_arp[p].gateway_ip)
+            tgen_ipv4_str(g_arp[p].gateway_ip, gw_buf, sizeof(gw_buf));
+        else
+            snprintf(gw_buf, sizeof(gw_buf), "not set");
+        if (g_arp[p].netmask)
+            tgen_ipv4_str(g_arp[p].netmask, nm_buf, sizeof(nm_buf));
+        else
+            snprintf(nm_buf, sizeof(nm_buf), "not set");
+
         printf("Port %u\n", p);
         printf("  Driver:      %s\n", c->driver_name);
         printf("  MAC:         %s\n", mac_buf);
         printf("  IP:          %s\n", ip_buf);
+        printf("  Gateway:     %s\n", gw_buf);
+        printf("  Netmask:     %s\n", nm_buf);
         printf("  Link:        %s  %u Mbps  %s\n",
                link.link_status ? "UP" : "DOWN",
                link.link_speed,
@@ -969,6 +1037,7 @@ cli_run(void)
     cli_register("reset",   "Reset all TCP state (connections, ports)", cmd_reset);
     cli_register("trace",    "Packet capture: trace start/stop",          cmd_trace);
     cli_register("show",     "Show interface details: show interface [port]", cmd_show);
+    cli_register("set",      "Set config: set ip <port> <ip> <gateway> <netmask>", cmd_set);
 
     /* Start CLI socket server for remote attach */
     cli_server_init(NULL);

@@ -389,11 +389,38 @@ vaigai> show interface 0
 | Driver      | DPDK PMD driver name                           |
 | MAC         | Hardware MAC address                           |
 | IP          | Configured source IPv4 address                 |
+| Gateway     | Default gateway IPv4 address                   |
+| Netmask     | Subnet mask                                    |
 | Link        | UP/DOWN, speed (Mbps), duplex                  |
 | NUMA socket | NUMA node the port is on                       |
 | Mgmt TX Q   | Dedicated management TX queue index            |
 | Offloads    | Hardware offload capabilities                  |
 | Statistics  | RX/TX packet and byte counters, errors/missed  |
+
+---
+
+## set ip
+
+Set or change the IP address, gateway, and netmask for a port at runtime.
+Overrides any values set via `--src-ip`, `--gateway`, and `--netmask` at startup.
+
+```
+set ip <port> <ip> <gateway> <netmask>
+```
+
+Each port can have its own independent IP, gateway, and netmask.
+
+### Examples
+
+```
+vaigai> set ip 0 10.88.33.65 10.88.32.1 255.255.252.0
+Port 0: ip 10.88.33.65  gateway 10.88.32.1  netmask 255.255.252.0
+
+vaigai> set ip 1 192.168.1.10 192.168.1.1 255.255.255.0
+Port 1: ip 192.168.1.10  gateway 192.168.1.1  netmask 255.255.255.0
+```
+
+Use `show interface` to verify the current settings.
 
 ---
 
