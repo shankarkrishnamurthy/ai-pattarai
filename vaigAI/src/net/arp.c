@@ -162,6 +162,18 @@ void arp_mgmt_process(uint16_t port_id, struct rte_mbuf *m)
     uint16_t op = rte_be_to_cpu_16(arp->arp_opcode);
     uint32_t sender_ip = arp->arp_data.arp_sip;
 
+    uint32_t sh = rte_be_to_cpu_32(sender_ip);
+    uint32_t th = rte_be_to_cpu_32(arp->arp_data.arp_tip);
+    if (op == RTE_ARP_OP_REPLY) {
+        RTE_LOG(DEBUG, USER1,
+                "ARP: mgmt_process port=%u REPLY sender=%u.%u.%u.%u target=%u.%u.%u.%u\n",
+                port_id,
+                (sh >> 24) & 0xFF, (sh >> 16) & 0xFF,
+                (sh >>  8) & 0xFF,  sh        & 0xFF,
+                (th >> 24) & 0xFF, (th >> 16) & 0xFF,
+                (th >>  8) & 0xFF,  th        & 0xFF);
+    }
+
     if (op == RTE_ARP_OP_REQUEST &&
         arp->arp_data.arp_tip == a->local_ip) {
         /* Learn sender's MAC from ARP request (RFC 826) */
@@ -265,6 +277,12 @@ int arp_request(uint16_t port_id, uint32_t ip_net)
 {
     arp_state_t_port *a = &g_arp[port_id];
 
+    uint32_t h = rte_be_to_cpu_32(ip_net);
+    RTE_LOG(DEBUG, USER1, "ARP: request port=%u target=%u.%u.%u.%u\n",
+            port_id,
+            (h >> 24) & 0xFF, (h >> 16) & 0xFF,
+            (h >>  8) & 0xFF,  h        & 0xFF);
+
     /* Pre-insert a PENDING entry so the reply handler can store the MAC */
     rte_rwlock_write_lock(&a->lock);
     int idx = rte_hash_add_key(a->table, &ip_net);
@@ -285,8 +303,8 @@ int arp_request(uint16_t port_id, uint32_t ip_net)
     if (!m) return -1;
     uint16_t txq = g_port_caps[port_id].mgmt_tx_q;
     int nb = rte_eth_tx_burst(port_id, txq, &m, 1);
-    if (!nb) rte_pktmbuf_free(m);
-    else     worker_metrics_add_arp_request_tx(0);
+    if (!nb) { rte_pktmbuf_free(m); RTE_LOG(DEBUG, USER1, "ARP: tx_burst failed port=%u\n", port_id); }
+    else     { worker_metrics_add_arp_request_tx(0); RTE_LOG(DEBUG, USER1, "ARP: tx_burst OK port=%u\n", port_id); }
     return 0;
 }
 

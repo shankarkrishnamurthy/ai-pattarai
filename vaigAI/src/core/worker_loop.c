@@ -113,31 +113,34 @@ int tgen_worker_ctx_init(void)
         /* Assign ports served by this worker */
         uint32_t n_ports = rte_eth_dev_count_avail();
         for (uint32_t p = 0; p < n_ports && p < TGEN_MAX_PORTS; p++) {
-            /* Check if this worker is in port_workers list */
-            bool found = false;
+            /* Find this worker's position in the port's worker list */
+            uint32_t my_pw = UINT32_MAX;
             for (uint32_t pw = 0; pw < g_core_map.port_num_workers[p]; pw++) {
                 if (g_core_map.port_workers[p][pw] == ctx->lcore_id) {
-                    found = true;
+                    my_pw = pw;
                     break;
                 }
             }
-            if (found) {
-                uint32_t idx = ctx->num_ports++;
-                ctx->ports[idx]     = (uint16_t)p;
-                /* Clamp queue indices to actual configured queues.
-                 * Without RSS the port may have only 1 RX queue;
-                 * workers > 0 must share queue 0 (caller must
-                 * ensure no two workers poll the same queue
-                 * concurrently, or restrict generation to 1 worker
-                 * for non-RSS ports). */
-                uint32_t max_rxq = g_port_caps[p].max_rx_queues;
-                uint32_t max_txq = g_port_caps[p].max_tx_queues;
-                if (max_rxq == 0) max_rxq = 1;
-                if (max_txq == 0) max_txq = 1;
-                ctx->rx_queues[idx] = (uint16_t)(w % max_rxq);
-                ctx->tx_queues[idx] = (uint16_t)(w % max_txq);
-                if (ctx->num_ports >= TGEN_MAX_PORTS) break;
-            }
+            if (my_pw == UINT32_MAX)
+                continue;  /* worker not assigned to this port */
+
+            uint32_t max_rxq = g_port_caps[p].max_rx_queues;
+            uint32_t max_txq = g_port_caps[p].max_tx_queues;
+            if (max_rxq == 0) max_rxq = 1;
+            if (max_txq == 0) max_txq = 1;
+
+            /* Skip port if this worker would duplicate an RX queue
+             * already owned by an earlier worker.  AF_PACKET / TAP
+             * ports expose only 1 RX queue — only the first worker
+             * in the list should poll them. */
+            if (my_pw >= max_rxq)
+                continue;
+
+            uint32_t idx = ctx->num_ports++;
+            ctx->ports[idx]     = (uint16_t)p;
+            ctx->rx_queues[idx] = (uint16_t)my_pw;
+            ctx->tx_queues[idx] = (uint16_t)(my_pw % max_txq);
+            if (ctx->num_ports >= TGEN_MAX_PORTS) break;
         }
     }
     return 0;

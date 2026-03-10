@@ -444,7 +444,7 @@ static void
 cmd_ping(int argc, char **argv)
 {
     if (argc < 2) {
-        printf("Usage: ping <dst_ip> [count=5] [size=56] [interval_ms=1000]\n");
+        printf("Usage: ping <dst_ip> [count=5] [size=56] [interval_ms=1000] [port=0]\n");
         return;
     }
     uint32_t dst_ip = 0;
@@ -455,8 +455,14 @@ cmd_ping(int argc, char **argv)
     uint32_t count       = (argc >= 3) ? (uint32_t)strtoul(argv[2], NULL, 10) : 5;
     uint32_t size        = (argc >= 4) ? (uint32_t)strtoul(argv[3], NULL, 10) : 56;
     uint32_t interval_ms = (argc >= 5) ? (uint32_t)strtoul(argv[4], NULL, 10) : 1000;
-    uint16_t port_id     = 0; /* always use port 0 for diagnostic ping */
-    printf("PING %s: %u bytes of data, %u packet(s)\n", argv[1], size, count);
+    uint16_t port_id     = (argc >= 6) ? (uint16_t)strtoul(argv[5], NULL, 10) : 0;
+    if (port_id >= g_n_ports) {
+        printf("ping: port %u does not exist (have %u port(s))\n",
+               port_id, g_n_ports);
+        return;
+    }
+    printf("PING %s (port %u): %u bytes of data, %u packet(s)\n",
+           argv[1], port_id, size, count);
     icmp_ping_start(port_id, dst_ip, count, size, interval_ms, ping_poll_cb);
 }
 
@@ -863,8 +869,9 @@ cmd_set(int argc, char **argv)
         return;
     }
 
-    /* Validate: gateway must be on the same subnet as the new IP */
-    if ((new_ip & new_mask) != (new_gw & new_mask)) {
+    /* Validate: gateway must be on the same subnet as the new IP.
+     * 0.0.0.0 means "no gateway" (direct-link, same-subnet only). */
+    if (new_gw != 0 && (new_ip & new_mask) != (new_gw & new_mask)) {
         printf("set ip: gateway is not on the same subnet as the IP\n");
         return;
     }
@@ -1031,7 +1038,7 @@ cli_run(void)
     cli_register("help",     "Show this help",           cmd_help);
     cli_register("stat",     "Statistics: stat [cpu|mem|net|port] [--rate] [--watch] [--core N]", cmd_stat);
     cli_register("stats",    "Alias for 'stat net'",     cmd_stats);
-    cli_register("ping",     "ICMP ping: ping <ip> [count] [size] [ms]", cmd_ping);
+    cli_register("ping",     "ICMP ping: ping <ip> [count] [size] [ms] [port]", cmd_ping);
     cli_register("start",    "Start traffic: start --ip <ip> --port <N> --duration <s> [flags]", cmd_start);
     cli_register("stop",     "Stop active traffic generation",          cmd_stop_gen);
     cli_register("reset",   "Reset all TCP state (connections, ports)", cmd_reset);
