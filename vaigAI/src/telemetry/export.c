@@ -779,155 +779,147 @@ export_net_text(const metrics_snapshot_t *snap, char *buf, size_t len)
     int p = 0;
     char tmp1[32], tmp2[32], tmp3[32];
 
-    /* ── Ethernet (L2) ─────────────────────────────────────────────── */
+    /* ── L2 — Ethernet ─────────────────────────────────────────────── */
     p = append(buf, len, p,
-        "\n── Ethernet ─────────────────────────────────────────────\n");
+        "\n┌─ L2 Ethernet ──────────────────────────────────────────┐\n");
     p = append(buf, len, p,
-        "  TX packets: %-14s  TX bytes: %s\n",
+        "│  TX packets: %-14s  TX bytes: %-14s│\n",
         fmt_loops(t->tx_pkts, tmp1, sizeof(tmp1)),
         fmt_bytes(t->tx_bytes, tmp2, sizeof(tmp2)));
     p = append(buf, len, p,
-        "  RX packets: %-14s  RX bytes: %s\n",
+        "│  RX packets: %-14s  RX bytes: %-14s│\n",
         fmt_loops(t->rx_pkts, tmp1, sizeof(tmp1)),
         fmt_bytes(t->rx_bytes, tmp2, sizeof(tmp2)));
+    p = append(buf, len, p,
+        "│  ARP req TX: %-14"PRIu64"  ARP reply TX: %-9"PRIu64"│\n",
+        t->arp_request_tx, t->arp_reply_tx);
+    if (t->arp_miss)
+        p = append(buf, len, p,
+            "│  ARP miss:   %-14"PRIu64"                        ⚠│\n",
+            t->arp_miss);
+    p = append(buf, len, p,
+        "└────────────────────────────────────────────────────────┘\n");
 
-    /* ── IPv4 (L3) ─────────────────────────────────────────────────── */
-    if (t->ip_bad_cksum || t->ip_frag_dropped || t->ip_not_for_us) {
+    /* ── L3 — IPv4 / ICMP ──────────────────────────────────────────── */
+    p = append(buf, len, p,
+        "┌─ L3 IPv4 / ICMP ─────────────────────────────────────────┐\n");
+    p = append(buf, len, p,
+        "│  Not for us:   %-12"PRIu64"  Bad checksum:  %-9"PRIu64"│\n",
+        t->ip_not_for_us, t->ip_bad_cksum);
+    p = append(buf, len, p,
+        "│  Frag dropped: %-12"PRIu64"                          │\n",
+        t->ip_frag_dropped);
+    p = append(buf, len, p,
+        "│  ICMP echo TX: %-12"PRIu64"  Unreachable:   %-8"PRIu64"│\n",
+        t->icmp_echo_tx, t->icmp_unreachable_tx);
+    if (t->icmp_bad_cksum)
         p = append(buf, len, p,
-            "\n── IPv4 ─────────────────────────────────────────────────\n");
-        p = append(buf, len, p,
-            "  Bad checksum:  %-10"PRIu64"  Frags dropped: %"PRIu64"\n",
-            t->ip_bad_cksum, t->ip_frag_dropped);
-        if (t->ip_not_for_us)
-            p = append(buf, len, p,
-                "  Not for us:    %"PRIu64"\n", t->ip_not_for_us);
-    }
+            "│  ICMP bad csum: %-11"PRIu64"                        ⚠│\n",
+            t->icmp_bad_cksum);
+    p = append(buf, len, p,
+        "└──────────────────────────────────────────────────────────┘\n");
 
-    /* ── ARP ───────────────────────────────────────────────────────── */
-    if (t->arp_reply_tx || t->arp_request_tx || t->arp_miss) {
-        p = append(buf, len, p,
-            "\n── ARP ──────────────────────────────────────────────────\n"
-            "  Replies TX:    %-10"PRIu64"  Requests TX:   %"PRIu64"\n",
-            t->arp_reply_tx, t->arp_request_tx);
-        if (t->arp_miss)
-            p = append(buf, len, p,
-                "  Cache miss:    %"PRIu64" ⚠\n", t->arp_miss);
-    }
+    /* ── L4 — TCP ──────────────────────────────────────────────────── */
+    p = append(buf, len, p,
+        "┌─ L4 TCP ─────────────────────────────────────────────────┐\n");
+    p = append(buf, len, p,
+        "│  Conn open:   %-13"PRIu64"  Conn close:   %-9"PRIu64"│\n",
+        t->tcp_conn_open, t->tcp_conn_close);
+    p = append(buf, len, p,
+        "│  SYN sent:    %-13"PRIu64"  Retransmits:  %-9"PRIu64"│\n",
+        t->tcp_syn_sent, t->tcp_retransmit);
+    p = append(buf, len, p,
+        "│  RST received:%-13"PRIu64"  RST sent:     %-9"PRIu64"│\n",
+        t->tcp_reset_rx, t->tcp_reset_sent);
+    p = append(buf, len, p,
+        "│  Bad checksum:%-13"PRIu64"  SYN Q drops:  %-9"PRIu64"│\n",
+        t->tcp_bad_cksum, t->tcp_syn_queue_drops);
+    p = append(buf, len, p,
+        "│  Out-of-order:%-13"PRIu64"  Dup ACKs:     %-9"PRIu64"│\n",
+        t->tcp_ooo_pkts, t->tcp_duplicate_acks);
+    p = append(buf, len, p,
+        "│  Payload TX:  %-13s  Payload RX:   %-9s│\n",
+        fmt_bytes(t->tcp_payload_tx, tmp1, sizeof(tmp1)),
+        fmt_bytes(t->tcp_payload_rx, tmp2, sizeof(tmp2)));
+    p = append(buf, len, p,
+        "└──────────────────────────────────────────────────────────┘\n");
 
-    /* ── ICMP ──────────────────────────────────────────────────────── */
-    if (t->icmp_echo_tx || t->icmp_bad_cksum || t->icmp_unreachable_tx) {
+    /* ── L4 — UDP ──────────────────────────────────────────────────── */
+    p = append(buf, len, p,
+        "┌─ L4 UDP ─────────────────────────────────────────────────┐\n");
+    p = append(buf, len, p,
+        "│  TX:          %-13"PRIu64"  RX:           %-9"PRIu64"│\n",
+        t->udp_tx, t->udp_rx);
+    if (t->udp_bad_cksum)
         p = append(buf, len, p,
-            "\n── ICMP ─────────────────────────────────────────────────\n"
-            "  Echo TX:       %-10"PRIu64"  Unreachable TX: %"PRIu64"\n",
-            t->icmp_echo_tx, t->icmp_unreachable_tx);
-        if (t->icmp_bad_cksum)
-            p = append(buf, len, p,
-                "  Bad checksum:  %"PRIu64" ⚠\n", t->icmp_bad_cksum);
-    }
+            "│  Bad checksum:%-13"PRIu64"                          ⚠│\n",
+            t->udp_bad_cksum);
+    p = append(buf, len, p,
+        "└──────────────────────────────────────────────────────────┘\n");
 
-    /* ── UDP (L4) ──────────────────────────────────────────────────── */
-    if (t->udp_tx || t->udp_rx || t->udp_bad_cksum) {
-        p = append(buf, len, p,
-            "\n── UDP ──────────────────────────────────────────────────\n"
-            "  TX:            %-10"PRIu64"  RX:            %"PRIu64"\n",
-            t->udp_tx, t->udp_rx);
-        if (t->udp_bad_cksum)
-            p = append(buf, len, p,
-                "  Bad checksum:  %"PRIu64" ⚠\n", t->udp_bad_cksum);
-    }
+    /* ── L5 — TLS ──────────────────────────────────────────────────── */
+    p = append(buf, len, p,
+        "┌─ L5 TLS ─────────────────────────────────────────────────┐\n");
+    p = append(buf, len, p,
+        "│  Handshake OK:%-13"PRIu64"  Handshake fail:%-8"PRIu64"│\n",
+        t->tls_handshake_ok, t->tls_handshake_fail);
+    p = append(buf, len, p,
+        "│  Records TX:  %-13"PRIu64"  Records RX:   %-9"PRIu64"│\n",
+        t->tls_records_tx, t->tls_records_rx);
+    p = append(buf, len, p,
+        "└──────────────────────────────────────────────────────────┘\n");
 
-    /* ── TCP (L4) ──────────────────────────────────────────────────── */
-    if (t->tcp_syn_sent || t->tcp_conn_open || t->tcp_payload_tx ||
-        t->tcp_payload_rx) {
-        p = append(buf, len, p,
-            "\n── TCP ──────────────────────────────────────────────────\n"
-            "  Conn open:     %-10"PRIu64"  Conn close:    %"PRIu64"\n"
-            "  SYN sent:      %-10"PRIu64"  Retransmits:   %"PRIu64"\n",
-            t->tcp_conn_open, t->tcp_conn_close,
-            t->tcp_syn_sent, t->tcp_retransmit);
-        if (t->tcp_reset_rx || t->tcp_reset_sent)
-            p = append(buf, len, p,
-                "  RST received:  %-10"PRIu64"  RST sent:      %"PRIu64"\n",
-                t->tcp_reset_rx, t->tcp_reset_sent);
-        if (t->tcp_bad_cksum)
-            p = append(buf, len, p,
-                "  Bad checksum:  %"PRIu64" ⚠\n", t->tcp_bad_cksum);
-        if (t->tcp_syn_queue_drops)
-            p = append(buf, len, p,
-                "  SYN queue drops: %"PRIu64" ⚠\n", t->tcp_syn_queue_drops);
-        if (t->tcp_ooo_pkts || t->tcp_duplicate_acks)
-            p = append(buf, len, p,
-                "  Out-of-order:  %-10"PRIu64"  Dup ACKs:      %"PRIu64"\n",
-                t->tcp_ooo_pkts, t->tcp_duplicate_acks);
-        if (t->tcp_payload_tx || t->tcp_payload_rx)
-            p = append(buf, len, p,
-                "  Payload TX:    %-10s  Payload RX:    %s\n",
-                fmt_bytes(t->tcp_payload_tx, tmp1, sizeof(tmp1)),
-                fmt_bytes(t->tcp_payload_rx, tmp2, sizeof(tmp2)));
-    }
-
-    /* ── TLS (L5) ──────────────────────────────────────────────────── */
-    if (t->tls_handshake_ok || t->tls_handshake_fail ||
-        t->tls_records_tx || t->tls_records_rx) {
-        p = append(buf, len, p,
-            "\n── TLS ──────────────────────────────────────────────────\n"
-            "  Handshake OK:  %-10"PRIu64"  Handshake fail: %"PRIu64,
-            t->tls_handshake_ok, t->tls_handshake_fail);
-        if (t->tls_handshake_fail)
-            p = append(buf, len, p, " ⚠");
+    /* ── L7 — HTTP ─────────────────────────────────────────────────── */
+    p = append(buf, len, p,
+        "┌─ L7 HTTP ────────────────────────────────────────────────┐\n");
+    p = append(buf, len, p,
+        "│  Requests TX: %-13"PRIu64"  Responses RX: %-9"PRIu64"│\n",
+        t->http_req_tx, t->http_rsp_rx);
+    bool has_codes = t->http_rsp_1xx || t->http_rsp_2xx ||
+                     t->http_rsp_3xx || t->http_rsp_4xx ||
+                     t->http_rsp_5xx;
+    if (has_codes) {
+        p = append(buf, len, p, "│  Status:     ");
+        if (t->http_rsp_1xx) p = append(buf, len, p, " 1xx:%-5"PRIu64, t->http_rsp_1xx);
+        if (t->http_rsp_2xx) p = append(buf, len, p, " 2xx:%-5"PRIu64, t->http_rsp_2xx);
+        if (t->http_rsp_3xx) p = append(buf, len, p, " 3xx:%-5"PRIu64, t->http_rsp_3xx);
+        if (t->http_rsp_4xx) p = append(buf, len, p, " 4xx:%-5"PRIu64"⚠", t->http_rsp_4xx);
+        if (t->http_rsp_5xx) p = append(buf, len, p, " 5xx:%-5"PRIu64"⚠", t->http_rsp_5xx);
+        /* pad to box edge */
         p = append(buf, len, p, "\n");
-        if (t->tls_records_tx || t->tls_records_rx)
-            p = append(buf, len, p,
-                "  Records TX:    %-10"PRIu64"  Records RX:    %"PRIu64"\n",
-                t->tls_records_tx, t->tls_records_rx);
     }
-
-    /* ── HTTP (L7) ─────────────────────────────────────────────────── */
-    if (t->http_req_tx || t->http_rsp_rx) {
+    if (t->http_parse_err)
         p = append(buf, len, p,
-            "\n── HTTP ─────────────────────────────────────────────────\n"
-            "  Requests TX:   %-10"PRIu64"  Responses RX:  %"PRIu64"\n",
-            t->http_req_tx, t->http_rsp_rx);
-        bool has_codes = t->http_rsp_1xx || t->http_rsp_2xx ||
-                         t->http_rsp_3xx || t->http_rsp_4xx ||
-                         t->http_rsp_5xx;
-        if (has_codes) {
-            p = append(buf, len, p, "  Status codes:  ");
-            if (t->http_rsp_1xx) p = append(buf, len, p, "1xx:%-6"PRIu64" ", t->http_rsp_1xx);
-            if (t->http_rsp_2xx) p = append(buf, len, p, "2xx:%-6"PRIu64" ", t->http_rsp_2xx);
-            if (t->http_rsp_3xx) p = append(buf, len, p, "3xx:%-6"PRIu64" ", t->http_rsp_3xx);
-            if (t->http_rsp_4xx) p = append(buf, len, p, "4xx:%-6"PRIu64" ⚠ ", t->http_rsp_4xx);
-            if (t->http_rsp_5xx) p = append(buf, len, p, "5xx:%-6"PRIu64" ⚠ ", t->http_rsp_5xx);
-            p = append(buf, len, p, "\n");
-        }
-        if (t->http_parse_err)
-            p = append(buf, len, p,
-                "  Parse errors:  %"PRIu64" ⚠\n", t->http_parse_err);
-    }
+            "│  Parse errors:%-13"PRIu64"                          ⚠│\n",
+            t->http_parse_err);
+    p = append(buf, len, p,
+        "└──────────────────────────────────────────────────────────┘\n");
 
     /* ── Latency ───────────────────────────────────────────────────── */
     uint64_t p50 = hist_percentile(&snap->latency, 50.0);
     uint64_t p95 = hist_percentile(&snap->latency, 95.0);
     uint64_t p99 = hist_percentile(&snap->latency, 99.0);
-    if (p50 || p95 || p99) {
+    p = append(buf, len, p,
+        "┌─ Latency ────────────────────────────────────────────────┐\n");
+    p = append(buf, len, p,
+        "│  p50: %-12s  p95: %-12s  p99: %-9s│\n",
+        fmt_lat(p50, tmp1, sizeof(tmp1)),
+        fmt_lat(p95, tmp2, sizeof(tmp2)),
+        fmt_lat(p99, tmp3, sizeof(tmp3)));
+    if (snap->latency.total_count > 0) {
+        uint64_t avg = snap->latency.total_sum_us / snap->latency.total_count;
         p = append(buf, len, p,
-            "\n── Latency ──────────────────────────────────────────────\n"
-            "  p50: %-10s  p95: %-10s  p99: %s\n",
-            fmt_lat(p50, tmp1, sizeof(tmp1)),
-            fmt_lat(p95, tmp2, sizeof(tmp2)),
-            fmt_lat(p99, tmp3, sizeof(tmp3)));
-        if (snap->latency.total_count > 0) {
-            uint64_t avg = snap->latency.total_sum_us / snap->latency.total_count;
-            p = append(buf, len, p,
-                "  min: %-10s  avg: %-10s  max: %s  (%"PRIu64" samples)\n",
-                fmt_lat(snap->latency.min_us, tmp1, sizeof(tmp1)),
-                fmt_lat(avg, tmp2, sizeof(tmp2)),
-                fmt_lat(snap->latency.max_us, tmp3, sizeof(tmp3)),
-                snap->latency.total_count);
-        }
+            "│  min: %-12s  avg: %-12s  max: %-9s│\n",
+            fmt_lat(snap->latency.min_us, tmp1, sizeof(tmp1)),
+            fmt_lat(avg, tmp2, sizeof(tmp2)),
+            fmt_lat(snap->latency.max_us, tmp3, sizeof(tmp3)));
+        p = append(buf, len, p,
+            "│  samples: %-47"PRIu64"│\n", snap->latency.total_count);
     }
+    p = append(buf, len, p,
+        "└──────────────────────────────────────────────────────────┘\n");
 
-    p = append(buf, len, p, "\nWorkers: %u\n", snap->n_workers);
+    p = append(buf, len, p, "Workers: %u\n", snap->n_workers);
 
     return p;
 }

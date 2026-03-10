@@ -1011,15 +1011,9 @@ cli_print_stats(void)
     metrics_snapshot_t snap;
     metrics_snapshot(&snap, g_core_map.num_workers);
 
-    /* Human-readable display */
     char buf[16384];
     export_net_text(&snap, buf, sizeof(buf));
     puts(buf);
-
-    /* Machine-parseable JSON for tests and scripts */
-    char json[4096];
-    export_json(&snap, json, sizeof(json));
-    puts(json);
 }
 
 static void
