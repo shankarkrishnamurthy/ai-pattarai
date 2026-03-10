@@ -897,121 +897,90 @@ hot path. All cross-plane communication uses **lock-free SPSC rings**.
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 Management Core Event Loop
+### 4.2 The Two Loops — Side by Side
 
-The management core runs a **cooperative run-to-completion poll loop** —
-structurally identical to a DPDK worker lcore but processing control-plane
-tasks instead of NIC RX/TX.  No function in the loop body may block.
-
-#### Worker loop vs Management loop — side by side
+Both cores run an identical **cooperative run-to-completion poll loop** — the
+same structural pattern, different payloads. Neither loop may ever block.
 
 ```
-worker_loop() {                     mgmt_loop_run() {
-  while (g_run) {                     while (g_run) {
-    ipc_recv();     // drain cmds       cli_stdin_poll();    // drain user input
-    rx_burst();     // drain NIC RX     cli_server_poll();   // drain remote CLI
-    classify();     // protocol FSM     arp_mgmt_tick();     // drain ARP ring
-    tx_gen();       // generate pkts    icmp_mgmt_tick();    // drain ICMP ring
-    tx_drain();     // flush TX ring    ipc_ack_drain();     // drain ACK ring
-    timer_tick();   // TCP timers       pktrace_flush();     // drain capture ring
-    port_tick();    // TIME_WAIT        traffic_gen_tick();  // monitor duration
-    cpu_account();  // cycle stats      mgmt_cpu_account();  // cycle stats
-    // never sleeps                     // rte_pause() or poll(stdin, 1ms) if idle
-  }                                   }
-}                                   }
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║                      vaigAI — Cooperative Two-Loop Architecture                      ║
+╠══════════════════════════════════════╦═══════════════════════════════════════════════╣
+║   WORKER LCORE(s)  ·  data plane     ║   MANAGEMENT LCORE  ·  control plane         ║
+║   never blocks · never sleeps        ║   never blocks · yields when idle             ║
+╠══════════════════════════════════════╩═══════════════════════════════════════════════╣
+║                                                                                      ║
+║  ┌────────────────────────────────┐       ┌────────────────────────────────────────┐ ║
+║  │ ➊ ipc_recv()                   │  CMD  │ ➊ cli_stdin_poll()    ◄─ priority 1   │ ║
+║  │   receive start/stop/shutdown  │◄──────│ ➋ cli_server_poll()   ◄─ priority 1   │ ║
+║  └───────────────┬────────────────┘  ACK  │   (remote vaigai --attach clients)     │ ║
+║                  │                ───────►└──────────────────┬─────────────────────┘ ║
+║                  │                                           │                       ║
+║  ┌───────────────▼────────────────┐       ┌──────────────────▼─────────────────────┐ ║
+║  │ ➋ rte_eth_rx_burst()           │       │ ➌ arp_mgmt_tick()     ◄─ priority 2   │ ║
+║  │   classify → protocol FSM      │       │ ➍ icmp_mgmt_tick()    ◄─ priority 2   │ ║
+║  │   · TCP/UDP/ICMP handled here  │ pkts  │ ➎ ipc_ack_drain()     ◄─ priority 2   │ ║
+║  │   · ARP/ICMP ──► mgmt ring ───┼───────►                                        │ ║
+║  └───────────────┬────────────────┘       └──────────────────┬─────────────────────┘ ║
+║                  │                                           │                       ║
+║  ┌───────────────▼────────────────┐       ┌──────────────────▼─────────────────────┐ ║
+║  │ ➌ tx_gen_burst()               │       │ ➏ pktrace_flush()     ◄─ priority 3   │ ║
+║  │   token bucket → build pkts    │       │ ➐ traffic_gen_tick()  ◄─ priority 3   │ ║
+║  │   rte_eth_tx_burst()           │       │   (monitors --duration / --one)        │ ║
+║  └───────────────┬────────────────┘       └──────────────────┬─────────────────────┘ ║
+║                  │                                           │                       ║
+║  ┌───────────────▼────────────────┐       ┌──────────────────▼─────────────────────┐ ║
+║  │ ➍ tcp_timer_tick()             │       │ ➑ cpu_accounting()                     │ ║
+║  │   · RTO retransmit (RFC 6298)  │       │                                        │ ║
+║  │   · TIME_WAIT expiry           │       │   busy? ──► rte_pause()   (spin)       │ ║
+║  │   · delayed ACK flush          │       │   idle? ──► poll(stdin, 1ms)           │ ║
+║  ├───────────────────────────────-┤       │             wakes on any keystroke      │ ║
+║  │ ➎ tcp_port_pool_tick()         │       └──────────────────┬─────────────────────┘ ║
+║  │   reclaim expired ports        │                          │                       ║
+║  ├────────────────────────────────┤                          │                       ║
+║  │ ➏ cpu_accounting()             │                          │                       ║
+║  │   rte_pause()  (always spin)   │                          │                       ║
+║  └───────────────┬────────────────┘                          │                       ║
+║                  └──────────────────────── ↺ loop ───────────┘                       ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
 ```
 
-Same pattern: drain inputs → process state → account cycles → loop.
+**Key rules:**
+- Workers own NIC RX/TX queues — the management core never touches them directly (except ARP reply on queue 0).
+- Management core owns CLI, ARP cache, telemetry — workers never read CLI or write to shared state.
+- Priority 1 (CLI) is checked first every iteration so keystrokes are never delayed by background work.
+- `stat --watch` from a remote `--attach` client falls back to a single `--rate` sample (detects memstream via `fileno(stdout) < 0`).
 
-#### Execution order and priority
+#### Activity Reference
 
-```
-mgmt_loop_run() {
-    while (g_run) {
-        // ── Priority 1: User input (never starved) ──
-        cli_stdin_poll();         // non-blocking readline callback API
-        cli_server_poll();        // accept + recv remote clients
+| Step | Function | Core | What it does |
+|------|----------|------|-------------|
+| W➊ | `ipc_recv()` | Worker | Receive CMD from mgmt; send ACK |
+| W➋ | `rte_eth_rx_burst()` / `classify_and_process()` | Worker | RX 32 mbufs, run protocol FSMs, enqueue ARP/ICMP to mgmt ring |
+| W➌ | `tx_gen_burst()` | Worker | Token-bucket paced packet generation (ICMP/UDP/TCP) |
+| W➍ | `tcp_timer_tick()` | Worker | RTO retransmit, TIME_WAIT expiry, delayed ACK |
+| W➎ | `tcp_port_pool_tick()` | Worker | Drain TIME_WAIT FIFO, reclaim ephemeral ports |
+| W➏ | `cpu_accounting()` / `rte_pause()` | Worker | TSC cycle accounting; always spins |
+| M➊ | `cli_stdin_poll()` | Mgmt | Non-blocking readline (`rl_callback_read_char()`) |
+| M➋ | `cli_server_poll()` | Mgmt | Accept + dispatch remote CLI clients (Unix socket) |
+| M➌ | `arp_mgmt_tick()` | Mgmt | Drain ARP rings, send replies, probe stale entries |
+| M➍ | `icmp_mgmt_tick()` | Mgmt | Drain ICMP rings, send replies |
+| M➎ | `ipc_ack_drain()` | Mgmt | Drain worker→mgmt ACK rings, log errors |
+| M➏ | `pktrace_flush()` | Mgmt | Write buffered pcapng captures to disk |
+| M➐ | `traffic_gen_tick()` | Mgmt | Monitor `--duration` / `--one`; print progress |
+| M➑ | `cpu_accounting()` + yield | Mgmt | TSC accounting; `rte_pause()` if busy, `poll(stdin,1ms)` if idle |
 
-        // ── Priority 2: Protocol housekeeping ──
-        arp_mgmt_tick();          // drain ARP rings, probe stale
-        icmp_mgmt_tick();         // drain ICMP rings
-        ipc_ack_drain();          // drain worker→mgmt ACK rings
+#### CPU Cycle Breakdown (`stat cpu`)
 
-        // ── Priority 3: Background work ──
-        pktrace_flush();          // drain capture ring → disk
-        traffic_gen_tick();       // check duration / --one completion
-
-        // ── Adaptive yield ──
-        if (active || pending_work)
-            rte_pause();          // spin — same as worker lcores
-        else
-            poll(stdin, 1ms);     // save CPU; keystroke wakes instantly
-    }
-}
-```
-
-CLI input has **top priority** — stdin and cli_server are checked first in
-every iteration. User keystrokes are dispatched immediately; they never wait
-behind ARP probes, pktrace flushes, or traffic-gen progress checks.
-
-#### Adaptive yield
-
-When any subsystem is active (packet capture, traffic generation, or ring
-data pending), the loop spins with `rte_pause()` — identical to worker
-lcore behavior.  When truly idle, `poll(stdin, 1ms)` yields the core but
-wakes instantly on user input, giving zero-latency CLI response even in
-the sleep path.
-
-#### Management Activities
-
-| Activity | Entry Point | What It Does |
-|----------|-------------|--------------|
-| **CLI stdin** | `cli_stdin_poll()` | Non-blocking readline via `rl_callback_read_char()` |
-| **Remote CLI server** | `cli_server_poll(dispatch)` | Accepts Unix socket connections, reads and dispatches commands |
-| **ARP cache management** | `arp_mgmt_tick()` | Drains worker ARP rings, processes requests/replies, probes stale entries |
-| **ICMP management** | `icmp_mgmt_tick()` | Drains worker ICMP rings, sends replies |
-| **IPC ACK drain** | `ipc_ack_drain()` | Drains `g_ack_rings[]`, logs non-zero return codes |
-| **Packet trace flush** | `pktrace_flush()` | Writes buffered captures to pcapng file |
-| **Traffic gen tick** | `traffic_gen_tick()` | Monitors duration/completion, prints progress |
-| **REST API** | libmicrohttpd | Own internal thread (`MHD_USE_INTERNAL_POLLING_THREAD`) |
-| **Telemetry snapshot** | `metrics_snapshot()` et al. | On-demand read of per-worker counter slabs |
-
-#### Non-blocking `start` command
-
-In interactive mode (TTY), `start` broadcasts `CFG_CMD_START` to workers
-and returns immediately.  The management event loop services
-`traffic_gen_tick()` every iteration to monitor duration and print progress.
-The user can type `stat`, `stop`, or any other command while traffic runs.
-
-In pipe mode (`!isatty(stdin)`), `start` keeps blocking behavior for
-backward compatibility with scripts that expect sequential execution.
-
-#### CPU cycle accounting
-
-The management loop tracks TSC cycles per phase, mirroring worker
-`cpu_stats_t`.  Exposed in `stat cpu` output as a "Mgmt" row:
-
-| Phase | Counter | What it measures |
-|-------|---------|------------------|
-| CLI | `cycles_cli` | stdin poll + cli_server_poll |
-| Proto | `cycles_proto` | ARP + ICMP + IPC ACK drain |
-| Background | `cycles_bg` | pktrace flush + traffic gen tick |
-| Idle | `cycles_idle` | Time in poll(stdin, 1ms) yield |
-
-#### Remote CLI and `--watch`
-
-When a command is dispatched from a remote CLI client (`vaigai --attach`),
-`cli_server_poll()` redirects `stdout` to a `memstream` (via
-`open_memstream()`) before calling `dispatch()`. The captured output is sent
-to the client as a single response after `dispatch()` returns.
-
-This means commands dispatched from remote clients **must not block
-indefinitely** — the remote client's `recv()` will hang until the command
-completes, and the memstream accumulates unbounded output.
-
-The `stat --watch` command detects this context by checking `fileno(stdout)`:
-if `stdout` is a memstream (`fileno() < 0`), it falls back to a single
-`--rate` sample instead of entering the infinite watch loop.
+| Phase | Worker counter | Mgmt counter | Measures |
+|-------|---------------|-------------|---------|
+| RX | `cycles_rx` | — | rx_burst + classify + FSM |
+| TX | `cycles_tx` | — | tx_gen_burst + tx_drain |
+| Timer | `cycles_timer` | — | tcp_timer_tick + port_pool_tick |
+| CLI | — | `cycles_cli` | stdin poll + cli_server_poll |
+| Protocol | — | `cycles_proto` | ARP + ICMP + IPC ACK drain |
+| Background | — | `cycles_bg` | pktrace flush + traffic_gen_tick |
+| Idle | `cycles_idle` | `cycles_idle` | rte_pause iters (worker) / poll(1ms) time (mgmt) |
 
 ### 4.3 IPC Protocol
 
