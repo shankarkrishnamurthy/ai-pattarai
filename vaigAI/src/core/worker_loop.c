@@ -186,16 +186,25 @@ int tgen_worker_loop(void *arg)
                 /* Clear pre-built HTTP request for this worker */
                 if (gcfg->proto == TX_GEN_PROTO_HTTP)
                     g_http_req[ctx->worker_idx].hdr_len = 0;
-                /* Resolve TX queue for the target port */
-                uint16_t tx_q = 0;
+                /* Only start traffic generation if this worker owns the
+                 * target port.  With single-queue drivers (AF_PACKET/TAP),
+                 * only one worker per port passes the max_rxq filter in
+                 * tgen_worker_ctx_init().  Workers without the port must
+                 * not TX on it: they can never receive replies (no RX
+                 * queue), causing endless retransmits; and their TX calls
+                 * would fire pktrace_tx_cb from a second lcore, violating
+                 * the MPSC ring assumption. */
+                uint16_t tx_q = UINT16_MAX;   /* UINT16_MAX = port not owned */
                 for (uint32_t pp = 0; pp < ctx->num_ports; pp++) {
                     if (ctx->ports[pp] == gcfg->port_id) {
                         tx_q = ctx->tx_queues[pp];
                         break;
                     }
                 }
-                tx_gen_configure(&ctx->tx_gen, gcfg, tx_q);
-                tx_gen_start(&ctx->tx_gen);
+                if (tx_q != UINT16_MAX) {
+                    tx_gen_configure(&ctx->tx_gen, gcfg, tx_q);
+                    tx_gen_start(&ctx->tx_gen);
+                }
                 tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
                 continue;
             }

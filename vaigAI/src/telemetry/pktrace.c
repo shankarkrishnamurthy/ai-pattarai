@@ -200,9 +200,13 @@ pktrace_init(void)
 {
     uint32_t data_room = rte_pcapng_mbuf_size(PKTRACE_SNAP_LEN);
 
+    /* MPSC ring: multiple worker lcores may call rte_eth_tx_burst() on
+     * the captured port/queue (e.g. TCP FSM retransmits from the same
+     * worker, or future multi-queue scenarios).  Only the mgmt lcore
+     * dequeues, so SC_DEQ is safe.  SP_ENQ is NOT safe here.          */
     g_ring = rte_ring_create("pktrace_ring", PKTRACE_RING_SZ,
                              rte_socket_id(),
-                             RING_F_SP_ENQ | RING_F_SC_DEQ);
+                             RING_F_SC_DEQ);
     if (!g_ring) {
         TGEN_ERR(TGEN_LOG_MGMT,
                  "pktrace: ring create failed: %s\n",
