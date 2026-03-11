@@ -117,6 +117,14 @@ typedef struct {
     /* HTTP request-response latency (TSC at request send) */
     uint64_t    http_req_sent_tsc;
 
+    /* HTTP response body tracking for proper active close.
+     * http_content_length is parsed from the Content-Length header.
+     * 0 means unknown (chunked / connection-close / not yet parsed).
+     * http_body_rx accumulates body bytes received across segments.
+     * app_state 6 = waiting for remaining body data after headers parsed. */
+    uint32_t    http_content_length;
+    uint32_t    http_body_rx;
+
     /* When true, use graceful FIN close instead of RST at end of
      * transaction (--one flag).  Set by tx_gen when max_initiations > 0. */
     bool        graceful_close;

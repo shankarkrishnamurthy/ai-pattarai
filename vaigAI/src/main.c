@@ -150,6 +150,12 @@ main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    /* In quiet mode (default), suppress INFO/DEBUG messages from our own
+     * subsystems.  EAL messages were already capped via --log-level injection
+     * in tgen_eal_init(), so this covers post-EAL startup log lines. */
+    if (!eal_args.verbose)
+        rte_log_set_global_level(RTE_LOG_WARNING);
+
     /* ---- 2. TSC calibration (done inside tgen_eal_init) ---- */
     RTE_LOG(INFO, USER1, "TSC frequency: %"PRIu64" Hz\n", g_tsc_hz);
 

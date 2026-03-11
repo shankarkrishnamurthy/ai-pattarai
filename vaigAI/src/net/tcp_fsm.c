@@ -31,7 +31,90 @@
 #include <rte_byteorder.h>
 #include <rte_log.h>
 
-/* ── Sequence number arithmetic ──────────────────────────────────────────── */
+/* ── HTTP response body tracking helpers ─────────────────────────────────── */
+
+/* Parse Content-Length from an HTTP response buffer.
+ * Returns the value, or 0 if not found / not parseable.
+ * buf must be at least buf_len bytes; does NOT require NUL termination. */
+static inline uint32_t
+http_parse_content_length(const uint8_t *buf, uint32_t buf_len)
+{
+    /* memmem is a glibc extension, available on Linux */
+    const uint8_t *p = memmem(buf, buf_len, "Content-Length: ", 16);
+    if (!p)
+        p = memmem(buf, buf_len, "content-length: ", 16);
+    if (!p)
+        return 0;
+    p += 16;
+    uint32_t rem = (uint32_t)(buf_len - (uint32_t)(p - buf));
+    uint32_t val = 0;
+    for (uint32_t i = 0; i < rem && p[i] >= '0' && p[i] <= '9'; i++)
+        val = val * 10 + (p[i] - '0');
+    return val;
+}
+
+/* Find the first byte of the HTTP response body (after \r\n\r\n).
+ * Returns the offset into buf, or buf_len if header terminator not found. */
+static inline uint32_t
+http_body_offset(const uint8_t *buf, uint32_t buf_len)
+{
+    const uint8_t *p = memmem(buf, buf_len, "\r\n\r\n", 4);
+    if (!p)
+        return buf_len;
+    return (uint32_t)(p - buf) + 4;
+}
+
+/* After receiving the first HTTP response segment: set up body tracking and
+ * decide what to do next.  Returns true if the connection was closed/reset
+ * (caller must goto done). */
+static inline bool
+http_rsp_body_start(uint32_t worker_idx, tcb_t *tcb,
+                    const uint8_t *buf, uint32_t buf_len)
+{
+    tcb->http_content_length = http_parse_content_length(buf, buf_len);
+    if (tcb->http_content_length == 0) {
+        /* No Content-Length (chunked, connection-close, etc.) —
+         * fall back to passive close: server will send FIN when done. */
+        tcb->app_state = 0;
+        return false;
+    }
+
+    uint32_t body_off = http_body_offset(buf, buf_len);
+    tcb->http_body_rx = (buf_len > body_off) ? (buf_len - body_off) : 0;
+
+    if (tcb->http_body_rx >= tcb->http_content_length) {
+        /* Full body already arrived in this segment — active close now. */
+        tcb->app_state = 0;
+        if (tcb->graceful_close) {
+            tcp_fsm_close(worker_idx, tcb);
+            return true;
+        }
+        tcp_fsm_reset(worker_idx, tcb);
+        return true;
+    }
+
+    /* More body to come — wait in state 6. */
+    tcb->app_state = 6;
+    return false;
+}
+
+/* While in state 6 (accumulating body): add data_len bytes and close when
+ * done.  Returns true if the connection was closed/reset. */
+static inline bool
+http_rsp_body_recv(uint32_t worker_idx, tcb_t *tcb, uint32_t data_len)
+{
+    tcb->http_body_rx += data_len;
+    if (tcb->http_body_rx >= tcb->http_content_length) {
+        tcb->app_state = 0;
+        if (tcb->graceful_close) {
+            tcp_fsm_close(worker_idx, tcb);
+            return true;
+        }
+        tcp_fsm_reset(worker_idx, tcb);
+        return true;
+    }
+    return false;
+}
 #define SEQ_LT(a,b)   ((int32_t)((a)-(b)) <  0)
 #define SEQ_LE(a,b)   ((int32_t)((a)-(b)) <= 0)
 #define SEQ_GT(a,b)   ((int32_t)((a)-(b)) >  0)
@@ -588,7 +671,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
 
                 /* ── L7: TLS handshake / decrypt ──────────────────── */
                 if (tcb->app_state == 2 || tcb->app_state == 3 ||
-                    tcb->app_state == 5) {
+                    tcb->app_state == 5 || tcb->app_state == 6) {
                     uint32_t ci = (uint32_t)(tcb - g_tcb_stores[worker_idx].tcbs);
                     tls_session_t *ts = tls_session_get(worker_idx, ci);
                     if (ts) {
@@ -677,25 +760,28 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                         (http_prebuilt_req_t *)tcb->app_ctx;
                                     if (hpb && hpb->keep_alive) {
                                         tcb->app_state = 4;
+                                    } else if (!tcb->graceful_close) {
+                                        tcp_fsm_reset(worker_idx, tcb);
+                                        goto done;
                                     } else {
-                                        tcb->app_state = 0;
-                                        if (!tcb->graceful_close) {
-                                            tcp_fsm_reset(worker_idx, tcb);
+                                        /* graceful_close: parse Content-Length
+                                         * and close after full body received. */
+                                        if (http_rsp_body_start(worker_idx, tcb,
+                                                plain, (uint32_t)n))
                                             goto done;
-                                        }
-                                        /* graceful_close: passive close — wait
-                                         * for server close_notify + FIN.
-                                         * The --one done condition fires on
-                                         * http_rsp_rx >= 1, so we don't need
-                                         * to initiate active close here. */
                                     }
+                                } else if (tcb->app_state == 6) {
+                                    /* Accumulating response body in TLS stream */
+                                    if (http_rsp_body_recv(worker_idx, tcb,
+                                                           (uint32_t)n))
+                                        goto done;
                                 }
                             }
                         }
                     }
                 }
 
-                /* ── L7: HTTP response parsing (plain HTTP only) ──── */
+                /* ── L7: HTTP response parsing + body accumulation (plain HTTP only) ── */
                 if (tcb->app_state == 5) {
                     uint32_t ci2 = (uint32_t)(tcb - g_tcb_stores[worker_idx].tcbs);
                     tls_session_t *ts2 = tls_session_get(worker_idx, ci2);
@@ -725,24 +811,34 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                             (http_prebuilt_req_t *)tcb->app_ctx;
                         if (hpb && hpb->keep_alive) {
                             tcb->app_state = 4; /* re-send next request */
+                        } else if (!tcb->graceful_close) {
+                            tcp_fsm_reset(worker_idx, tcb);
+                            goto done;
                         } else {
-                            tcb->app_state = 0;
-                            if (!tcb->graceful_close) {
-                                tcp_fsm_reset(worker_idx, tcb);
+                            /* graceful_close: parse Content-Length and
+                             * send FIN only after the full body arrives.
+                             * Falls back to passive close if no
+                             * Content-Length header (chunked, etc.). */
+                            if (http_rsp_body_start(worker_idx, tcb,
+                                    (const uint8_t *)tcp + hdr_len,
+                                    data_len))
                                 goto done;
-                            }
-                            /* graceful_close: passive close — wait for server
-                             * FIN (ESTABLISHED → CLOSE_WAIT path above).
-                             * For --one, the done condition fires on
-                             * http_rsp_rx >= 1 so we don't have to wait for
-                             * the full 4-way close before declaring success.
-                             * Calling tcp_fsm_close() here breaks large
-                             * responses: our premature FIN causes the server
-                             * to slow its transfer, and the body may never
-                             * arrive before duration_s expires. */
                         }
                     }
                     /* TLS HTTP responses handled above in decrypt path */
+                } else if (tcb->app_state == 6) {
+                    /* HTTP body accumulation — only for plain HTTP.
+                     * TLS body is accumulated in the decrypt path above.
+                     * Use else-if so this block does NOT fire on the same
+                     * segment that transitions state 5→6 (which would
+                     * double-count the body bytes already tallied by
+                     * http_rsp_body_start). */
+                    uint32_t ci3 = (uint32_t)(tcb - g_tcb_stores[worker_idx].tcbs);
+                    tls_session_t *ts3 = tls_session_get(worker_idx, ci3);
+                    if (!ts3) {
+                        if (http_rsp_body_recv(worker_idx, tcb, data_len))
+                            goto done;
+                    }
                 }
             }
         }

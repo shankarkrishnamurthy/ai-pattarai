@@ -39,6 +39,8 @@ typedef struct {
     uint32_t    netmask;            /* subnet mask in network byte order (--netmask) */
 
     char        sslkeylog_path[256]; /* SSLKEYLOG file path (--sslkeylog) */
+
+    bool        verbose;            /* -v/--verbose: show all startup log messages */
 } tgen_eal_args_t;
 
 /** Parse argv, populate tgen_eal_args_t, then call rte_eal_init().

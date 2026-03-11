@@ -38,6 +38,7 @@ static const struct option g_long_opts[] = {
     { "gateway",                required_argument, NULL, 'G' },
     { "netmask",                required_argument, NULL, 'N' },
     { "sslkeylog",              required_argument, NULL, 'K' },
+    { "verbose",                no_argument,       NULL, 'v' },
     { NULL, 0, NULL, 0 },
 };
 
@@ -69,7 +70,7 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
     optind = 1;
     opterr = 0; /* suppress errors for unknown options (belong to EAL) */
 
-    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:X:R:I:G:N:K:", g_long_opts,
+    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:X:R:I:G:N:K:v", g_long_opts,
                               &opt_idx)) != -1) {
         switch (opt) {
         case 'W': a->num_worker_cores = (uint32_t)atoi(optarg); break;
@@ -103,6 +104,7 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
             snprintf(a->sslkeylog_path, sizeof(a->sslkeylog_path),
                      "%s", optarg);
             break;
+        case 'v': a->verbose = true; break;
         default:  break; /* unknown → EAL handles */
         }
     }
@@ -116,32 +118,51 @@ int tgen_eal_init(int argc, char **argv, tgen_eal_args_t *out_args)
     tgen_eal_args_t args;
     memset(&args, 0, sizeof(args));
 
-    /* Auto-generate a unique --file-prefix so multiple vaigai instances
-     * can coexist.  Users may still override via the command line.      */
-    static char prefix_buf[64];
-    char *eal_argv[128];
-    int   eal_argc = argc;
-    bool  has_prefix = false;
-
+    /* Pre-scan argv to decide what to inject into EAL args.
+     * --log-level and --file-prefix only appear before the '--' separator.
+     * -v/--verbose may appear anywhere (it is a tgen option after '--'). */
+    bool has_prefix    = false;
+    bool has_log_level = false;
+    bool verbose       = false;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--file-prefix") == 0) {
+        if (strcmp(argv[i], "--") == 0)
+            break;
+        if (strcmp(argv[i], "--file-prefix") == 0)
             has_prefix = true;
+        else if (strcmp(argv[i], "--log-level") == 0)
+            has_log_level = true;
+    }
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
+            verbose = true;
             break;
         }
     }
 
-    if (!has_prefix && argc + 2 < 128) {
+    /* Build eal_argv, optionally injecting --file-prefix and --log-level.
+     * Max injected args: 4 (--file-prefix <pfx> --log-level warning). */
+    static char prefix_buf[64];
+    char *eal_argv[136];
+    int   eal_argc = 0;
+
+    eal_argv[eal_argc++] = argv[0];
+
+    if (!has_prefix) {
         snprintf(prefix_buf, sizeof(prefix_buf), "vaigai_%d", (int)getpid());
-        eal_argv[0] = argv[0];
-        eal_argv[1] = (char *)"--file-prefix";
-        eal_argv[2] = prefix_buf;
-        for (int i = 1; i < argc; i++)
-            eal_argv[i + 2] = argv[i];
-        eal_argc = argc + 2;
-    } else {
-        for (int i = 0; i < argc; i++)
-            eal_argv[i] = argv[i];
+        eal_argv[eal_argc++] = (char *)"--file-prefix";
+        eal_argv[eal_argc++] = prefix_buf;
     }
+
+    /* In quiet mode (default), cap EAL log output at WARNING so the
+     * "EAL: Detected CPU lcores" family of messages is suppressed.
+     * The user can pass --log-level explicitly to override. */
+    if (!verbose && !has_log_level) {
+        eal_argv[eal_argc++] = (char *)"--log-level";
+        eal_argv[eal_argc++] = (char *)"warning";
+    }
+
+    for (int i = 1; i < argc && eal_argc < 136; i++)
+        eal_argv[eal_argc++] = argv[i];
 
     /* Standard DPDK convention: EAL consumes everything up to '--',
      * then returns the count of args it consumed.  Application-specific

@@ -4,6 +4,13 @@
 #include "soft_nic.h"
 
 #include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <net/if.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <linux/ethtool.h>
+#include <linux/sockios.h>
 #include <rte_log.h>
 #include <rte_ethdev.h>
 
@@ -36,7 +43,63 @@ driver_kind_t soft_nic_detect(const char *driver_name)
     return DRIVER_UNKNOWN;
 }
 
-/* ── Per-driver post-init ─────────────────────────────────────────────────── */
+/* ── GRO disable helper ───────────────────────────────────────────────────── */
+
+/* Disable Generic Receive Offload on a Linux network interface.
+ *
+ * AF_PACKET receives packets AFTER kernel GRO coalesces them.  GRO can merge
+ * multiple TCP segments into a single "super-packet" (up to ~64 KB) that
+ * exceeds the AF_PACKET ring frame size (2048 bytes).  Such packets are
+ * truncated by the ring and then dropped by vaigai's IP validation check
+ * (ip->total_length > m->data_len).  Disabling GRO ensures each segment
+ * arrives at most MTU-sized, which fits cleanly into the ring frames.
+ */
+static void disable_gro_on_iface(uint16_t port_id, const char *ifname)
+{
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        RTE_LOG(WARNING, PORT,
+            "Port %u: cannot open socket to disable GRO on %s: %s\n",
+            port_id, ifname, strerror(errno));
+        return;
+    }
+
+    struct ifreq ifr;
+    struct ethtool_value ev;
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+    ev.cmd  = ETHTOOL_SGRO;
+    ev.data = 0;               /* 0 = disable */
+    ifr.ifr_data = (void *)&ev;
+
+    if (ioctl(sock, SIOCETHTOOL, &ifr) < 0) {
+        RTE_LOG(WARNING, PORT,
+            "Port %u: could not disable GRO on %s: %s\n",
+            port_id, ifname, strerror(errno));
+    } else {
+        RTE_LOG(INFO, PORT,
+            "Port %u: GRO disabled on %s (prevents oversized GRO "
+            "packets from being dropped by AF_PACKET ring)\n",
+            port_id, ifname);
+    }
+
+    close(sock);
+}
+
+static void post_init_af_packet(uint16_t port_id, port_caps_t *caps)
+{
+    (void)caps;
+
+    struct rte_eth_dev_info info;
+    if (rte_eth_dev_info_get(port_id, &info) == 0 && info.if_index > 0) {
+        char ifname[IF_NAMESIZE];
+        if (if_indextoname((unsigned)info.if_index, ifname))
+            disable_gro_on_iface(port_id, ifname);
+    }
+}
+
 static void post_init_af_xdp(uint16_t port_id, port_caps_t *caps)
 {
     (void)caps;
@@ -80,6 +143,7 @@ static void post_init_vhost(uint16_t port_id, port_caps_t *caps)
 void soft_nic_post_init(uint16_t port_id, port_caps_t *caps)
 {
     switch (caps->driver) {
+    case DRIVER_AF_PACKET: post_init_af_packet(port_id, caps); break;
     case DRIVER_AF_XDP:   post_init_af_xdp(port_id, caps);  break;
     case DRIVER_TAP:      post_init_tap(port_id, caps);      break;
     case DRIVER_NULL:     post_init_null(port_id, caps);     break;
