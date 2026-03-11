@@ -25,6 +25,7 @@ typedef struct {
     bool        reuse;          /* --reuse (throughput) mode */
     bool        is_tty;         /* stdout is a TTY */
     uint64_t    start_tsc;      /* TSC at start */
+    uint64_t    stop_tsc;       /* TSC at stop (for actual elapsed) */
     uint32_t    duration_s;     /* requested duration */
     uint32_t    n_workers;      /* worker count at start time */
     uint16_t    port_id;        /* DPDK port used */

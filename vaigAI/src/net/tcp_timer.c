@@ -97,6 +97,8 @@ void tcp_timer_tick(uint32_t worker_idx)
                     tls_session_detach(worker_idx, i);
                     tcb->app_state = 0;
                 }
+                /* Count as a closed connection so --one done condition fires */
+                worker_metrics_add_tcp_conn_close(worker_idx);
                 tcp_port_free(worker_idx, tcb->src_ip, tcb->src_port);
                 tcb_free(store, tcb);
             }

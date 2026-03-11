@@ -684,10 +684,11 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                             goto done;
                                         }
                                         /* graceful_close (TLS): send close_notify
-                                         * now so the server knows we are done
-                                         * sending, then wait for the server's
-                                         * close_notify + FIN to trigger our FIN
-                                         * (curl-like four-way close). */
+                                         * immediately, then send our FIN.  The
+                                         * server will ACK and reply with its own
+                                         * close_notify + FIN; the FIN_WAIT_1
+                                         * handler completes the close and
+                                         * increments tcp_conn_close. */
                                         uint8_t cl_buf[64];
                                         size_t cl_len = 0;
                                         int ts_ret = tls_shutdown(ts,
@@ -701,9 +702,8 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                             (void)fs_ret;
                                         }
                                         (void)ts_ret;
-                                        /* Do NOT call tcp_fsm_close() here.
-                                         * The ESTABLISHED FIN handler below
-                                         * will send our FIN when server closes. */
+                                        /* Initiate active close after close_notify */
+                                        tcp_fsm_close(worker_idx, tcb);
                                     }
                                 }
                             }
@@ -747,11 +747,14 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                 tcp_fsm_reset(worker_idx, tcb);
                                 goto done;
                             }
-                            /* graceful_close: wait for server FIN.
-                             * The ESTABLISHED FIN handler below will call
-                             * tcp_fsm_close() when the server closes the
-                             * connection, completing the four-way handshake
-                             * (curl-like behaviour). */
+                            /* graceful_close: initiate active close (FIN).
+                             * Sending our FIN immediately after the response
+                             * avoids waiting up to duration_s for the server
+                             * to send its FIN first.  The server will ACK our
+                             * FIN and send its own FIN; the FIN_WAIT_1 handler
+                             * completes the four-way handshake and increments
+                             * tcp_conn_close, triggering the --one done check. */
+                            tcp_fsm_close(worker_idx, tcb);
                         }
                     }
                     /* TLS HTTP responses handled above in decrypt path */

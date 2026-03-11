@@ -21,10 +21,10 @@ int export_json(const metrics_snapshot_t *snap, char *buf, size_t len);
 
 /**
  * Render a human-readable traffic summary with status, rates, warnings.
- * @param duration_s  test duration in seconds (0 for standalone stats)
+ * @param actual_s    actual elapsed test duration in seconds (0 for standalone)
  * @param proto       protocol name string (e.g. "http", NULL for standalone)
  */
-int export_summary(const metrics_snapshot_t *snap, uint32_t duration_s,
+int export_summary(const metrics_snapshot_t *snap, double actual_s,
                    const char *proto, char *buf, size_t len);
 
 /**

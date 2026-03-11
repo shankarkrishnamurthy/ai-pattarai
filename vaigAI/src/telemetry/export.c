@@ -146,12 +146,12 @@ fmt_lat(uint64_t us, char *tmp, size_t sz)
 /* Human-readable summary with status, rates, warnings                  */
 /* ------------------------------------------------------------------ */
 int
-export_summary(const metrics_snapshot_t *snap, uint32_t duration_s,
+export_summary(const metrics_snapshot_t *snap, double actual_s,
                const char *proto, char *buf, size_t len)
 {
     const worker_metrics_t *t = &snap->total;
     int p = 0;
-    double dur = duration_s > 0 ? (double)duration_s : 1.0;
+    double dur = actual_s > 0.0 ? actual_s : 1.0;
     char tmp1[32], tmp2[32], tmp3[32];
     uint64_t p50 = hist_percentile(&snap->latency, 50.0);
     uint64_t p95 = hist_percentile(&snap->latency, 95.0);
@@ -201,14 +201,14 @@ export_summary(const metrics_snapshot_t *snap, uint32_t duration_s,
     p = append(buf, len, p, "\n--- packets ---\n");
     p = append(buf, len, p, "  tx_pkts: %-12"PRIu64"  tx_bytes: %s",
                t->tx_pkts, fmt_bytes(t->tx_bytes, tmp1, sizeof(tmp1)));
-    if (duration_s > 0)
+    if (actual_s > 0.0)
         p = append(buf, len, p, "  (%s, %.1f Mbps)",
                    fmt_pps((double)t->tx_pkts / dur, tmp2, sizeof(tmp2)),
                    (double)t->tx_bytes * 8.0 / dur / 1e6);
     p = append(buf, len, p, "\n");
     p = append(buf, len, p, "  rx_pkts: %-12"PRIu64"  rx_bytes: %s",
                t->rx_pkts, fmt_bytes(t->rx_bytes, tmp1, sizeof(tmp1)));
-    if (duration_s > 0)
+    if (actual_s > 0.0)
         p = append(buf, len, p, "  (%s)",
                    fmt_pps((double)t->rx_pkts / dur, tmp2, sizeof(tmp2)));
     p = append(buf, len, p, "\n");
@@ -277,7 +277,7 @@ export_summary(const metrics_snapshot_t *snap, uint32_t duration_s,
         if (t->http_rsp_2xx || t->http_rsp_3xx || t->http_rsp_4xx ||
             t->http_rsp_5xx || t->http_parse_err)
             p = append(buf, len, p, "\n");
-        if (duration_s > 0)
+        if (actual_s > 0.0)
             p = append(buf, len, p, "  req/s: %.1f  rsp/s: %.1f\n",
                        (double)t->http_req_tx / dur,
                        (double)t->http_rsp_rx / dur);

@@ -153,8 +153,7 @@ mgmt_traffic_stop(void)
         return;
 
     ts->active = false;
-
-    /* Brief grace period for in-flight packets — keep flushing capture ring */
+    ts->stop_tsc = rte_rdtsc(); /* record actual stop time */
     delay_ms_flush(ts->reuse ? 1000 : 100);
     if (ts->is_tty && !ts->reuse)
         printf("\n");
@@ -164,30 +163,46 @@ mgmt_traffic_stop(void)
     metrics_snapshot(&snap, ts->n_workers);
 
     /* Print results */
+    uint64_t hz_s = rte_get_tsc_hz();
+    /* Actual elapsed: difference between stop_tsc and start_tsc, minus
+     * the grace delay we added in delay_ms_flush() above. Use it for
+     * display and throughput calculations so "Duration" reflects how long
+     * the test actually ran, not the configured maximum. */
+    double actual_s = (ts->stop_tsc > ts->start_tsc)
+        ? (double)(ts->stop_tsc - ts->start_tsc) / (double)hz_s
+        : 0.0;
+    /* Cap at configured duration to avoid confusion for timed-out runs */
+    if (actual_s > (double)ts->duration_s)
+        actual_s = (double)ts->duration_s;
     if (ts->reuse) {
         uint64_t total_bytes = snap.total.tcp_payload_tx;
-        double mbps = (double)total_bytes * 8.0 /
-                      ((double)ts->duration_s * 1e6);
+        double mbps = (actual_s > 0.0)
+            ? (double)total_bytes * 8.0 / (actual_s * 1e6) : 0.0;
         double mb   = (double)total_bytes / (1024.0 * 1024.0);
         printf("[SUM]  0.00-%.2fs    %.0f MB       %.1f Mbps\n",
-               (double)ts->duration_s, mb, mbps);
+               actual_s, mb, mbps);
     } else {
+        /* Show actual elapsed in a human-friendly format */
+        char dur_str[32];
+        if (actual_s < 1.0)
+            snprintf(dur_str, sizeof(dur_str), "%.0f ms", actual_s * 1000.0);
+        else
+            snprintf(dur_str, sizeof(dur_str), "%.1f s", actual_s);
         printf("\n--- traffic statistics ---\n"
-               "Protocol: %s, Duration: %us, Rate: %s\n"
+               "Protocol: %s, Duration: %s, Rate: %s\n"
                "%"PRIu64" packets transmitted\n",
-               ts->proto, ts->duration_s,
+               ts->proto, dur_str,
                ts->rate ? "limited" : "unlimited",
                snap.total.tx_pkts);
-        if (ts->duration_s > 0 && snap.total.tx_pkts > 0) {
-            double pps = (double)snap.total.tx_pkts /
-                         (double)ts->duration_s;
+        if (actual_s > 0.0 && snap.total.tx_pkts > 0) {
+            double pps = (double)snap.total.tx_pkts / actual_s;
             printf("Throughput: %.1f pps\n", pps);
         }
     }
 
     /* Export summary */
     char summary[8192];
-    export_summary(&snap, ts->duration_s, ts->proto,
+    export_summary(&snap, actual_s, ts->proto,
                    summary, sizeof(summary));
     puts(summary);
 
