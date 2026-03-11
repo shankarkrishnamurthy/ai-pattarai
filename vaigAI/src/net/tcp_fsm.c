@@ -666,27 +666,31 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                         tcb->app_state = 4;
                                     } else {
                                         tcb->app_state = 0;
-                                        if (tcb->graceful_close) {
-                                            /* Send TLS close_notify before FIN */
-                                            uint8_t cl_buf[64];
-                                            size_t cl_len = 0;
-                                            int ts_ret = tls_shutdown(ts,
-                                                         cl_buf,
-                                                         sizeof(cl_buf),
-                                                         &cl_len);
-                                            if (cl_len > 0) {
-                                                int fs_ret = tcp_fsm_send(worker_idx,
-                                                             tcb, cl_buf,
-                                                             (uint32_t)cl_len);
-                                                (void)fs_ret;
-                                            }
-                                            int fc_ret = tcp_fsm_close(worker_idx, tcb);
-                                            (void)ts_ret;
-                                            (void)fc_ret;
-                                        } else {
+                                        if (!tcb->graceful_close) {
                                             tcp_fsm_reset(worker_idx, tcb);
+                                            goto done;
                                         }
-                                        goto done;
+                                        /* graceful_close (TLS): send close_notify
+                                         * now so the server knows we are done
+                                         * sending, then wait for the server's
+                                         * close_notify + FIN to trigger our FIN
+                                         * (curl-like four-way close). */
+                                        uint8_t cl_buf[64];
+                                        size_t cl_len = 0;
+                                        int ts_ret = tls_shutdown(ts,
+                                                     cl_buf,
+                                                     sizeof(cl_buf),
+                                                     &cl_len);
+                                        if (cl_len > 0) {
+                                            int fs_ret = tcp_fsm_send(worker_idx,
+                                                         tcb, cl_buf,
+                                                         (uint32_t)cl_len);
+                                            (void)fs_ret;
+                                        }
+                                        (void)ts_ret;
+                                        /* Do NOT call tcp_fsm_close() here.
+                                         * The ESTABLISHED FIN handler below
+                                         * will send our FIN when server closes. */
                                     }
                                 }
                             }
@@ -726,11 +730,15 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                             tcb->app_state = 4; /* re-send next request */
                         } else {
                             tcb->app_state = 0;
-                            if (tcb->graceful_close)
-                                tcp_fsm_close(worker_idx, tcb);
-                            else
+                            if (!tcb->graceful_close) {
                                 tcp_fsm_reset(worker_idx, tcb);
-                            goto done;
+                                goto done;
+                            }
+                            /* graceful_close: wait for server FIN.
+                             * The ESTABLISHED FIN handler below will call
+                             * tcp_fsm_close() when the server closes the
+                             * connection, completing the four-way handshake
+                             * (curl-like behaviour). */
                         }
                     }
                     /* TLS HTTP responses handled above in decrypt path */
@@ -798,6 +806,10 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             /* Arm idle timeout for FIN_WAIT_2 (RFC 9293 §3.6) */
             tcb->timewait_deadline_tsc = rte_rdtsc() +
                 60ULL * rte_get_tsc_hz();
+            /* ACK any data that arrived in the same segment */
+            if (fw1_tlen > fw1_hlen)
+                tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
+                                  NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
         } else if (fw1_tlen > fw1_hlen) {
             /* ACK the data even if no FIN yet */
             tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,

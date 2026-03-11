@@ -686,8 +686,11 @@ calls `tcp_fsm_connect()` + `tcp_fsm_send()` on behalf of CLI commands like
 - RFC 7323 §2.2: SYN-ACK window is NOT scaled — initial `snd_wnd` uses the raw window field.
 - RTT is measured from the SYN round-trip (timestamp echo in SYN-ACK), calibrating RTO before any data segment is sent.
 - **Throughput mode bypass:** connections marked with `app_ctx == (void*)1` (throughput pump) skip congestion control entirely — cwnd is set to UINT32_MAX and `congestion_on_ack`/`congestion_on_rto`/`congestion_fast_retransmit` return early. The receiver's advertised window (`snd_wnd`) is the only flow-control limit.
-- HTTP response timeout: connections in `app_state == 5` (HTTP response pending) are RST'd after 50 ms to free TCB slots quickly.
+- **HTTP response timeout:** connections in `app_state == 5` (HTTP response pending) are RST'd after **5 s** (`TCP_HTTP_RSP_TIMEOUT_US`) if no data arrives. This allows for large responses and slow servers.
+- **`--one` passive close:** for single-request mode (`graceful_close` path), after the HTTP/TLS response headers are received, the FSM clears `app_state` and waits for the server to send its FIN (passive close). This mirrors `curl` behaviour: the full response body is received before vaigai initiates its own half-close. The done condition is `http_rsp_rx >= 1 && tcp_conn_close >= 1`.
+- **Initial RTO:** `TCP_INITIAL_RTO_US` is 200 ms, consistent with the minimum RTO enforced by `update_rtt()` after measurement.
 - RST-no-TCB (RFC 793 §3.4) is disabled to prevent RST storms from overwhelming the peer.
+- **AF_PACKET kernel RST interference:** when using `net_af_packet` on an interface whose IP is also assigned to the Linux kernel, the kernel TCP stack will receive a copy of every SYN-ACK and generate a RST (no matching socket). Run `sudo bash scripts/setup.sh --suppress-rst` before starting vaigai to install an nftables rule that drops kernel-generated RSTs on vaigai's ephemeral port range (10000–59999). Remove with `--clear-rst`. Alternatively, remove the kernel IP from the interface so it is exclusively managed by vaigai.
 
 ---
 

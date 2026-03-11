@@ -15,10 +15,10 @@ extern "C" {
 #define TCP_SYN_QUEUE_SZ       1024
 #define TCP_DELAYED_ACK_US     40000   /* 40 ms */
 #define TCP_MAX_RETRANSMITS    15
-#define TCP_INITIAL_RTO_US     10000   /* 10 ms — aggressive for LAN */
+#define TCP_INITIAL_RTO_US     200000  /* 200 ms — matches post-measurement minimum */
 #define TCP_MAX_RTO_US         60000000 /* 60 s */
 #define TCP_TLS_HS_TIMEOUT_S   5       /* TLS handshake timeout (seconds) */
-#define TCP_HTTP_RSP_TIMEOUT_US 50000   /* 50 ms — abort if no HTTP response */
+#define TCP_HTTP_RSP_TIMEOUT_US 5000000 /* 5 s — wait for full response body */
 
 /** Worker: receive and dispatch an incoming TCP segment.
  *  m's data pointer should be at start of TCP header. */

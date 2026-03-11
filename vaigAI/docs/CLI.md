@@ -146,7 +146,7 @@ start --ip <addr> --port <N> --duration <secs> [options]
 |---------------|---------|-----------------------------------------------|
 | `--proto`     | `tcp`   | Protocol: `tcp`, `http`, `https`, `udp`, `icmp`, `tls` |
 | `--rate`      | 0       | Rate limit in packets/sec (0 = unlimited). Mutually exclusive with `--one`. |
-| `--one`       | off     | Send exactly one request/handshake/connection and stop. Mutually exclusive with `--duration` and `--rate`. |
+| `--one`       | off     | Send exactly one request/handshake/connection and stop. Mutually exclusive with `--duration` and `--rate`. For HTTP/HTTPS, vaigai performs a passive close — waits for the server to send its FIN after the full response body, mirroring `curl` behaviour. |
 | `--size`      | 56      | Payload size in bytes                         |
 | `--streams`   | 1       | Number of concurrent streams (max 16)         |
 | `--reuse`     | off     | Enable connection reuse (throughput mode)     |

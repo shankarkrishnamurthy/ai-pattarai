@@ -663,7 +663,7 @@ cmd_start(int argc, char **argv)
             arp_mgmt_tick();
             pktrace_flush();          /* drain capture ring to avoid drops */
             if (arp_lookup(port_id, nexthop, &dst_mac)) break;
-            rte_delay_ms(10);
+            mgmt_delay_ms_flush(10);
         }
     }
     if (!arp_lookup(port_id, nexthop, &dst_mac)) {
