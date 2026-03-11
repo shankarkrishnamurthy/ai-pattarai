@@ -510,6 +510,19 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                     tcb->app_state = 5; /* HTTP response pending */
                 }
             }
+        } else if ((flags & RTE_TCP_ACK_FLAG) && !(flags & RTE_TCP_RST_FLAG) &&
+                   ack == tcb->snd_nxt) {
+            /* RFC 5961 §4: challenge ACK — server already has a connection
+             * for this 4-tuple (stale ESTABLISHED from a prior test run).
+             * Per RFC 5961 §4.2: respond with RST (seq = SEG.ACK = snd_nxt)
+             * to attempt clearing the stale connection, then fail fast.
+             * The next --one attempt will use a fresh ephemeral port (cursor
+             * already advanced), avoiding the 4-tuple collision. */
+            TGEN_WARN(TGEN_LOG_SYN,
+                "challenge ACK from %08x:%u — stale server conn, sending RST\n",
+                rte_be_to_cpu_32(tcb->dst_ip), tcb->dst_port);
+            tcp_fsm_reset(worker_idx, tcb);
+            goto done;
         }
         break;
 
