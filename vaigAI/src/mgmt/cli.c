@@ -802,8 +802,13 @@ cmd_start(int argc, char **argv)
                         done = (ms.total.tx_pkts >= 1);
                     else if (strcmp(a.proto, "http") == 0 ||
                              strcmp(a.proto, "https") == 0)
-                        done = (ms.total.http_rsp_rx >= 1 &&
-                                ms.total.tcp_conn_close >= 1) ||
+                        /* Done as soon as the response header arrives — no
+                         * need to wait for the full TCP close.  The passive
+                         * close (server FIN → CLOSE_WAIT) or cleanup RST
+                         * will handle teardown after we return to the prompt.
+                         * This matches curl semantics: "done when response
+                         * received", regardless of body size. */
+                        done = ms.total.http_rsp_rx >= 1 ||
                                ms.total.tcp_reset_sent >= 1 ||
                                ms.total.tcp_reset_rx >= 1;
                     else

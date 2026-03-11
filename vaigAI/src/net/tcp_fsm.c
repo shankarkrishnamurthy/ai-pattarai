@@ -683,27 +683,11 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                             tcp_fsm_reset(worker_idx, tcb);
                                             goto done;
                                         }
-                                        /* graceful_close (TLS): send close_notify
-                                         * immediately, then send our FIN.  The
-                                         * server will ACK and reply with its own
-                                         * close_notify + FIN; the FIN_WAIT_1
-                                         * handler completes the close and
-                                         * increments tcp_conn_close. */
-                                        uint8_t cl_buf[64];
-                                        size_t cl_len = 0;
-                                        int ts_ret = tls_shutdown(ts,
-                                                     cl_buf,
-                                                     sizeof(cl_buf),
-                                                     &cl_len);
-                                        if (cl_len > 0) {
-                                            int fs_ret = tcp_fsm_send(worker_idx,
-                                                         tcb, cl_buf,
-                                                         (uint32_t)cl_len);
-                                            (void)fs_ret;
-                                        }
-                                        (void)ts_ret;
-                                        /* Initiate active close after close_notify */
-                                        tcp_fsm_close(worker_idx, tcb);
+                                        /* graceful_close: passive close — wait
+                                         * for server close_notify + FIN.
+                                         * The --one done condition fires on
+                                         * http_rsp_rx >= 1, so we don't need
+                                         * to initiate active close here. */
                                     }
                                 }
                             }
@@ -747,14 +731,15 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                 tcp_fsm_reset(worker_idx, tcb);
                                 goto done;
                             }
-                            /* graceful_close: initiate active close (FIN).
-                             * Sending our FIN immediately after the response
-                             * avoids waiting up to duration_s for the server
-                             * to send its FIN first.  The server will ACK our
-                             * FIN and send its own FIN; the FIN_WAIT_1 handler
-                             * completes the four-way handshake and increments
-                             * tcp_conn_close, triggering the --one done check. */
-                            tcp_fsm_close(worker_idx, tcb);
+                            /* graceful_close: passive close — wait for server
+                             * FIN (ESTABLISHED → CLOSE_WAIT path above).
+                             * For --one, the done condition fires on
+                             * http_rsp_rx >= 1 so we don't have to wait for
+                             * the full 4-way close before declaring success.
+                             * Calling tcp_fsm_close() here breaks large
+                             * responses: our premature FIN causes the server
+                             * to slow its transfer, and the body may never
+                             * arrive before duration_s expires. */
                         }
                     }
                     /* TLS HTTP responses handled above in decrypt path */
