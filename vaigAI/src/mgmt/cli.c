@@ -863,13 +863,13 @@ cmd_reset(int argc, char **argv)
                 tcp_fsm_reset(w, tcb);
                 batch++;
                 if (batch % 1024 == 0)
-                    rte_delay_ms(5);
+                    mgmt_delay_ms_flush(5);
             }
         }
     }
 
     /* Wait for RSTs to be transmitted and remote side to process them */
-    rte_delay_ms(200);
+    mgmt_delay_ms_flush(200);
 
     /* Full reset of TCB stores — clears tombstones left by tcb_free */
     for (uint32_t w = 0; w < n_workers; w++)

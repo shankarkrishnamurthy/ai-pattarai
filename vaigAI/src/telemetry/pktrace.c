@@ -29,7 +29,11 @@
 
 /* ─── tunables ──────────────────────────────────────────────────────────── */
 #define PKTRACE_RING_SZ   4096   /* power-of-2; ring slots                  */
-#define PKTRACE_POOL_SZ   4096   /* pcapng-clone mempool elements            */
+/* Pool must be larger than ring.  When the ring is completely full the pool
+ * still has PKTRACE_POOL_SZ - PKTRACE_RING_SZ free mbufs, so workers never
+ * stall on "pool empty" until the ring is genuinely full AND the mgmt lcore
+ * is not keeping up with disk.  2× the ring is sufficient.                 */
+#define PKTRACE_POOL_SZ   8192   /* pcapng-clone mempool elements (2×ring)  */
 #define PKTRACE_SNAP_LEN  1600   /* bytes captured per packet                */
 #define PKTRACE_BATCH      64    /* write batch size                         */
 
@@ -62,6 +66,11 @@ pktrace_rx_cb(uint16_t port, uint16_t queue,
     if (!atomic_load_explicit(&g_active, memory_order_relaxed))
         return nb_pkts;
 
+    /* Clone all packets into pcapng mbufs, then bulk-enqueue.
+     * Bulk ops reduce CAS pressure on the SPSC ring dramatically. */
+    struct rte_mbuf *clones[PKTRACE_BATCH];
+    uint16_t nc = 0;
+
     for (uint16_t i = 0; i < nb_pkts; i++) {
         uint32_t n = atomic_fetch_add_explicit(&g_captured, 1,
                                                memory_order_relaxed);
@@ -74,23 +83,35 @@ pktrace_rx_cb(uint16_t port, uint16_t queue,
             rte_pcapng_copy(port, queue, pkts[i], g_mp,
                             PKTRACE_SNAP_LEN,
                             RTE_PCAPNG_DIRECTION_IN, NULL);
-        bool pool_empty = (clone == NULL);
-        bool ring_full  = clone && (rte_ring_enqueue(g_ring, clone) != 0);
-        if (pool_empty || ring_full) {
-            if (clone)
-                rte_pktmbuf_free(clone);
+        if (!clone) {
             uint32_t prev =
                 atomic_fetch_add_explicit(&g_dropped, 1, memory_order_relaxed);
             atomic_fetch_sub_explicit(&g_captured, 1, memory_order_relaxed);
-            /* Log first drop and every 1000th thereafter so we can see when
-             * starvation begins without flooding the log. */
             if (prev == 0 || prev % 1000 == 0)
                 RTE_LOG(WARNING, USER1,
-                        "pktrace: DROP #%u — ring=%u/%u %s\n",
-                        prev + 1,
-                        rte_ring_count(g_ring), PKTRACE_RING_SZ,
-                        pool_empty ? "(pool empty)" : "(ring full)");
+                        "pktrace: DROP #%u — ring=%u/%u (pool empty)\n",
+                        prev + 1, rte_ring_count(g_ring), PKTRACE_RING_SZ);
+            continue;
         }
+        clones[nc++] = clone;
+    }
+
+    if (nc == 0)
+        return nb_pkts;
+
+    uint32_t sent = rte_ring_enqueue_burst(g_ring, (void **)clones, nc, NULL);
+    if (sent < nc) {
+        /* Ring full: free what didn't fit */
+        uint32_t lost = nc - sent;
+        for (uint32_t i = sent; i < nc; i++)
+            rte_pktmbuf_free(clones[i]);
+        uint32_t prev =
+            atomic_fetch_add_explicit(&g_dropped, lost, memory_order_relaxed);
+        atomic_fetch_sub_explicit(&g_captured, lost, memory_order_relaxed);
+        if (prev == 0 || prev % 1000 == 0)
+            RTE_LOG(WARNING, USER1,
+                    "pktrace: DROP #%u — ring=%u/%u (ring full, +%u)\n",
+                    prev + 1, rte_ring_count(g_ring), PKTRACE_RING_SZ, lost);
     }
     return nb_pkts;
 }
@@ -106,6 +127,9 @@ pktrace_tx_cb(uint16_t port, uint16_t queue,
     if (!atomic_load_explicit(&g_active, memory_order_relaxed))
         return nb_pkts;
 
+    struct rte_mbuf *clones[PKTRACE_BATCH];
+    uint16_t nc = 0;
+
     for (uint16_t i = 0; i < nb_pkts; i++) {
         uint32_t n = atomic_fetch_add_explicit(&g_captured, 1,
                                                memory_order_relaxed);
@@ -118,12 +142,34 @@ pktrace_tx_cb(uint16_t port, uint16_t queue,
             rte_pcapng_copy(port, queue, pkts[i], g_mp,
                             PKTRACE_SNAP_LEN,
                             RTE_PCAPNG_DIRECTION_OUT, NULL);
-        if (!clone || rte_ring_enqueue(g_ring, clone) != 0) {
-            if (clone)
-                rte_pktmbuf_free(clone);
-            atomic_fetch_add_explicit(&g_dropped, 1, memory_order_relaxed);
+        if (!clone) {
+            uint32_t prev =
+                atomic_fetch_add_explicit(&g_dropped, 1, memory_order_relaxed);
             atomic_fetch_sub_explicit(&g_captured, 1, memory_order_relaxed);
+            if (prev == 0 || prev % 1000 == 0)
+                RTE_LOG(WARNING, USER1,
+                        "pktrace: DROP #%u — ring=%u/%u (pool empty)\n",
+                        prev + 1, rte_ring_count(g_ring), PKTRACE_RING_SZ);
+            continue;
         }
+        clones[nc++] = clone;
+    }
+
+    if (nc == 0)
+        return nb_pkts;
+
+    uint32_t sent = rte_ring_enqueue_burst(g_ring, (void **)clones, nc, NULL);
+    if (sent < nc) {
+        uint32_t lost = nc - sent;
+        for (uint32_t i = sent; i < nc; i++)
+            rte_pktmbuf_free(clones[i]);
+        uint32_t prev =
+            atomic_fetch_add_explicit(&g_dropped, lost, memory_order_relaxed);
+        atomic_fetch_sub_explicit(&g_captured, lost, memory_order_relaxed);
+        if (prev == 0 || prev % 1000 == 0)
+            RTE_LOG(WARNING, USER1,
+                    "pktrace: DROP #%u — ring=%u/%u (ring full, +%u)\n",
+                    prev + 1, rte_ring_count(g_ring), PKTRACE_RING_SZ, lost);
     }
     return nb_pkts;
 }
@@ -155,7 +201,8 @@ pktrace_init(void)
     uint32_t data_room = rte_pcapng_mbuf_size(PKTRACE_SNAP_LEN);
 
     g_ring = rte_ring_create("pktrace_ring", PKTRACE_RING_SZ,
-                             rte_socket_id(), 0 /* MPMC */);
+                             rte_socket_id(),
+                             RING_F_SP_ENQ | RING_F_SC_DEQ);
     if (!g_ring) {
         TGEN_ERR(TGEN_LOG_MGMT,
                  "pktrace: ring create failed: %s\n",

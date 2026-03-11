@@ -28,6 +28,22 @@
 #include <rte_pause.h>
 #include <rte_ethdev.h>
 
+/* Delay for the given number of milliseconds while continuously draining the
+ * pktrace capture ring.  Any mgmt-lcore code that needs to "sleep" must use
+ * this instead of rte_delay_ms() to prevent capture drops at high rates. */
+void
+mgmt_delay_ms_flush(uint32_t ms)
+{
+    uint64_t end = rte_rdtsc() + (uint64_t)ms * rte_get_tsc_hz() / 1000ULL;
+    while (rte_rdtsc() < end) {
+        pktrace_flush();
+        rte_pause();
+    }
+}
+
+/* Local alias so mgmt_loop.c can use the short name internally */
+static inline void delay_ms_flush(uint32_t ms) { mgmt_delay_ms_flush(ms); }
+
 #ifdef HAVE_READLINE
 # include <readline/readline.h>
 # include <readline/history.h>
@@ -138,8 +154,8 @@ mgmt_traffic_stop(void)
 
     ts->active = false;
 
-    /* Brief grace period for in-flight packets */
-    rte_delay_ms(ts->reuse ? 1000 : 100);
+    /* Brief grace period for in-flight packets — keep flushing capture ring */
+    delay_ms_flush(ts->reuse ? 1000 : 100);
     if (ts->is_tty && !ts->reuse)
         printf("\n");
 
@@ -212,7 +228,7 @@ mgmt_traffic_stop(void)
 
     /* --one: reset TCBs, stores, metrics */
     if (ts->one_shot) {
-        rte_delay_ms(50);
+        delay_ms_flush(50);   /* wait for worker to drain in-flight TCB work */
         for (uint32_t w = 0; w < ts->n_workers; w++) {
             tcb_store_t *store = &g_tcb_stores[w];
             for (uint32_t i = 0; i < store->capacity; i++) {
@@ -221,7 +237,7 @@ mgmt_traffic_stop(void)
                     tcp_fsm_reset(w, tcb);
             }
         }
-        rte_delay_ms(100);
+        delay_ms_flush(100);  /* let RSTs propagate before store reset */
         for (uint32_t w = 0; w < ts->n_workers; w++) {
             tcb_store_reset(&g_tcb_stores[w]);
             tcp_port_pool_reset(w);

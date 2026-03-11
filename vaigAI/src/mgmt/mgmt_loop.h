@@ -70,6 +70,13 @@ void mgmt_traffic_start(const traffic_gen_state_t *state);
  */
 void mgmt_traffic_stop(void);
 
+/**
+ * Delay for @p ms milliseconds while continuously draining the pktrace
+ * capture ring.  Any mgmt-lcore code that needs to "sleep" must use this
+ * instead of rte_delay_ms() to prevent capture drops at high rates.
+ */
+void mgmt_delay_ms_flush(uint32_t ms);
+
 #ifdef __cplusplus
 }
 #endif
