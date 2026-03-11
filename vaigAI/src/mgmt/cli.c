@@ -623,7 +623,31 @@ cmd_start(int argc, char **argv)
     }
 
     tx_gen_proto_t proto = start_resolve_proto(&a);
+
+    /* Select egress port: scan all configured ports, prefer the one whose
+     * subnet contains dst_ip (on-link), fall back to any port with a
+     * default gateway, then port 0. */
     uint16_t port_id = 0;
+    bool port_matched = false;
+    for (uint16_t p = 0; p < g_n_ports && !port_matched; p++) {
+        rte_rwlock_read_lock(&g_arp[p].lock);
+        uint32_t lip  = g_arp[p].local_ip;
+        uint32_t lmask = g_arp[p].netmask;
+        rte_rwlock_read_unlock(&g_arp[p].lock);
+        if (lip && lmask && (dst_ip & lmask) == (lip & lmask)) {
+            port_id = p;
+            port_matched = true;
+        }
+    }
+    if (!port_matched) {
+        /* No on-link match — use the first port with a gateway configured */
+        for (uint16_t p = 0; p < g_n_ports; p++) {
+            rte_rwlock_read_lock(&g_arp[p].lock);
+            uint32_t gw = g_arp[p].gateway_ip;
+            rte_rwlock_read_unlock(&g_arp[p].lock);
+            if (gw != 0) { port_id = p; break; }
+        }
+    }
 
     /* Clamp streams */
     if (a.streams > 16) a.streams = 16;
@@ -637,6 +661,7 @@ cmd_start(int argc, char **argv)
         uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
         while (rte_rdtsc() < deadline) {
             arp_mgmt_tick();
+            pktrace_flush();          /* drain capture ring to avoid drops */
             if (arp_lookup(port_id, nexthop, &dst_mac)) break;
             rte_delay_ms(10);
         }
@@ -748,36 +773,47 @@ cmd_start(int argc, char **argv)
     (void)pipe_mode;
     if (a.one) {
         mgmt_traffic_start(&tgs);
+        uint64_t hz        = rte_get_tsc_hz();
+        uint64_t chk_itvl  = hz / 100;              /* 10 ms in TSC ticks  */
+        uint64_t last_chk   = rte_rdtsc() - chk_itvl; /* check on 1st iter */
         while (g_traffic_state.active && g_run) {
+            /* Tight loop: keep ARP/ICMP alive and drain the capture ring
+             * on every iteration so pktrace never starves on busy ports. */
             arp_mgmt_tick();
             icmp_mgmt_tick();
             pktrace_flush();
             cli_server_poll(dispatch);
-            /* Check completion inline */
+            /* Throttle the expensive completion/timeout check to 10 ms */
             uint64_t now = rte_rdtsc();
-            uint64_t hz  = rte_get_tsc_hz();
-            uint64_t elapsed_s = (now - g_traffic_state.start_tsc) / hz;
-            if (elapsed_s >= g_traffic_state.duration_s) {
-                mgmt_traffic_stop();
-                break;
+            if ((now - last_chk) >= chk_itvl) {
+                last_chk = now;
+                uint64_t elapsed_s =
+                    (now - g_traffic_state.start_tsc) / hz;
+                if (elapsed_s >= g_traffic_state.duration_s) {
+                    mgmt_traffic_stop();
+                    break;
+                }
+                if (g_traffic_state.one_shot) {
+                    metrics_snapshot_t ms;
+                    metrics_snapshot(&ms, n_workers);
+                    bool done = false;
+                    if (strcmp(a.proto, "icmp") == 0 ||
+                        strcmp(a.proto, "udp") == 0)
+                        done = (ms.total.tx_pkts >= 1);
+                    else if (strcmp(a.proto, "http") == 0 ||
+                             strcmp(a.proto, "https") == 0)
+                        done = (ms.total.http_rsp_rx >= 1 &&
+                                ms.total.tcp_conn_close >= 1) ||
+                               ms.total.tcp_reset_sent >= 1 ||
+                               ms.total.tcp_reset_rx >= 1;
+                    else
+                        done = ms.total.tcp_conn_close >= 1 ||
+                               ms.total.tcp_reset_sent >= 1 ||
+                               ms.total.tcp_reset_rx >= 1;
+                    if (done) { mgmt_traffic_stop(); break; }
+                }
             }
-            if (g_traffic_state.one_shot) {
-                metrics_snapshot_t ms;
-                metrics_snapshot(&ms, n_workers);
-                bool done = false;
-                if (strcmp(a.proto, "icmp") == 0 ||
-                    strcmp(a.proto, "udp") == 0)
-                    done = (ms.total.tx_pkts >= 1);
-                else if (strcmp(a.proto, "http") == 0 ||
-                         strcmp(a.proto, "https") == 0)
-                    done = (ms.total.http_rsp_rx >= 1 &&
-                            ms.total.tcp_conn_close >= 1);
-                else
-                    done = (ms.total.tcp_conn_close >= 1);
-                if (done) { mgmt_traffic_stop(); break; }
-            }
-            struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
-            nanosleep(&ts, NULL);
+            rte_pause(); /* yield pipeline; matches mgmt_loop_run() behavior */
         }
         return;
     }

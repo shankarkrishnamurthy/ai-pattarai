@@ -78,9 +78,13 @@ traffic_gen_tick(void)
         else if (strcmp(ts->proto, "http") == 0 ||
                  strcmp(ts->proto, "https") == 0)
             done = (ms.total.http_rsp_rx >= 1 &&
-                    ms.total.tcp_conn_close >= 1);
+                    ms.total.tcp_conn_close >= 1) ||
+                   ms.total.tcp_reset_sent >= 1 ||
+                   ms.total.tcp_reset_rx >= 1;
         else
-            done = (ms.total.tcp_conn_close >= 1);
+            done = ms.total.tcp_conn_close >= 1 ||
+                   ms.total.tcp_reset_sent >= 1 ||
+                   ms.total.tcp_reset_rx >= 1;
         if (done) {
             mgmt_traffic_stop();
             return;

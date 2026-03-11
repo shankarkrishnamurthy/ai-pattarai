@@ -74,11 +74,22 @@ pktrace_rx_cb(uint16_t port, uint16_t queue,
             rte_pcapng_copy(port, queue, pkts[i], g_mp,
                             PKTRACE_SNAP_LEN,
                             RTE_PCAPNG_DIRECTION_IN, NULL);
-        if (!clone || rte_ring_enqueue(g_ring, clone) != 0) {
+        bool pool_empty = (clone == NULL);
+        bool ring_full  = clone && (rte_ring_enqueue(g_ring, clone) != 0);
+        if (pool_empty || ring_full) {
             if (clone)
                 rte_pktmbuf_free(clone);
-            atomic_fetch_add_explicit(&g_dropped, 1, memory_order_relaxed);
+            uint32_t prev =
+                atomic_fetch_add_explicit(&g_dropped, 1, memory_order_relaxed);
             atomic_fetch_sub_explicit(&g_captured, 1, memory_order_relaxed);
+            /* Log first drop and every 1000th thereafter so we can see when
+             * starvation begins without flooding the log. */
+            if (prev == 0 || prev % 1000 == 0)
+                RTE_LOG(WARNING, USER1,
+                        "pktrace: DROP #%u — ring=%u/%u %s\n",
+                        prev + 1,
+                        rte_ring_count(g_ring), PKTRACE_RING_SZ,
+                        pool_empty ? "(pool empty)" : "(ring full)");
         }
     }
     return nb_pkts;
@@ -282,12 +293,13 @@ pktrace_flush(void)
     while ((n = rte_ring_dequeue_burst(g_ring, (void **)batch,
                                        PKTRACE_BATCH, NULL)) > 0) {
         ssize_t written = rte_pcapng_write_packets(g_writer, batch, (uint16_t)n);
+        /* Always free — rte_pcapng_write_packets() does NOT free mbufs */
+        for (unsigned i = 0; i < n; i++)
+            rte_pktmbuf_free(batch[i]);
         if (written < 0) {
             TGEN_ERR(TGEN_LOG_MGMT,
                      "pktrace: write error after %u flushed packets\n",
                      g_written);
-            for (unsigned i = 0; i < n; i++)
-                rte_pktmbuf_free(batch[i]);
             break;
         }
         g_written += n;

@@ -903,46 +903,49 @@ Both cores run an identical **cooperative run-to-completion poll loop** — the
 same structural pattern, different payloads. Neither loop may ever block.
 
 ```
-╔══════════════════════════════════════════════════════════════════════════════════════╗
-║                      vaigAI — Cooperative Two-Loop Architecture                      ║
-╠══════════════════════════════════════╦═══════════════════════════════════════════════╣
-║   WORKER LCORE(s)  ·  data plane     ║   MANAGEMENT LCORE  ·  control plane         ║
-║   never blocks · never sleeps        ║   never blocks · yields when idle             ║
-╠══════════════════════════════════════╩═══════════════════════════════════════════════╣
-║                                                                                      ║
-║  ┌────────────────────────────────┐       ┌────────────────────────────────────────┐ ║
-║  │ ➊ ipc_recv()                   │  CMD  │ ➊ cli_stdin_poll()    ◄─ priority 1   │ ║
-║  │   receive start/stop/shutdown  │◄──────│ ➋ cli_server_poll()   ◄─ priority 1   │ ║
-║  └───────────────┬────────────────┘  ACK  │   (remote vaigai --attach clients)     │ ║
-║                  │                ───────►└──────────────────┬─────────────────────┘ ║
-║                  │                                           │                       ║
-║  ┌───────────────▼────────────────┐       ┌──────────────────▼─────────────────────┐ ║
-║  │ ➋ rte_eth_rx_burst()           │       │ ➌ arp_mgmt_tick()     ◄─ priority 2   │ ║
-║  │   classify → protocol FSM      │       │ ➍ icmp_mgmt_tick()    ◄─ priority 2   │ ║
-║  │   · TCP/UDP/ICMP handled here  │ pkts  │ ➎ ipc_ack_drain()     ◄─ priority 2   │ ║
-║  │   · ARP/ICMP ──► mgmt ring ───┼───────►                                        │ ║
-║  └───────────────┬────────────────┘       └──────────────────┬─────────────────────┘ ║
-║                  │                                           │                       ║
-║  ┌───────────────▼────────────────┐       ┌──────────────────▼─────────────────────┐ ║
-║  │ ➌ tx_gen_burst()               │       │ ➏ pktrace_flush()     ◄─ priority 3   │ ║
-║  │   token bucket → build pkts    │       │ ➐ traffic_gen_tick()  ◄─ priority 3   │ ║
-║  │   rte_eth_tx_burst()           │       │   (monitors --duration / --one)        │ ║
-║  └───────────────┬────────────────┘       └──────────────────┬─────────────────────┘ ║
-║                  │                                           │                       ║
-║  ┌───────────────▼────────────────┐       ┌──────────────────▼─────────────────────┐ ║
-║  │ ➍ tcp_timer_tick()             │       │ ➑ cpu_accounting()                     │ ║
-║  │   · RTO retransmit (RFC 6298)  │       │                                        │ ║
-║  │   · TIME_WAIT expiry           │       │   busy? ──► rte_pause()   (spin)       │ ║
-║  │   · delayed ACK flush          │       │   idle? ──► poll(stdin, 1ms)           │ ║
-║  ├───────────────────────────────-┤       │             wakes on any keystroke      │ ║
-║  │ ➎ tcp_port_pool_tick()         │       └──────────────────┬─────────────────────┘ ║
-║  │   reclaim expired ports        │                          │                       ║
-║  ├────────────────────────────────┤                          │                       ║
-║  │ ➏ cpu_accounting()             │                          │                       ║
-║  │   rte_pause()  (always spin)   │                          │                       ║
-║  └───────────────┬────────────────┘                          │                       ║
-║                  └──────────────────────── ↺ loop ───────────┘                       ║
-╚══════════════════════════════════════════════════════════════════════════════════════╝
+╔═════════════════════════════════════════════════════════════════════════════════════╗
+║                    vaigAI — Cooperative Two-Loop Architecture                       ║
+╠═════════════════════════════════════════════════════════════════════════════════════╣
+║  Inter-core:  MGMT ──[ipc_cmd_t]──► WORKER  ·  WORKER ──[ipc_ack_t]──► MGMT       ║
+║               WORKER ──[ARP/ICMP pkts via pkt_ring]──────────────────► MGMT       ║
+╠══════════════════════════════════════════╦══════════════════════════════════════════╣
+║   WORKER LCORE(s)  ·  data plane         ║   MANAGEMENT LCORE  ·  control plane     ║
+║   always spinning  ·  never blocks       ║   yields when idle  ·  never blocks      ║
+╠══════════════════════════════════════════╬══════════════════════════════════════════╣
+║                                          ║                                          ║
+║  ┌────────────────────────────────────┐  ║  ┌────────────────────────────────────┐  ║
+║  │ ➊  ipc_recv()                      │  ║  │ ➊  cli_stdin_poll()                │  ║
+║  │    recv CMD · dispatch to FSM      │  ║  │ ➋  cli_server_poll()               │  ║
+║  │    send ACK back to mgmt           │  ║  │    (remote --attach clients)       │  ║
+║  └─────────────────┬──────────────────┘  ║  └─────────────────┬──────────────────┘  ║
+║                    │                     ║                    │                     ║
+║  ┌─────────────────▼──────────────────┐  ║  ┌─────────────────▼──────────────────┐  ║
+║  │ ➋  rte_eth_rx_burst()              │  ║  │ ➌  arp_mgmt_tick()                 │  ║
+║  │    classify → protocol FSMs        │  ║  │ ➍  icmp_mgmt_tick()                │  ║
+║  │    · TCP / UDP / ICMP              │  ║  │ ➎  ipc_ack_drain()                 │  ║
+║  │    · ARP/ICMP → mgmt pkt ring      │  ║  └─────────────────┬──────────────────┘  ║
+║  └─────────────────┬──────────────────┘  ║                    │                     ║
+║                    │                     ║  ┌─────────────────▼──────────────────┐  ║
+║  ┌─────────────────▼──────────────────┐  ║  │ ➏  pktrace_flush()                 │  ║
+║  │ ➌  tx_gen_burst()                  │  ║  │ ➐  traffic_gen_tick()              │  ║
+║  │    token-bucket-paced TX           │  ║  │    (--duration · --one monitor)    │  ║
+║  │    rte_eth_tx_burst()              │  ║  └─────────────────┬──────────────────┘  ║
+║  └─────────────────┬──────────────────┘  ║                    │                     ║
+║                    │                     ║  ┌─────────────────▼──────────────────┐  ║
+║  ┌─────────────────▼──────────────────┐  ║  │ ➑  cpu_accounting()                │  ║
+║  │ ➍  tcp_timer_tick()                │  ║  │    busy → rte_pause()  [spin]      │  ║
+║  │    · RTO retransmit (RFC 6298)     │  ║  │    idle → poll(stdin, 1 ms)        │  ║
+║  │    · TIME_WAIT expiry              │  ║  └────────────────────────────────────┘  ║
+║  │    · delayed-ACK flush             │  ║                                          ║
+║  ├────────────────────────────────────┤  ║                                          ║
+║  │ ➎  tcp_port_pool_tick()            │  ║                                          ║
+║  │    reclaim ephemeral ports         │  ║                                          ║
+║  ├────────────────────────────────────┤  ║                                          ║
+║  │ ➏  cpu_accounting()                │  ║                                          ║
+║  │    rte_pause()  [always spin]      │  ║                                          ║
+║  └─────────────────┬──────────────────┘  ║                                          ║
+║                    └─────────────────────╫──────────────────── ↺ loop ──────────────║
+╚══════════════════════════════════════════╩══════════════════════════════════════════╝
 ```
 
 **Key rules:**

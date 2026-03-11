@@ -7,6 +7,7 @@
 #include "../port/port_init.h"
 #include "../common/util.h"
 #include "../telemetry/metrics.h"
+#include "../telemetry/pktrace.h"
 
 #include <string.h>
 #include <errno.h>
@@ -248,6 +249,7 @@ int icmp_ping_start(uint16_t port_id, uint32_t dst_ip_net,
         uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
         while (rte_rdtsc() < deadline) {
             arp_mgmt_tick();          /* drains ARP ring from workers */
+            pktrace_flush();          /* drain capture ring to avoid drops */
             if (arp_lookup(port_id, nexthop, &dst_mac)) break;
             rte_delay_ms(10);
         }
@@ -351,10 +353,13 @@ int icmp_ping_start(uint16_t port_id, uint32_t dst_ip_net,
         if (!got_reply)
             printf("Request timeout for icmp_seq=%u\n", seq);
 
-        /* Pace subsequent packets */
+        /* Pace subsequent packets: flush capture ring while waiting */
         if (i + 1 < count) {
             uint64_t next = t0 + (uint64_t)interval_ms * rte_get_tsc_hz() / 1000;
-            while (rte_rdtsc() < next) rte_pause();
+            while (rte_rdtsc() < next) {
+                pktrace_flush();
+                rte_pause();
+            }
         }
     }
 

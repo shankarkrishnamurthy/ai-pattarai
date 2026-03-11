@@ -88,6 +88,7 @@ typedef struct {
     /* State */
     tcp_state_t state;
     uint8_t     lcore_id;
+    uint16_t    port_id;         /* DPDK egress port for this connection */
     bool        active_open;     /* we initiated the connection */
 
     /* Out-of-order queue */

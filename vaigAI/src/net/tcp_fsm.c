@@ -124,7 +124,7 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     if (!buf) { rte_pktmbuf_free(m); return -1; }
 
     /* Ethernet header */
-    uint16_t port_id = 0; /* TODO: route to correct port */
+    uint16_t port_id = tcb->port_id;
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)buf;
     rte_ether_addr_copy(&g_port_caps[port_id].mac_addr, &eth->src_addr);
     /* Resolve destination MAC via ARP (use gateway for off-link) */
@@ -369,6 +369,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->ts_ecr        = opts.ts_val;
             tcb->nagle_enabled = true;
             tcb->lcore_id      = (uint8_t)rte_lcore_id();
+            tcb->port_id       = m->port;
             tcb->rto_us        = TCP_INITIAL_RTO_US;
 
             /* Send SYN-ACK */
@@ -915,7 +916,6 @@ tcb_t *tcp_fsm_connect(uint32_t worker_idx,
                          uint32_t dst_ip, uint16_t dst_port,
                          uint16_t port_id)
 {
-    (void)port_id;
 
     /* Auto-allocate ephemeral port if caller passes 0 */
     if (src_port == 0) {
@@ -940,6 +940,7 @@ tcb_t *tcp_fsm_connect(uint32_t worker_idx,
     tcb->nagle_enabled = true;
     tcb->rto_us       = TCP_INITIAL_RTO_US;
     tcb->lcore_id     = (uint8_t)rte_lcore_id();
+    tcb->port_id      = port_id;
     tcb->active_open  = true;
     tcb->ts_enabled   = true;
     /* Store creation time for TLS handshake timeout.
