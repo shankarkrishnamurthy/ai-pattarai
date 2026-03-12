@@ -210,7 +210,7 @@ vaigai> reset
 Unified statistics command with sub-commands and shared flags.
 
 ```
-stat [cpu|mem|net|port] [--rate] [--watch] [--core N]
+stat [cpu|mem|net|port] [--rate] [--core N]
 ```
 
 Without a sub-command, `stat` prints a brief summary of all domains.
@@ -220,7 +220,6 @@ Without a sub-command, `stat` prints a brief summary of all domains.
 | Flag | Description |
 |------|-------------|
 | `--rate` | Take two snapshots 1 second apart and show rates (pps, Mbps, %) |
-| `--watch` | Continuous refresh every 1 second (implies `--rate`; Ctrl+C stops) |
 | `--core N` | Filter output to a single worker (W*N*) |
 
 ### stat cpu
@@ -239,7 +238,6 @@ W1     2      0       worker   58.9    40.2   14.3   4.4    41.1
 
 vaigai> stat cpu --rate           # 1-second sample
 vaigai> stat cpu --core 0         # single worker
-vaigai> stat cpu --rate --watch   # live monitor
 ```
 
 ### stat mem
@@ -309,7 +307,6 @@ Port  Driver     Link       RX pkts     RX bytes   RX miss  RX err
 ─────────────────────────────────────────────────────────────────────
 
 vaigai> stat port --rate          # live pps and Mbps per port
-vaigai> stat port --rate --watch  # continuous refresh
 ```
 
 ### Backward Compatibility

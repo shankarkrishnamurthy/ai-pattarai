@@ -28,10 +28,10 @@ err()   { echo -e "${RED}[ERR]${NC}   $*"; }
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--server | --tgen | --cleanup]
+Usage: $(basename "$0") [--server | --vaigai | --cleanup]
   (no args)   Run everything: server + vaigai (original behavior)
   --server    Start QEMU VM with all services (terminal 1)
-  --tgen      Start vaigai traffic generator only (terminal 2)
+  --vaigai      Start vaigai traffic generator only (terminal 2)
   --cleanup   Clean up all resources from previous runs
 EOF
 }
@@ -41,7 +41,7 @@ MODE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server)  MODE="server" ;;
-        --tgen)    MODE="tgen" ;;
+        --vaigai)    MODE="vaigai" ;;
         --cleanup) MODE="cleanup" ;;
         -h|--help) usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
@@ -51,7 +51,7 @@ done
 
 # ── Pre-flight checks ───────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
-if [[ "$MODE" == "tgen" || -z "$MODE" ]]; then
+if [[ "$MODE" == "vaigai" || -z "$MODE" ]]; then
     [[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
 fi
 
@@ -81,12 +81,12 @@ ${BOLD}═══ Traffic Commands (at vaigai> prompt or via --attach) ═══$
   start --ip $SIP --port $TLS_PORT --proto tls --one
 
   ${CYAN}# Duration / rate tests${NC}
-  start --ip $SIP --port $TCP_PORT --proto tcp --duration 30
-  start --ip $SIP --port $TCP_PORT --proto tcp --duration 30 --rate 1000
-  start --ip $SIP --port $HTTP_PORT --proto http --duration 30 --url /
-  start --ip $SIP --port $HTTPS_PORT --proto https --duration 30 --url /
-  start --ip $SIP --port $TLS_PORT --proto tls --duration 30
-  start --ip $SIP --port $UDP_PORT --proto udp --size 1024 --duration 30
+  start --ip $SIP --port $TCP_PORT --proto tcp --duration 5
+  start --ip $SIP --port $TCP_PORT --proto tcp --duration 5 --rate 1000
+  start --ip $SIP --port $HTTP_PORT --proto http --duration 5 --url /
+  start --ip $SIP --port $HTTPS_PORT --proto https --duration 5 --url /
+  start --ip $SIP --port $TLS_PORT --proto tls --duration 5
+  start --ip $SIP --port $UDP_PORT --proto udp --size 1024 --duration 5
 
   ${CYAN}# Control${NC}
   stop                          # stop active traffic
@@ -222,7 +222,7 @@ case "$MODE" in
         ok "SSH into VM: ssh -o StrictHostKeyChecking=no -p 2222 root@localhost"
         sleep infinity
         ;;
-    tgen)
+    vaigai)
         setup_hugepages
         start_tgen
         ;;

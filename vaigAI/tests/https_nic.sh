@@ -2,10 +2,33 @@
 # Test: HTTPS over real NIC loopback + QEMU VM (nginx SSL) + Intel QAT.
 #
 # Topology:
-#   vaigAI (DPDK on NIC_VAIGAI) ←loopback cable→ QEMU VM (NIC_VM passthrough, nginx SSL)
-#   Intel QAT DH895XCC devices optionally passed to vaigai and/or QEMU VM
 #
-# NIC pair (default: ens22f0np0 ↔ ens22f1np1, PCI 0000:81:00.0 ↔ 0000:81:00.1)
+# ┌──────────────────────────────── Host ─────────────────────────────────┐
+# │                                                                       │
+# │  vaigAI (DPDK i40e PMD)                       QEMU/KVM VM            │
+# │  ┌────────────────────┐                 ┌──────────────────────┐      │
+# │  │  lcore 14: mgmt    │                 │  Alpine Linux 3.23   │      │
+# │  │  lcore 15: worker  │                 │                      │      │
+# │  │                    │                 │  nginx SSL :443      │      │
+# │  │  ┌──────────────┐ │                 │    /1k    (1 KB)     │      │
+# │  │  │ DPDK crypto  │ │                 │    /100k  (100 KB)   │      │
+# │  │  │ crypto_qat   │ │                 │    /1m    (1 MB)     │      │
+# │  │  └──────┬───────┘ │                 │  socat discard :5001 │      │
+# │  └─────────┼──────────┘                 └──────────┬───────────┘      │
+# │            │                                       │                  │
+# │    ┌───────┴──────┐    loopback cable    ┌─────────┴────────┐        │
+# │    │ ens22f0np0   │◄════════════════════►│ ens22f1np1       │        │
+# │    │ 0000:81:00.0 │    25 Gbps XXV710    │ 0000:81:00.1     │        │
+# │    │ DPDK i40e    │                      │ vfio-pci passthru│        │
+# │    └──────────────┘                      └──────────────────┘        │
+# │    10.0.0.1                               10.0.0.2                    │
+# │                                                                       │
+# │    ┌── QAT DH895XCC ──────────────────────────────────────────┐      │
+# │    │  0000:0b:00.0  →  vaigai (DPDK crypto_qat PMD)          │      │
+# │    │  0000:0c:00.0  →  VM (vfio-pci → qatengine)             │      │
+# │    │  0000:0d-0e,11 →  idle                                   │      │
+# │    └──────────────────────────────────────────────────────────┘      │
+# └───────────────────────────────────────────────────────────────────────┘
 #
 # The QEMU VM boots Alpine Linux with nginx serving HTTPS on :443.
 #

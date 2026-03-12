@@ -2,7 +2,24 @@
 # Test: HTTP over real Mellanox ConnectX-4 NIC loopback + QEMU microVM.
 #
 # Topology:
-#   vaigAI (DPDK mlx5 on NIC_VAIGAI) ←loopback cable→ QEMU VM (NIC_VM passthrough, nginx)
+#
+# ┌─────────────────────────────── Host ──────────────────────────────────┐
+# │                                                                       │
+# │  vaigAI (DPDK mlx5 PMD)                          QEMU/KVM VM         │
+# │  ┌────────────────────┐                    ┌──────────────────────┐   │
+# │  │  lcore 14: mgmt    │                    │  Alpine Linux 3.23   │   │
+# │  │  lcore 15: worker  │                    │                      │   │
+# │  └────────┬───────────┘                    │  nginx        :80    │   │
+# │           │                                │  socat echo   :5000  │   │
+# │    ┌──────┴──────┐    loopback cable       │  socat discard:5001  │   │
+# │    │ ens30f0np0  │◄══════════════════════►│  socat chargen:5002  │   │
+# │    │ 0000:95:00.0│    50 Gbps ConnectX-4   │                      │   │
+# │    │ DPDK mlx5   │                         │  ens30f1np1 (eth0)   │   │
+# │    │ bifurcated  │                         │  0000:95:00.1        │   │
+# │    └─────────────┘                         │  vfio-pci passthru   │   │
+# │    10.0.0.1                                │  10.0.0.2            │   │
+# │                                            └──────────────────────┘   │
+# └───────────────────────────────────────────────────────────────────────┘
 #
 # NIC pair (default: ens30f0np0 ↔ ens30f1np1, PCI 0000:95:00.0 ↔ 0000:95:00.1)
 #   - NIC_VAIGAI is used by vaigAI via DPDK mlx5 PMD (bifurcated — no kernel unbind)

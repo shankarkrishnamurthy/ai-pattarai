@@ -739,7 +739,6 @@ Management never writes to `g_metrics[]`. Ownership is strict and one-directiona
 | Trigger | Who runs it | Frequency |
 |---------|-------------|-----------|
 | CLI `stat` command | mgmt core (readline thread) | once per keystroke |
-| CLI `stat --watch` | mgmt core in loop | 1 Hz continuous |
 | REST `GET /api/v1/stats/*` | libmicrohttpd thread on mgmt core | once per HTTP request |
 | `start` live progress | mgmt core in sleep loop | 1 Hz for the start duration |
 | Remote CLI `stat` | mgmt core via socket poll | once per remote command |
@@ -956,7 +955,6 @@ same structural pattern, different payloads. Neither loop may ever block.
 - Workers own NIC RX/TX queues — the management core never touches them directly (except ARP reply on queue 0).
 - Management core owns CLI, ARP cache, telemetry — workers never read CLI or write to shared state.
 - Priority 1 (CLI) is checked first every iteration so keystrokes are never delayed by background work.
-- `stat --watch` from a remote `--attach` client falls back to a single `--rate` sample (detects memstream via `fileno(stdout) < 0`).
 
 #### Activity Reference
 
@@ -1035,7 +1033,7 @@ vaigai> help
 | Command | Syntax | Description |
 |---------|--------|-------------|
 | `help` | `help` | List available commands |
-| `stat` | `stat [cpu\|mem\|net\|port] [--rate] [--watch] [--core N]` | Unified statistics (see CLI.md) |
+| `stat` | `stat [cpu\|mem\|net\|port] [--rate] [--core N]` | Unified statistics (see CLI.md) |
 | `stats` | `stats` | Alias for `stat net` (backward compat) |
 | `ping` | `ping <ip> [count] [size] [interval_ms]` | ICMP echo request |
 | `start` | `start --proto <proto> --ip <ip> --duration <s> [--rate <pps>] [--size <bytes>] [--port <port>] [--tls] [--reuse] [--streams <n>]` | Start traffic generation |

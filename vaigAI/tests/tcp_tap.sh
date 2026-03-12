@@ -1,6 +1,30 @@
 #!/usr/bin/env bash
 # Test: TCP over dual TAP + Linux bridge + Firecracker microVM.
 #
+# Topology:
+#
+# ┌─────────────────────────────── Host ──────────────────────────────────┐
+# │                                                                       │
+# │  vaigAI                                                               │
+# │    └─► DPDK net_tap0                                                  │
+# │          │                                                            │
+# │   ┌──────┴──────┐     ┌────────────┐     ┌────────────┐              │
+# │   │ tap-vaigai  │◄═══►│ br-vaigai  │◄═══►│  tap-fc0   │              │
+# │   └─────────────┘     └────────────┘     └─────┬──────┘              │
+# │                                                 │                     │
+# │                                    ┌────────────▼──────────────┐      │
+# │                                    │   Firecracker microVM     │      │
+# │                                    │   Alpine · eth0=tap-fc0   │      │
+# │                                    │   192.168.204.2           │      │
+# │                                    │                           │      │
+# │                                    │   socat echo   :5000      │      │
+# │                                    │   socat discard :5001     │      │
+# │                                    │   socat chargen :5002     │      │
+# │                                    └───────────────────────────┘      │
+# │                                                                       │
+# │   vaigAI IP = 192.168.204.1                                          │
+# └───────────────────────────────────────────────────────────────────────┘
+#
 # Runs three tests:
 #   T1 — SYN flood (CPS benchmark)
 #   T2 — Full lifecycle: SYN → DATA → FIN (echo server)

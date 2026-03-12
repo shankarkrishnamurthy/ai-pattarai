@@ -96,7 +96,6 @@ cmd_stats(int argc, char **argv)
 /* ── Shared stat flags ────────────────────────────────────────────────────── */
 typedef struct {
     bool rate;      /* --rate: 1-second delta */
-    bool watch;     /* --watch: continuous refresh (implies rate) */
     int  core;      /* --core N (-1 = all) */
 } stat_opts_t;
 
@@ -104,15 +103,11 @@ static void
 stat_parse_opts(int argc, char **argv, int start, stat_opts_t *opts)
 {
     opts->rate  = false;
-    opts->watch = false;
     opts->core  = -1;
     for (int i = start; i < argc; i++) {
         if (strcmp(argv[i], "--rate") == 0)
             opts->rate = true;
-        else if (strcmp(argv[i], "--watch") == 0) {
-            opts->watch = true;
-            opts->rate  = true;
-        } else if (strcmp(argv[i], "--core") == 0 && i + 1 < argc) {
+        else if (strcmp(argv[i], "--core") == 0 && i + 1 < argc) {
             opts->core = atoi(argv[++i]);
         }
     }
@@ -354,59 +349,12 @@ cmd_stat(int argc, char **argv)
 
     stat_parse_opts(argc, argv, 2, &opts);
 
-    /* --watch wraps in a loop */
-    if (opts.watch) {
-        /* When dispatched from a remote CLI client (vaigai --attach),
-         * stdout is a memstream with no file descriptor.  The remote
-         * client has no way to press a key to exit the loop, so fall
-         * back to a single --rate sample instead of blocking the
-         * management core indefinitely. */
-        if (fileno(stdout) < 0) {
-            opts.watch = false;
-            /* opts.rate is already true (--watch implies --rate);
-             * fall through to the single-shot path below. */
-        } else if (!isatty(STDOUT_FILENO)) {
-            printf("--watch requires a TTY\n");
-            return;
-        }
-    }
-
-    if (opts.watch) {
-        while (g_run) {
-            printf("\033[H\033[2J"); /* clear screen */
-            if (strcmp(sub, "cpu") == 0)       stat_cpu(&opts);
-            else if (strcmp(sub, "mem") == 0)  stat_mem(&opts);
-            else if (strcmp(sub, "net") == 0)  stat_net(&opts);
-            else if (strcmp(sub, "port") == 0) stat_port(&opts);
-            else { printf("Unknown stat sub-command: %s\n", sub); return; }
-            fflush(stdout);
-
-            /* Service ARP / ICMP / pcap-trace between iterations.
-             * The stat_*() functions already slept ~1 s for rate
-             * sampling; this loop adds ~100 ms of management ticks
-             * so the control plane (ARP replies, ICMP echo, packet
-             * capture flush) keeps working and does not starve
-             * ongoing traffic generation. */
-            struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
-            bool quit = false;
-            for (int t = 0; t < 10 && !quit; t++) {
-                arp_mgmt_tick();
-                icmp_mgmt_tick();
-                pktrace_flush();
-                if (poll(&pfd, 1, 10) > 0)
-                    quit = true;
-            }
-            if (quit) break;
-        }
-        return;
-    }
-
     if (strcmp(sub, "cpu") == 0)       stat_cpu(&opts);
     else if (strcmp(sub, "mem") == 0)  stat_mem(&opts);
     else if (strcmp(sub, "net") == 0)  stat_net(&opts);
     else if (strcmp(sub, "port") == 0) stat_port(&opts);
     else printf("Unknown stat sub-command: %s\n"
-                "Usage: stat [cpu|mem|net|port] [--rate] [--watch] [--core N]\n",
+                "Usage: stat [cpu|mem|net|port] [--rate] [--core N]\n",
                 sub);
 }
 
@@ -1097,8 +1045,8 @@ cli_run(void)
         "With a command name, shows detailed usage for that command.\n",
         cmd_help);
 
-    cli_register("stat",     "Statistics: stat [cpu|mem|net|port] [--rate] [--watch] [--core N]",
-        "Usage: stat [cpu|mem|net|port] [--rate] [--watch] [--core N]\n"
+    cli_register("stat",     "Statistics: stat [cpu|mem|net|port] [--rate] [--core N]",
+        "Usage: stat [cpu|mem|net|port] [--rate] [--core N]\n"
         "\n"
         "Sub-commands:\n"
         "  cpu    Per-core CPU utilisation (RX%, TX%, Timer%, Idle%)\n"
@@ -1108,7 +1056,6 @@ cli_run(void)
         "\n"
         "Flags:\n"
         "  --rate       1-second delta sample (pps, Mbps, %)\n"
-        "  --watch      Continuous refresh (implies --rate; press any key to stop)\n"
         "  --core N     Filter output to worker N\n"
         "\n"
         "Without a sub-command, prints a brief summary of all domains.\n",

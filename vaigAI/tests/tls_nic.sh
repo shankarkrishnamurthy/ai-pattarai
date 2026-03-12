@@ -2,14 +2,33 @@
 # Test: TLS over real NIC loopback + QEMU VM + Intel QAT crypto offload.
 #
 # Topology:
-#   vaigAI (DPDK mlx5/i40e on NIC_VAIGAI) ←loopback cable→ QEMU VM (NIC_VM passthrough, openssl s_server)
-#   Intel QAT DH895XCC devices optionally passed to vaigai and/or QEMU VM
 #
-# NIC pair (default: ens22f0np0 ↔ ens22f1np1, PCI 0000:81:00.0 ↔ 0000:81:00.1)
-#   - NIC_VAIGAI is used by vaigAI via DPDK PMD (bifurcated — no kernel unbind)
-#   - NIC_VM is unbound from kernel, bound to vfio-pci, passed to QEMU VM
-#
-# The QEMU VM boots Alpine Linux with openssl s_server for raw TLS testing.
+# ┌──────────────────────────────── Host ───────────────────────────────────┐
+# │                                                                       │
+# │  vaigAI (DPDK i40e PMD)                       QEMU/KVM VM            │
+# │  ┌────────────────────┐                 ┌──────────────────────┐      │
+# │  │  lcore 14: mgmt    │                 │  Alpine Linux 3.23   │      │
+# │  │  lcore 15: worker  │                 │                      │      │
+# │  │                    │                 │  openssl s_server    │      │
+# │  │  ┌──────────────┐ │                 │    :4433 (TLS)       │      │
+# │  │  │ DPDK crypto  │ │                 │  socat discard :5001 │      │
+# │  │  │ crypto_qat   │ │                 │                      │      │
+# │  │  └──────┬───────┘ │                 └──────────┬───────────┘      │
+# │  └─────────┼──────────┘                           │                   │
+# │            │                                      │                   │
+# │    ┌───────┴─────┐    loopback cable    ┌────────┴────────┐        │
+# │    │ ens22f0np0   │◄════════════════════►│ ens22f1np1       │        │
+# │    │ 0000:81:00.0 │    25 Gbps XXV710    │ 0000:81:00.1     │        │
+# │    │ DPDK i40e    │                      │ vfio-pci passthru│        │
+# │    └──────────────┘                      └──────────────────┘        │
+# │    10.0.0.1                               10.0.0.2                    │
+# │                                                                       │
+# │    ┌── QAT DH895XCC ──────────────────────────────────────────┐      │
+# │    │  0000:0b:00.0  →  vaigai (DPDK crypto_qat PMD)          │      │
+# │    │  0000:0c:00.0  →  VM (vfio-pci → qatengine)             │      │
+# │    │  0000:0d-0e,11 →  idle                                   │      │
+# │    └──────────────────────────────────────────────────────────┘      │
+# └───────────────────────────────────────────────────────────────────────┘
 #
 # Tests:
 #   T1 — TLS Handshake TPS: start --proto tls + rate-limited (peak TPS discovery)
