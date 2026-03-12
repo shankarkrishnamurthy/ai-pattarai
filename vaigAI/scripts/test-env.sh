@@ -309,9 +309,9 @@ build_rootfs() {
     # Install apk-tools statically if not available
     if ! command -v apk &>/dev/null; then
         info "Installing apk-tools-static"
-        curl -Lo /tmp/apk-tools-static.apk \
+        curl -fLo /tmp/apk-tools-static.apk \
             "${mirror}/main/x86_64/apk-tools-static-2.14.6-r3.apk" 2>/dev/null \
-            || curl -Lo /tmp/apk-tools-static.apk \
+            || curl -fLo /tmp/apk-tools-static.apk \
             "${mirror}/main/x86_64/$(curl -sL "${mirror}/main/x86_64/" | grep -o 'apk-tools-static-[^"]*\.apk' | tail -1)" 2>/dev/null
         tar xf /tmp/apk-tools-static.apk -C /tmp sbin/apk.static 2>/dev/null || true
         APK=/tmp/sbin/apk.static
@@ -323,7 +323,7 @@ build_rootfs() {
     echo "${mirror}/main"      >  "$mnt/etc/apk/repositories"
     echo "${mirror}/community" >> "$mnt/etc/apk/repositories"
 
-    $APK add --root "$mnt" --initdb --no-cache --arch x86_64 \
+    $APK add --root "$mnt" --initdb --no-cache --arch x86_64 --allow-untrusted \
         alpine-base openrc busybox busybox-openrc busybox-suid \
         bash coreutils \
         socat curl tcpdump \
@@ -939,9 +939,9 @@ verify_env() {
     local pass=0 fail=0
     check() {
         if eval "$2" &>/dev/null; then
-            ok "$1"; ((pass++))
+            ok "$1"; pass=$((pass + 1))
         else
-            warn "MISSING: $1"; ((fail++))
+            warn "MISSING: $1"; fail=$((fail + 1))
         fi
     }
 
