@@ -15,6 +15,7 @@
 
 ---
 
+<a id="1-system-architecture"></a>
 ## 1. System Architecture
 
 ### 1.1 High-Level Block Diagram
@@ -279,6 +280,7 @@ Mempool allocation uses a 3-tier NUMA fallback: worker's socket with 1 GB pages 
 
 ---
 
+<a id="2-life-of-a-packet"></a>
 ## 2. Life of a Packet
 
 ### 2.1 Receive Path — From Wire to Protocol Handler
@@ -695,6 +697,7 @@ calls `tcp_fsm_connect()` + `tcp_fsm_send()` on behalf of CLI commands like
 
 ---
 
+<a id="3-telemetry-system"></a>
 ## 3. Telemetry System
 
 ### 3.1 Ownership & Data Flow
@@ -855,6 +858,7 @@ Each macro adds `[function:line]` prefix automatically.
 
 ---
 
+<a id="4-control-plane--data-plane-segregation"></a>
 ## 4. Control Plane / Data Plane Segregation
 
 ### 4.1 Design Principle
@@ -1201,29 +1205,49 @@ safe without mutual exclusion in the fast path:
 
 ---
 
+<a id="5-test-infrastructure"></a>
 ## 5. Test Infrastructure
 
 ### 5.1 Test Script Overview
 
 ```
 tests/
-├── ping_veth.sh            # ICMP over veth — smoke test (no VM)
-├── udp_veth.sh             # UDP over veth — datagram validation
-├── arp_test.sh             # ARP resolution + cache lifecycle
-├── tcp_tap.sh              # TCP SYN/data/FIN over TAP + Firecracker
-├── http_nic.sh             # HTTP RPS + throughput over NIC + QEMU
-├── tls_nic.sh              # TLS handshake/throughput over NIC + QEMU + QAT
-├── https_nic.sh            # HTTPS (nginx SSL) over NIC + QEMU + QAT
-└── manual-tests.sh         # Cut-and-paste reference for all topologies
+├── ping_veth.sh                # ICMP over veth — smoke test (no VM)
+├── udp_veth.sh                 # UDP over veth — datagram validation
+├── arp_test.sh                 # ARP resolution + cache lifecycle
+├── tcp_tap.sh                  # TCP SYN/data/FIN over TAP + Firecracker
+├── http_nic.sh                 # HTTP RPS + throughput over NIC + QEMU
+├── tls_nic.sh                  # TLS handshake/throughput over NIC + QEMU + QAT
+├── https_nic.sh                # HTTPS (nginx SSL) over NIC + QEMU + QAT
+└── manual/                     # Interactive scripts for all topologies
+    ├── 1a-qemu-mlx5.sh         # QEMU VM + Mellanox ConnectX (mlx5)
+    ├── 1b-qemu-i40e.sh         # QEMU VM + Intel XXV710 (i40e)
+    ├── 1c-firecracker-tap.sh   # Firecracker MicroVM + TAP bridge
+    ├── 1d-container-afxdp.sh   # Podman container + AF_XDP
+    ├── 1e-native-afpacket.sh   # Native processes + veth / AF_PACKET
+    ├── 1g-net-ring.sh          # Software loopback (net_ring)
+    ├── 1h-net-null.sh          # CPU benchmark / null sink
+    ├── 1i-net-pcap.sh          # PCAP replay + capture
+    ├── 1j-qemu-virtio.sh       # QEMU microVM + virtio-net bridge
+    ├── 1k-vhost-user.sh        # vhost-user ↔ QEMU microVM
+    └── README.md               # Usage guide and topology reference
 ```
 
 ### 5.2 Topology Tiers
 
-| Tier | Transport | VM | NIC | Script(s) |
-|------|-----------|-----|------|----------|
-| **Kernel** | veth / TAP | None | Virtual | `ping_veth.sh`, `udp_veth.sh`, `arp_test.sh` |
-| **TAP + Firecracker** | TAP + bridge | Firecracker microVM | `net_tap` PMD | `tcp_tap.sh` |
-| **NIC + QEMU** | Physical loopback | QEMU/KVM + vfio-pci | HW PMD (mlx5/i40e) | `http_nic.sh`, `tls_nic.sh`, `https_nic.sh` |
+| Tier | Transport | VM / Container | NIC / PMD | Script(s) |
+|------|-----------|----------------|-----------|----------|
+| **Kernel veth** | veth pair | None | Virtual | `ping_veth.sh`, `udp_veth.sh`, `arp_test.sh` |
+| **TAP + Firecracker** | TAP + bridge | Firecracker microVM | `net_tap` PMD | `tcp_tap.sh`, `manual/1c-firecracker-tap.sh` |
+| **NIC + QEMU (mlx5)** | Physical loopback | QEMU/KVM + vfio-pci | Mellanox mlx5 PMD | `http_nic.sh`, `tls_nic.sh`, `https_nic.sh`, `manual/1a-qemu-mlx5.sh` |
+| **NIC + QEMU (i40e)** | Physical loopback | QEMU/KVM + vfio-pci | Intel i40e PMD | `manual/1b-qemu-i40e.sh` |
+| **Container + AF_XDP** | veth | Podman container | AF_XDP PMD | `manual/1d-container-afxdp.sh` |
+| **Native AF_PACKET** | veth | None (host processes) | AF_PACKET PMD | `manual/1e-native-afpacket.sh` |
+| **Software loopback** | — | None | `net_ring` PMD | `manual/1g-net-ring.sh` |
+| **Null sink** | — | None | `net_null` PMD | `manual/1h-net-null.sh` |
+| **PCAP replay** | File | None | `net_pcap` PMD | `manual/1i-net-pcap.sh` |
+| **QEMU virtio** | vhost-net + bridge | QEMU microVM | `net_tap` PMD | `manual/1j-qemu-virtio.sh` |
+| **vhost-user** | Shared memory | QEMU microVM | `net_vhost` PMD | `manual/1k-vhost-user.sh` |
 
 ### 5.3 TLS / HTTPS Test Architecture
 
@@ -1270,8 +1294,7 @@ All NIC-tier scripts share a common pattern:
 | **Teardown** | EXIT trap: quit vaigai, kill QEMU, restore PCI drivers, clean temp files |
 | **Pass/fail** | Per-assertion counters, non-zero exit on any failure |
 
-See [tls-test.md](tls-test.md), [https-test.md](https-test.md),
-[http-test.md](http-test.md), and [tcp-test.md](tcp-test.md) for
-detailed test plans and code coverage matrices.
+See [tests/manual/README.md](../tests/manual/README.md) for the complete
+topology guide, usage instructions, and split-terminal workflow for each script.
 
 
