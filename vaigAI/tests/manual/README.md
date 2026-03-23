@@ -19,6 +19,7 @@ commands, and cleans up on exit (Ctrl+C).
 | `1i-net-pcap.sh` | PCAP replay + capture | net_pcap | libpcap, DPDK with `net/pcap` |
 | `1j-qemu-virtio.sh` | QEMU microVM + virtio-net bridge | net_tap + vhost-net | QEMU, kernel, rootfs |
 | `1k-vhost-user.sh` | vhost-user ↔ QEMU microVM | net_vhost | QEMU, kernel, rootfs, DPDK with `net/vhost` |
+| `2a-server-afpacket.sh` | vaigai as **server** + veth | AF_PACKET | socat, curl, openssl |
 
 ## Usage
 
@@ -63,6 +64,7 @@ sudo bash tests/manual/1e-native-afpacket.sh --cleanup
 | `1i-net-pcap.sh` | File-based — inspect output.pcap after quit |
 | `1j-qemu-virtio.sh` | `tail -f /tmp/vaigai-1j/serial.log` (serial) |
 | `1k-vhost-user.sh` | `tail -f /tmp/vaigai-1k/serial.log` (serial) |
+| `2a-server-afpacket.sh` | Native clients on host — no SSH needed |
 
 ### Special startup order
 
@@ -75,6 +77,19 @@ sudo bash tests/manual/1k-vhost-user.sh --vaigai
 
 # Terminal 2 — starts QEMU once socket is visible
 sudo bash tests/manual/1k-vhost-user.sh --server
+```
+
+### Server-mode tests (2x series)
+
+`2a-server-afpacket.sh` tests vaigai as a **server** (the inverse of the 1x
+client-mode tests). It uses `--server` / `--client` / `--cleanup` flags:
+
+```bash
+# Terminal 1 — start vaigai in server mode
+sudo bash tests/manual/2a-server-afpacket.sh --server
+
+# Terminal 2 — print client test commands (socat, curl, openssl)
+sudo bash tests/manual/2a-server-afpacket.sh --client
 ```
 
 ## Structure
