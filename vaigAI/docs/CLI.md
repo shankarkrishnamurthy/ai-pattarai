@@ -30,12 +30,36 @@ vaigai accepts DPDK EAL arguments followed by `--` and then app-level arguments:
 | `--max-chain-depth <N>` | `-C` | mbuf chain depth |
 | `--max-conn <N>` | `-X` | Max concurrent connections per worker |
 | `--rest-port <port>` | `-R` | REST API listen port (0 = disabled) |
+| `--server` | `-S` | Start in server mode (accept connections) |
 
 ### Special Modes
 
 | Flag | Description |
 |------|-------------|
 | `--attach [path]` | Connect to a running vaigai as a remote CLI client (no EAL init) |
+| `--server` | Start in server mode: listen for and accept connections instead of generating traffic |
+
+### Mode Gating
+
+vaigai operates in one of two modes, selected at startup:
+
+- **Client mode** (default): The process generates traffic toward remote
+  destinations. The commands `start`, `stop`, and `ping` are available.
+  Server-only commands (`serve`, `show listeners`, `show connections`) print an error.
+
+- **Server mode** (`--server`): The process accepts incoming connections.
+  The commands `serve`, `stop`, `show listeners`, and `show connections` are available.
+  Client-only commands (`start`, `ping`) print an error.
+
+Commands that work in **both** modes: `stat`, `stats`, `trace`, `show`,
+`set`, `reset`, `help`, `quit`.
+
+The prompt reflects the active mode:
+
+```
+vaigai>           # client mode
+vaigai(server)>   # server mode
+```
 
 ### Environment Variables
 
@@ -184,12 +208,54 @@ vaigai> start --ip 10.0.0.2 --port 443 --proto https --one --url /
 
 ---
 
+## serve
+
+Server mode only. Configure and start listeners.
+
+```
+serve --listen <spec> [--listen <spec> ...]
+      [--tls-cert <path>] [--tls-key <path>]
+      [--http-body-size <bytes>]
+```
+
+`<spec>` = `proto:port[:handler]`
+
+### Protocols and handlers
+
+| Proto | Handler | Description |
+|-------|---------|-------------|
+| `tcp` | `echo` | Reflect received data |
+| `tcp` | `discard` | ACK + drop payload |
+| `tcp` | `chargen` | Send bulk data |
+| `http` | (implicit) | HTTP/1.1 response |
+| `https` | (implicit) | TLS + HTTP response |
+| `tls` | `echo` | TLS + echo |
+
+### Examples
+
+```
+vaigai(server)> serve --listen tcp:5000:echo --listen http:80
+vaigai(server)> serve --listen https:443 --tls-cert cert.pem --tls-key key.pem
+```
+
+---
+
+---
+
 ## stop
 
 Stop active traffic generation immediately.
 
 ```
 vaigai> stop
+```
+
+In server mode, `stop` without arguments stops **all** listeners.
+To stop a single listener, pass the spec or listener number:
+
+```
+vaigai(server)> stop tcp:5000:echo
+vaigai(server)> stop 1
 ```
 
 ---
@@ -379,21 +445,23 @@ vaigai> trace stop
 
 ## show interface
 
-Display DPDK interface details: driver, MAC, IP, link status, offloads,
-and packet statistics.
+Display system details.
 
 ```
 show interface [port_id]
+show listeners              (server mode)
+show connections            (server mode)
 ```
 
-Without `port_id`, shows all ports.
+### show interface
+
+Display DPDK interface details: driver, MAC, IP, link status, offloads,
+and packet statistics. Without `port_id`, shows all ports.
 
 ```
 vaigai> show interface
 vaigai> show interface 0
 ```
-
-### Output fields
 
 | Field       | Description                                    |
 |-------------|------------------------------------------------|
@@ -407,6 +475,25 @@ vaigai> show interface 0
 | Mgmt TX Q   | Dedicated management TX queue index            |
 | Offloads    | Hardware offload capabilities                  |
 | Statistics  | RX/TX packet and byte counters, errors/missed  |
+
+### show listeners
+
+Server mode only. Show active listeners with stats.
+
+Output columns: `#`, `SPEC`, `STATE`, `CONNS`, `RX bytes`, `TX bytes`,
+`HTTP resps`. The `SPEC` column is copy-pasteable for `stop <spec>`.
+
+```
+vaigai(server)> show listeners
+```
+
+### show connections
+
+Server mode only. Show per-worker active TCB count.
+
+```
+vaigai(server)> show connections
+```
 
 ---
 

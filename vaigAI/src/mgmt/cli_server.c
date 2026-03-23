@@ -15,6 +15,7 @@
 #include <fcntl.h>
 
 #include <rte_log.h>
+#include <rte_eal.h>
 #include "../common/types.h"
 
 /* ── Server state ─────────────────────────────────────────────────── */
@@ -46,10 +47,19 @@ int
 cli_server_init(const char *sock_path)
 {
     const char *path = sock_path;
+    char auto_path[256];
 
-    /* Resolve path with fallback */
-    if (!path || path[0] == '\0')
-        path = CLI_SERVER_DEFAULT_PATH;
+    /* Resolve path: prefer DPDK runtime dir (unique per --file-prefix),
+     * then /var/run/vaigai/, then /tmp/. */
+    if (!path || path[0] == '\0') {
+        const char *rtdir = rte_eal_get_runtime_dir();
+        if (rtdir && rtdir[0]) {
+            snprintf(auto_path, sizeof(auto_path), "%s/vaigai.sock", rtdir);
+            path = auto_path;
+        } else {
+            path = CLI_SERVER_DEFAULT_PATH;
+        }
+    }
 
     /* Try to create parent directory for default path */
     if (strcmp(path, CLI_SERVER_DEFAULT_PATH) == 0) {

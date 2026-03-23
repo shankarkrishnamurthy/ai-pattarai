@@ -52,6 +52,19 @@ int tcb_store_init(tcb_store_t *store, uint32_t capacity, int socket_id)
     }
     memset(store->ht, -1, sizeof(int32_t) * store->ht_size);
 
+    /* Free-index stack: all slots start free */
+    store->free_stack = rte_zmalloc_socket("tcb_free",
+                            sizeof(uint32_t) * capacity, CACHE_LINE_SIZE, socket_id);
+    if (!store->free_stack) {
+        RTE_LOG(ERR, TCP, "TCB: failed to allocate free stack (%u)\n", capacity);
+        rte_free(store->ht);
+        rte_free(store->tcbs);
+        return -1;
+    }
+    for (uint32_t i = 0; i < capacity; i++)
+        store->free_stack[i] = capacity - 1 - i; /* top of stack = index 0 */
+    store->free_top = capacity;
+
     store->capacity = capacity;
     store->count    = 0;
     return 0;
@@ -62,19 +75,11 @@ tcb_t *tcb_alloc(tcb_store_t *store,
                   uint32_t s_ip, uint16_t s_port,
                   uint32_t d_ip, uint16_t d_port)
 {
-    if (store->count >= store->capacity) return NULL;
+    if (store->free_top == 0) return NULL; /* no free slots */
 
-    /* Find free TCB slot (linear scan — pool should have free slots) */
-    tcb_t *tcb = NULL;
-    uint32_t idx = 0;
-    for (uint32_t i = 0; i < store->capacity; i++) {
-        if (!store->tcbs[i].in_use) {
-            tcb  = &store->tcbs[i];
-            idx  = i;
-            break;
-        }
-    }
-    if (!tcb) return NULL;
+    /* Pop free index from stack — O(1) */
+    uint32_t idx = store->free_stack[--store->free_top];
+    tcb_t *tcb = &store->tcbs[idx];
 
     memset(tcb, 0, sizeof(*tcb));
     tcb->src_ip   = s_ip;
@@ -125,13 +130,16 @@ void tcb_free(tcb_store_t *store, tcb_t *tcb)
 
     uint32_t s_ip   = tcb->src_ip,  d_ip   = tcb->dst_ip;
     uint16_t s_port = tcb->src_port, d_port = tcb->dst_port;
+    uint32_t idx_in_array = (uint32_t)(tcb - store->tcbs);
 
     memset(tcb, 0, sizeof(*tcb));
     store->count--;
 
+    /* Push index back onto free stack — O(1) */
+    store->free_stack[store->free_top++] = idx_in_array;
+
     /* Remove from hash table (mark as tombstone = -2) */
     uint32_t h = tuple_hash(s_ip, s_port, d_ip, d_port) & store->ht_mask;
-    uint32_t idx_in_array = (uint32_t)(tcb - store->tcbs);
     for (uint32_t k = 0; k < store->ht_size; k++) {
         uint32_t slot = (h + k) & store->ht_mask;
         if (store->ht[slot] == (int32_t)idx_in_array) {
@@ -152,6 +160,10 @@ void tcb_store_reset(tcb_store_t *store)
     /* Clear hash table */
     for (uint32_t i = 0; i < store->ht_size; i++)
         store->ht[i] = -1;
+    /* Rebuild free stack */
+    for (uint32_t i = 0; i < store->capacity; i++)
+        store->free_stack[i] = store->capacity - 1 - i;
+    store->free_top = store->capacity;
 }
 
 /* ── Init all workers ─────────────────────────────────────────────────────── */
@@ -179,6 +191,10 @@ void tcb_stores_destroy(void)
         if (g_tcb_stores[w].ht) {
             rte_free(g_tcb_stores[w].ht);
             g_tcb_stores[w].ht = NULL;
+        }
+        if (g_tcb_stores[w].free_stack) {
+            rte_free(g_tcb_stores[w].free_stack);
+            g_tcb_stores[w].free_stack = NULL;
         }
     }
 }

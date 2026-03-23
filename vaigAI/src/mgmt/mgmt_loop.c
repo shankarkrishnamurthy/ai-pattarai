@@ -18,6 +18,7 @@
 #include "../telemetry/metrics.h"
 #include "../telemetry/export.h"
 #include "../telemetry/log.h"
+#include "config_mgr.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -286,7 +287,9 @@ cli_stdin_init(mgmt_dispatch_fn_t dispatch)
     g_stdin_eof = false;
 
 #ifdef HAVE_READLINE
-    rl_callback_handler_install("vaigai> ", readline_line_cb);
+    rl_callback_handler_install(
+        g_config.server_mode ? "vaigai(server)> " : "vaigai> ",
+        readline_line_cb);
     rl_bind_key('\t', rl_complete);
     g_readline_got_line = false;
     g_readline_line = NULL;
@@ -375,8 +378,9 @@ mgmt_loop_run(mgmt_dispatch_fn_t dispatch)
                   "(send SIGTERM to stop, or use vaigai --attach)\n");
     } else {
         if (isatty(STDIN_FILENO))
-            printf("vaigai CLI  (type 'help' for commands, "
-                   "'help <cmd>' for details, 'quit' to exit)\n");
+            printf("vaigai CLI%s  (type 'help' for commands, "
+                   "'help <cmd>' for details, 'quit' to exit)\n",
+                   g_config.server_mode ? " [server mode]" : "");
         cli_stdin_init(dispatch);
     }
 

@@ -8,7 +8,7 @@
 ## Table of Contents
 
 1. [System Architecture](#1-system-architecture) — block diagram, module map, build, startup, core assignment, memory
-2. [Life of a Packet](#2-life-of-a-packet) — RX/TX paths, worker loop, protocol stack, HTTP parser, TLS, TCP flow control
+2. [Life of a Packet](#2-life-of-a-packet) — RX/TX paths, worker loop, protocol stack, HTTP parser, TLS, TCP flow control, server mode
 3. [Telemetry System](#3-telemetry-system) — metrics ownership, counters, histogram, export, logging
 4. [Control Plane / Data Plane](#4-control-plane--data-plane-segregation) — mgmt core scheduling, IPC, CLI, REST API, config, shared state
 5. [Test Infrastructure](#5-test-infrastructure) — scripts, topology tiers, coverage
@@ -100,7 +100,8 @@ src/
 │   └── cryptodev.h/c          # DPDK Cryptodev AES-GCM offload
 │
 ├── app/                       ── Application layer ──
-│   └── http11.h/c             # HTTP/1.1 request builder + response parser
+│   ├── http11.h/c             # HTTP/1.1 request builder + response parser
+│   └── server.h/c             # Server mode: listener table, handler dispatch
 │
 ├── mgmt/                      ── Management plane ──
 │   ├── mgmt_loop.h/c         # Cooperative run-to-completion event loop
@@ -695,6 +696,109 @@ calls `tcp_fsm_connect()` + `tcp_fsm_send()` on behalf of CLI commands like
 - RST-no-TCB (RFC 793 §3.4) is disabled to prevent RST storms from overwhelming the peer.
 - **AF_PACKET kernel RST interference:** when using `net_af_packet` on an interface whose IP is also assigned to the Linux kernel, the kernel TCP stack will receive a copy of every SYN-ACK and generate a RST (no matching socket). Run `sudo bash scripts/setup.sh --suppress-rst` before starting vaigai to install an nftables rule that drops kernel-generated RSTs on vaigai's ephemeral port range (10000–59999). Remove with `--clear-rst`. Alternatively, remove the kernel IP from the interface so it is exclusively managed by vaigai.
 
+### 2.8 Server Mode
+
+#### Overview
+
+vaigai can run as a DPDK-based TCP/TLS/HTTP server using the `--server` flag.
+In server mode, workers become **reactive** — the TX generation engine
+(`tx_gen_burst()`) is disabled. Instead of initiating connections, workers
+listen for incoming SYNs and respond according to a handler table. The full
+protocol stack (Ethernet → IPv4 → TCP → TLS → HTTP) remains the same; only
+the connection initiation direction is reversed.
+
+#### Listener Table
+
+Each worker maintains a per-worker **listener table** (`srv_table_t`) with
+capacity for up to **16 listeners**. The table is populated by the `serve`
+CLI command, which broadcasts a `CFG_CMD_SERVE` message over IPC to all
+workers. Each listener maps a TCP port number to a handler function.
+
+```
+  srv_table_t (per-worker)
+  ┌───────┬───────────┐
+  │ Port  │ Handler   │
+  ├───────┼───────────┤
+  │ 5000  │ echo      │
+  │ 5001  │ discard   │
+  │ 5002  │ chargen   │
+  │ 8080  │ http      │
+  │ 8443  │ https     │
+  │  ...  │  ...      │
+  └───────┴───────────┘
+  max 16 entries
+```
+
+Lookup is **O(n)** with n ≤ 16 — a linear scan is cheaper than a hash table
+at this scale and avoids cache misses. When a SYN arrives and no matching
+listener is found, the FSM sends RST per RFC 793.
+
+#### Handler Types
+
+| Handler    | Description                                                  |
+|------------|--------------------------------------------------------------|
+| `echo`     | Reflects received data back to the sender (TCP loopback)     |
+| `discard`  | Accepts data and drops it silently (`/dev/null` sink)        |
+| `chargen`  | Generates a continuous stream of data toward the client      |
+| `http`     | Parses HTTP/1.1 requests and sends a pre-built HTTP response |
+| `https`    | TLS-wrapped HTTP — performs server-side TLS accept, then HTTP |
+| `tls_echo` | TLS-wrapped echo — encrypts reflected data via TLS engine    |
+
+#### Data Flow
+
+```
+  SYN → passive open (check listener table)
+    → SYN-ACK
+    → ACK → ESTABLISHED → srv_on_established()
+      → [chargen: start TX immediately]
+      → [https/tls_echo: TLS server accept]
+    → Data → srv_on_data()
+      → [echo: reflect data]
+      → [discard: drop]
+      → [http: parse req, send pre-built response]
+      → [https: TLS decrypt, send encrypted response]
+    → FIN → graceful close
+```
+
+The passive open path reuses the existing TCP FSM — `tcp_fsm_input()` creates
+a new TCB in `SYN_RECEIVED` when a SYN matches a listener port. The handler
+callbacks (`srv_on_established`, `srv_on_data`) are invoked from the FSM at
+the appropriate state transitions, keeping all processing on the worker core.
+
+#### TCB `app_state` Mapping
+
+The TCB `app_state` field distinguishes server-mode connection phases:
+
+| `app_state` | Meaning                          |
+|-------------|----------------------------------|
+| `0`         | Plain TCP (echo / discard / http)|
+| `10`        | Chargen active                   |
+| `20`        | TLS server handshaking           |
+| `21`        | TLS server established           |
+
+#### New Source Files
+
+| File                | Purpose                                              |
+|---------------------|------------------------------------------------------|
+| `src/app/server.h`  | `srv_table_t` structure, handler enum, public API    |
+| `src/app/server.c`  | Listener table management, handler dispatch, IPC receive for `CFG_CMD_SERVE` |
+
+#### Test Topology (DPDK ↔ DPDK)
+
+Server mode is designed for back-to-back NIC testing where both ends run
+vaigai — one as a client, one as a server:
+
+```
+  vaigai CLIENT (mlx5)              vaigai SERVER (mlx5)
+     10.0.0.1                          10.0.0.2
+        │                                 │
+    NIC Port A ◄──── 100G cable ────► NIC Port B
+```
+
+This replaces the need for a Firecracker or QEMU VM as a TCP peer.
+Both instances use the same DPDK-based stack, eliminating kernel overhead
+on both sides and enabling true line-rate TCP/TLS/HTTP benchmarking.
+
 ---
 
 <a id="3-telemetry-system"></a>
@@ -1015,6 +1119,7 @@ Commands flow from management to workers via `config_update_t` messages (256 byt
 | `CFG_CMD_SET_RATE` | rate value             | Adjust token bucket rate                  |
 | `CFG_CMD_SET_PROFILE` | `flow_cfg_t`        | Update flow profile                       |
 | `CFG_CMD_SHUTDOWN` | *(none)*               | Exit worker loop                          |
+| `CFG_CMD_SERVE`    | `srv_listener_cfg_t`   | Add listener to per-worker server table   |
 
 **Management-local commands** (not sent via IPC):
 
@@ -1046,6 +1151,9 @@ vaigai> help
 | `trace` | `trace start <file.pcapng> [port] [queue]` | Start packet capture |
 | | `trace stop` | Stop capture |
 | `show` | `show interface [port_id]` | Show DPDK interface details |
+|        | `show listeners` | Show active listeners (server mode) |
+|        | `show connections` | Show per-worker TCB count (server mode) |
+| `serve` | `serve --listen <spec> [--listen ...] [opts]` | Configure and start listeners (server mode) |
 | `quit` | `quit` | Graceful shutdown |
 
 ### 4.5 REST API

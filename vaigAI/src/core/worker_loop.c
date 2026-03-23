@@ -26,6 +26,7 @@
 #include "../net/tcp_port_pool.h"
 #include "../telemetry/metrics.h"
 #include "../telemetry/cpu_stats.h"
+#include "../app/server.h"
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
 volatile int      g_run = 0;
@@ -210,6 +211,31 @@ int tgen_worker_loop(void *arg)
             }
             if (cmd.cmd == CFG_CMD_STOP) {
                 tx_gen_stop(&ctx->tx_gen);
+                /* Also stop server listeners if serving */
+                if (g_srv_tables[ctx->worker_idx].serving) {
+                    tcp_fsm_reset_all(ctx->worker_idx);
+                    srv_table_stop_all(ctx->worker_idx);
+                }
+                tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
+                continue;
+            }
+            if (cmd.cmd == CFG_CMD_SERVE) {
+                srv_ipc_payload_t *scfg = (srv_ipc_payload_t *)cmd.payload;
+                tcp_fsm_reset_all(ctx->worker_idx);
+                srv_table_configure(ctx->worker_idx, scfg);
+                tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
+                continue;
+            }
+            if (cmd.cmd == CFG_CMD_STOP_LISTENER) {
+                /* payload[0..3] = listener index, UINT32_MAX = stop all */
+                uint32_t li;
+                memcpy(&li, cmd.payload, sizeof(li));
+                if (li == UINT32_MAX) {
+                    tcp_fsm_reset_all(ctx->worker_idx);
+                    srv_table_stop_all(ctx->worker_idx);
+                } else {
+                    srv_table_stop_one(ctx->worker_idx, li);
+                }
                 tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
                 continue;
             }
@@ -256,7 +282,10 @@ int tgen_worker_loop(void *arg)
         uint64_t t2 = rte_rdtsc();
 
         /* ── 3. TX generation (tps / sustained traffic) ─────────────── */
-        if (ctx->tx_gen.active) {
+        /* In server mode, workers are reactive — no tx_gen.  Server-side
+         * TX (echo, HTTP response, chargen) is handled inline by
+         * srv_on_data() / srv_on_established() from tcp_fsm_input(). */
+        if (ctx->tx_gen.active && !g_srv_tables[ctx->worker_idx].serving) {
             tx_gen_burst(&ctx->tx_gen, ctx->mempool, ctx->worker_idx);
         }
 

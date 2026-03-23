@@ -22,6 +22,8 @@ typedef enum {
     CFG_CMD_STOP,
     CFG_CMD_SET_RATE,
     CFG_CMD_SHUTDOWN,
+    CFG_CMD_SERVE,          /* server mode: start listeners */
+    CFG_CMD_STOP_LISTENER,  /* server mode: stop one/all listeners */
 } cfg_cmd_t;
 
 typedef struct __rte_aligned(8) {

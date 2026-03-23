@@ -103,17 +103,41 @@ bm_test(const uint64_t *map, uint32_t bit)
     return (map[bit >> 6] >> (bit & 63)) & 1u;
 }
 
-/** Find the next set bit at or after 'start', wrapping once. */
+/** Find the next set bit at or after 'start', wrapping once.
+ *  Uses __builtin_ctzll for word-granularity scanning (O(words) vs O(bits)). */
 static int
 bm_find_next(const uint64_t *map, uint32_t start, uint32_t *out)
 {
-    for (uint32_t i = 0; i < TGEN_EPHEM_CNT; i++) {
-        uint32_t pos = (start + i) % TGEN_EPHEM_CNT;
-        if (bm_test(map, pos)) {
-            *out = pos;
-            return 0;
+    uint32_t total_words = BITMAP_WORDS;
+
+    /* Start word and bit offset within that word */
+    uint32_t w = start >> 6;
+    uint32_t b = start & 63;
+
+    /* Phase 1: scan from 'start' to end of bitmap */
+    /* First partial word: mask off bits below 'b' */
+    uint64_t masked = map[w] & (~0ULL << b);
+    if (masked) {
+        uint32_t pos = (w << 6) + (uint32_t)__builtin_ctzll(masked);
+        if (pos < TGEN_EPHEM_CNT) { *out = pos; return 0; }
+    }
+    for (uint32_t i = w + 1; i < total_words; i++) {
+        if (map[i]) {
+            uint32_t pos = (i << 6) + (uint32_t)__builtin_ctzll(map[i]);
+            if (pos < TGEN_EPHEM_CNT) { *out = pos; return 0; }
         }
     }
+
+    /* Phase 2: wrap around from beginning to 'start' word */
+    for (uint32_t i = 0; i <= w; i++) {
+        uint64_t word = map[i];
+        if (i == w) word &= ~(~0ULL << b); /* mask off bits at/above 'b' */
+        if (word) {
+            uint32_t pos = (i << 6) + (uint32_t)__builtin_ctzll(word);
+            if (pos < TGEN_EPHEM_CNT) { *out = pos; return 0; }
+        }
+    }
+
     return -1; /* exhausted */
 }
 

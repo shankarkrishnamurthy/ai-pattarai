@@ -20,6 +20,7 @@
 #include "../tls/tls_engine.h"
 #include "../core/tx_gen.h"
 #include "../telemetry/log.h"
+#include "../app/server.h"
 
 #include <string.h>
 #include <netinet/in.h>
@@ -123,11 +124,7 @@ http_rsp_body_recv(uint32_t worker_idx, tcb_t *tcb, uint32_t data_len)
 /* ── Check if current lcore is a worker (vs mgmt) ───────────────────────── */
 static inline bool is_worker_lcore(void)
 {
-    unsigned int lid = rte_lcore_id();
-    for (uint32_t i = 0; i < g_core_map.num_workers; i++)
-        if (g_core_map.worker_lcores[i] == lid)
-            return true;
-    return false;
+    return tgen_is_worker(rte_lcore_id());
 }
 
 /* ── Detach TLS session before freeing a TCB ─────────────────────────────── */
@@ -210,11 +207,19 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     uint16_t port_id = tcb->port_id;
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)buf;
     rte_ether_addr_copy(&g_port_caps[port_id].mac_addr, &eth->src_addr);
-    /* Resolve destination MAC via ARP (use gateway for off-link) */
-    struct rte_ether_addr dst_mac;
-    if (!arp_lookup(port_id, arp_nexthop(port_id, tcb->dst_ip), &dst_mac))
-        memset(dst_mac.addr_bytes, 0xFF, 6);
-    rte_ether_addr_copy(&dst_mac, &eth->dst_addr);
+    /* Use cached destination MAC if available, otherwise resolve via ARP */
+    if (likely(tcb->dst_mac_valid)) {
+        rte_ether_addr_copy(&tcb->dst_mac, &eth->dst_addr);
+    } else {
+        struct rte_ether_addr resolved_mac;
+        if (arp_lookup(port_id, arp_nexthop(port_id, tcb->dst_ip), &resolved_mac)) {
+            rte_ether_addr_copy(&resolved_mac, &tcb->dst_mac);
+            tcb->dst_mac_valid = true;
+        } else {
+            memset(resolved_mac.addr_bytes, 0xFF, 6);
+        }
+        rte_ether_addr_copy(&resolved_mac, &eth->dst_addr);
+    }
     eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 
     /* IPv4 header */
@@ -431,6 +436,13 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
     if (!tcb) {
         /* SYN → passive open */
         if ((flags & RTE_TCP_SYN_FLAG) && !(flags & RTE_TCP_ACK_FLAG)) {
+            /* In server mode, only accept SYNs on ports with listeners */
+            srv_handler_t srv_h = SRV_HANDLER_NONE;
+            if (g_srv_tables[worker_idx].serving) {
+                srv_h = srv_lookup_port(worker_idx, dst_port);
+                if (srv_h == SRV_HANDLER_NONE)
+                    goto done; /* no listener on this port — drop */
+            }
             tcb = tcb_alloc(store, dst_ip, dst_port, src_ip, src_port);
             if (!tcb) { worker_metrics_add_syn_queue_drops(worker_idx); goto bad; }
             tcb->state         = TCP_SYN_RECEIVED;
@@ -454,6 +466,14 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->lcore_id      = (uint8_t)rte_lcore_id();
             tcb->port_id       = m->port;
             tcb->rto_us        = TCP_INITIAL_RTO_US;
+            /* Pre-resolve destination MAC for passive open */
+            {
+                struct rte_ether_addr pmac;
+                if (arp_lookup(m->port, arp_nexthop(m->port, src_ip), &pmac)) {
+                    rte_ether_addr_copy(&pmac, &tcb->dst_mac);
+                    tcb->dst_mac_valid = true;
+                }
+            }
 
             /* Send SYN-ACK */
             tcp_send_segment(worker_idx, tcb,
@@ -615,6 +635,10 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->state   = TCP_ESTABLISHED;
             tcb->snd_wnd = rte_be_to_cpu_16(tcp->rx_win) << tcb->wscale_remote;
             worker_metrics_add_tcp_conn_open(worker_idx);
+            /* Server mode: notify handler that connection is established */
+            if (g_srv_tables[worker_idx].serving) {
+                srv_on_established(worker_idx, tcb, tcb->src_port);
+            }
         }
         break;
 
@@ -669,6 +693,18 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                     TCP_DELAYED_ACK_US * g_tsc_hz / 1000000ULL;
                 worker_metrics_add_tcp_payload_rx(worker_idx, data_len);
 
+                /* ── Server mode: dispatch to handler ────────────── */
+                if (tcb->app_state >= 10) {
+                    const uint8_t *payload_data =
+                        (const uint8_t *)tcp + hdr_len;
+                    srv_on_data(worker_idx, tcb,
+                                payload_data, data_len,
+                                tcb->src_port);
+                    /* Immediate ACK for server handlers */
+                    tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
+                                     NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
+                    tcb->pending_ack = false;
+                } else
                 /* ── L7: TLS handshake / decrypt ──────────────────── */
                 if (tcb->app_state == 2 || tcb->app_state == 3 ||
                     tcb->app_state == 5 || tcb->app_state == 6) {
@@ -1052,6 +1088,14 @@ tcb_t *tcp_fsm_connect(uint32_t worker_idx,
     tcb->port_id      = port_id;
     tcb->active_open  = true;
     tcb->ts_enabled   = true;
+    /* Pre-resolve destination MAC so all segments use cached value */
+    {
+        struct rte_ether_addr mac;
+        if (arp_lookup(port_id, arp_nexthop(port_id, dst_ip), &mac)) {
+            rte_ether_addr_copy(&mac, &tcb->dst_mac);
+            tcb->dst_mac_valid = true;
+        }
+    }
     /* Store creation time for TLS handshake timeout.
      * Reuses timewait_deadline_tsc (only used in TIME_WAIT state). */
     tcb->timewait_deadline_tsc = rte_rdtsc();

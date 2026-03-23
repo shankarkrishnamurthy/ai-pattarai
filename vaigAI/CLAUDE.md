@@ -1,0 +1,334 @@
+# Claude Code Instructions — vaigAI
+
+## What This Project Is
+
+**vaigAI** is a high-performance DPDK-based traffic generator written in **C17**.
+Every packet (Ethernet -> IP -> TCP/UDP/ICMP) is crafted in user-space; the Linux
+kernel is never in the data path. Think of it as a from-scratch iperf3 + hping3
+that runs entirely on DPDK poll-mode drivers.
+
+The binary is called `vaigai`. It is a single process that spawns worker lcores
+(DPDK threads pinned to CPU cores) for packet TX/RX and a management core for
+CLI, REST API, config, and ARP.
+
+## Host Environment
+
+| Item | Value |
+|------|-------|
+| OS | Fedora 42 (Linux 6.14+) |
+| Arch | x86_64 |
+| Build system | Meson + Ninja |
+| C standard | C17 (`-std=c17`) |
+| Compiler flags | `-march=native -Wall -Wextra -Werror` |
+| Package manager | `dnf` |
+
+## External Dependencies & Paths
+
+### DPDK 24.11.1 (required)
+
+- **Source**: `/work/dpdk-stable-24.11.1/`
+- **Build dir**: `/work/dpdk-stable-24.11.1/builddir/`
+- **Installed to**: `/usr/local` (libs in `/usr/local/lib64/`, pkgconfig in `/usr/local/lib64/pkgconfig/`)
+- **PMD plugins**: `/usr/local/lib64/dpdk/pmds-25.0/`
+- **Enabled drivers**: `net/af_packet, net/af_xdp, net/tap, net/mlx5, net/i40e, common/mlx5, bus/auxiliary, bus/pci, bus/vdev`
+- **Build command** (from source):
+  ```bash
+  cd /work/dpdk-stable-24.11.1
+  meson setup builddir -Denable_drivers=net/af_packet,net/af_xdp,net/tap,net/mlx5,net/i40e,common/mlx5,bus/auxiliary,bus/pci,bus/vdev
+  ninja -C builddir
+  sudo ninja -C builddir install
+  sudo ldconfig
+  ```
+- **Key**: If you change the DPDK build, rebuild vaigai with `meson setup --wipe build && ninja -C build`.
+
+### Firecracker MicroVM (for TCP tests)
+
+- **Binary**: `firecracker` (v1.14.2, must be in `$PATH` or set `$FIRECRACKER`)
+- **Guest kernel**: `/work/firecracker/vmlinux` — Linux 6.1.163, built from `/work/firecracker/linux-src/`
+  - Minimal config: virtio-net, ext4, 9p, no modules, ELF vmlinux (not bzImage)
+- **Root filesystem**: `/work/firecracker/alpine.ext4` — Alpine 3.23, 128 MB ext4 image
+  - Contains: busybox, socat, iproute2, iperf3, curl, nginx, openssl, strace
+  - Init system: OpenRC with a `vaigai` service that starts TCP listeners:
+    - Port 5000: socat echo (PIPE) — for T1 SYN flood & T2 data echo
+    - Port 5001: socat discard (/dev/null) — for T3 TX throughput sink
+    - Port 5002: socat chargen (dd from /dev/zero) — for T3 RX throughput source
+  - The `vaigai_mode` kernel boot arg controls which services start (default: `tcp`)
+- **Firecracker repo**: `/work/firecracker/fc-repo/` (v1.14.2 source, used to build the binary)
+- **Kernel config reference**: `/work/firecracker/vmlinux-6.1`
+
+### QEMU VM (for HTTP/HTTPS/TLS NIC tests)
+
+- **Root filesystem**: `/work/firecracker/rootfs.ext4` — Alpine 3.23, 256 MB ext4 image
+  - Extended rootfs for QEMU-based NIC loopback tests (http_nic.sh, https_nic.sh, tls_nic.sh)
+  - Contains everything in `alpine.ext4` plus:
+    - QAT firmware (`qat_895xcc.bin`, `qat_895xcc_mmp.bin`) for DH895XCC crypto offload
+    - QAT kernel modules (`intel_qat`, `qat_dh895xcc`) for PF passthrough
+    - nginx TLS vhost on `:443` with pre-generated SSL certificates
+    - OpenSSL afalg engine config (`/etc/vaigai/openssl-qat.cnf`) for kernel crypto API -> QAT
+    - QAT setup script (`/etc/vaigai/qat-setup.sh`) for PF initialization
+  - Used with `qemu-system-x86_64` and vfio-pci device passthrough (NIC + QAT PFs)
+  - The QEMU tests make COW copies at runtime, so the base image is never modified
+
+### Optional Libraries
+
+| Library | Feature flag | Purpose |
+|---------|-------------|---------|
+| OpenSSL >= 1.1 | `-Dtls=enabled` | TLS 1.2/1.3 engine |
+| readline | `-Dcli=enabled` | Interactive CLI |
+| libbpf | `-Daf_xdp=enabled` | AF_XDP socket support |
+| jansson >= 2.14 | `-Drest=enabled` | JSON config & REST API |
+| libmicrohttpd | `-Drest=enabled` | REST HTTP server |
+| rdma-core-devel | (for mlx5 PMD) | Mellanox ConnectX NIC support |
+
+## Building vaigAI
+
+```bash
+cd vaigAI/
+meson setup build          # first time
+ninja -C build             # incremental
+# OR after DPDK / dep changes:
+meson setup --wipe build
+ninja -C build
+```
+
+The binary is at `build/vaigai`. Install with `ninja -C build install`.
+
+## Architecture Overview
+
+Refer to `docs/ARCHITECTURE.md` for the full design. Key points:
+
+### Source Layout
+
+```
+src/
+├── main.c              # Process lifecycle, lcore launch, signal handling
+├── common/             # types.h (constants), util.c (TSC, parsers, PRNG)
+├── core/               # EAL init, core assignment, mempool, IPC rings, worker loop, TX gen
+├── port/               # NIC port init, soft_nic driver detection
+├── net/                # Full protocol stack: ethernet, ARP, IPv4, ICMP, UDP, TCP (FSM + TCB + options + timers + congestion + port pool + checksum)
+├── tls/                # OpenSSL BIO-pair TLS engine, session store, cert manager, cryptodev
+├── app/                # HTTP/1.1 engine + server mode (echo, discard, chargen, HTTP, HTTPS, TLS)
+├── mgmt/               # CLI (readline), REST API (libmicrohttpd), config manager (JSON)
+└── telemetry/          # Per-worker lock-free metrics, JSON export, HDR histogram, packet trace, structured logging
+```
+
+### Control Plane vs Data Plane
+
+- **Data plane** (worker lcores): RX burst -> classify -> protocol process -> TX gen -> TX drain -> timer tick. Never blocks, never does syscalls, never allocates memory.
+- **Control plane** (mgmt lcore): CLI REPL, REST API, config management, ARP cache, telemetry snapshots. Communicates with workers via lock-free SPSC `rte_ring` IPC.
+- **No locks in hot path**. Workers own their metrics slabs, TCB stores, and port pools.
+
+### Key Constants (from `src/common/types.h`)
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `TGEN_MAX_WORKERS` | 124 | Max worker lcores |
+| `TGEN_MAX_PORTS` | 16 | Max DPDK ports |
+| `TGEN_MAX_RX_BURST` / `TGEN_MAX_TX_BURST` | 32 | Burst size |
+| `TGEN_DEFAULT_RX_DESC` / `TGEN_DEFAULT_TX_DESC` | 2048 | Ring descriptor count |
+| `TGEN_EPHEMERAL_LO` – `TGEN_EPHEMERAL_HI` | 10000–59999 | TCP ephemeral port range |
+
+### Startup Sequence (simplified)
+
+1. `tgen_eal_init()` — DPDK EAL + TSC calibration
+2. `tgen_core_assign_init()` — map lcores to worker/mgmt roles (auto-scales by core count)
+3. `tgen_mempool_create_all()` — per-worker NUMA-aware mempools
+4. `tgen_ports_init()` — configure NICs, RSS, queues, start ports
+5. Protocol subsystem init (ARP, ICMP, UDP, TCP stores, port pools)
+6. `tgen_ipc_init()` — SPSC command + ACK rings
+7. Config load, TLS init, cryptodev init
+8. Launch workers -> REST server -> CLI REPL (blocks)
+9. On "quit": ordered teardown
+
+### CLI Commands
+
+Refer to `docs/CLI.md` for the full reference. Summary:
+
+| Command | Client Mode | Server Mode |
+|---------|:-----------:|:-----------:|
+| `start` | traffic gen | error |
+| `serve` | error | start listeners |
+| `stop`  | stop traffic | stop listeners |
+| `ping`  | ICMP ping | error |
+| `show listeners` | error | show active listeners |
+| `show connections` | error | show TCB summary |
+| `stats` / `trace` / `show interface` / `reset` / `quit` | works | works |
+
+### Server Mode
+
+vaigai can run as a DPDK-based server with `--server`. Workers become
+reactive — no `tx_gen_burst()`, only responding to incoming connections.
+
+```bash
+# Server
+./vaigai -l 0-3 -a 0000:07:00.1 -- --server --src-ip 10.0.0.2
+vaigai(server)> serve --listen tcp:5000:echo --listen http:80
+
+# Client
+./vaigai -l 0-3 -a 0000:07:00.0 -- --src-ip 10.0.0.1
+vaigai> start --ip 10.0.0.2 --port 5000 --proto tcp --duration 10
+```
+
+Server source: `src/app/server.h`, `src/app/server.c`.
+
+### Telemetry
+
+- 38 per-worker counters (L2 through HTTP), cache-line aligned, single-writer.
+- Management core pulls on demand via `metrics_snapshot()` — no periodic scrape.
+- Export: flat JSON via `export_json()`, served at `/api/v1/stats` and CLI `stats`.
+
+## Test Infrastructure
+
+### ping_veth.sh — ICMP over AF_PACKET/AF_XDP
+
+Uses a veth pair + Alpine container (podman). No Firecracker needed.
+Tests ICMP echo request/reply through the full stack.
+
+```bash
+bash tests/ping_veth.sh              # AF_PACKET mode
+bash tests/ping_veth.sh --xdp       # AF_XDP mode
+bash tests/ping_veth.sh --flood 5   # 5-second flood
+```
+
+### tcp_tap.sh — TCP over TAP + Firecracker
+
+Uses dual TAP interfaces + Linux bridge + Firecracker microVM.
+The test topology is documented in `docs/tcp-test.md`.
+
+```
+vaigAI (DPDK net_tap) <-> tap-vaigai <-> br-vaigai <-> tap-fc0 <-> Firecracker VM (Alpine)
+```
+
+- Network: `192.168.204.0/24`, vaigAI = `.1`, VM = `.2`
+- **Important**: DPDK's TAP PMD creates the `tap-vaigai` interface internally. Do NOT pre-create it. The test script attaches it to the bridge after DPDK creates it.
+- vaigai runs as a persistent background process; commands are sent via FIFO.
+
+```bash
+bash tests/tcp_tap.sh                # all tests
+bash tests/tcp_tap.sh --test 1       # T1 only (SYN flood)
+bash tests/tcp_tap.sh --test 2       # T2 only (full lifecycle)
+bash tests/tcp_tap.sh --test 3       # T3 only (throughput)
+```
+
+**Prerequisite paths** (override with env vars `$VMLINUX`, `$ROOTFS`, `$FIRECRACKER`):
+- Kernel: `/work/firecracker/vmlinux`
+- Rootfs: `/work/firecracker/alpine.ext4`
+- Firecracker: in `$PATH`
+
+### udp_veth.sh — UDP over veth
+
+Similar to ping_veth.sh but for UDP flood testing.
+
+## Hugepage Setup
+
+DPDK requires hugepages. For development with TAP/af_packet (no physical NIC):
+
+```bash
+# 256 x 2 MB hugepages (512 MB total) — sufficient for TAP testing
+echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+# For production with physical NICs, use 1 GB hugepages via setup.sh:
+bash scripts/setup.sh --hugepages-1g 16 <pci-addr>
+```
+
+## Running vaigai Manually
+
+```bash
+# TAP mode (no physical NIC needed):
+./build/vaigai --lcores 0-1 --no-pci --vdev "net_tap0,iface=tap-vaigai"
+
+# Physical NIC:
+./build/vaigai --lcores 0-7 -a 0000:01:00.0
+
+# With TLS key logging:
+SSLKEYLOGFILE=/tmp/keys.log ./build/vaigai --lcores 0-3 -a 0000:01:00.0
+```
+
+## Recreating the Environment on a New System
+
+### 1. Install system packages (Fedora/RHEL)
+
+```bash
+dnf install -y \
+    gcc meson ninja-build pkgconfig \
+    numactl-devel rdma-core-devel libibverbs-devel libmlx5 \
+    openssl-devel readline-devel libbpf-devel jansson-devel libmicrohttpd-devel \
+    python3-pyelftools \
+    socat iproute bridge-utils podman
+```
+
+### 2. Build and install DPDK
+
+```bash
+curl -LO https://fast.dpdk.org/rel/dpdk-24.11.1.tar.xz
+tar xf dpdk-24.11.1.tar.xz
+cd dpdk-stable-24.11.1
+
+meson setup builddir \
+    -Denable_drivers=net/af_packet,net/af_xdp,net/tap,net/mlx5,net/i40e,common/mlx5,bus/auxiliary,bus/pci,bus/vdev
+ninja -C builddir
+sudo ninja -C builddir install
+sudo ldconfig
+```
+
+### 3. Build vaigai
+
+```bash
+cd vaigAI/
+meson setup build
+ninja -C build
+```
+
+### 4. Set up hugepages
+
+```bash
+echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+```
+
+### 5. (Optional) Set up Firecracker for TCP tests
+
+```bash
+# Install Firecracker v1.14.2
+curl -L https://github.com/firecracker-microvm/firecracker/releases/download/v1.14.2/firecracker-v1.14.2-x86_64.tgz | tar xz
+sudo cp release-v1.14.2-x86_64/firecracker-v1.14.2-x86_64 /usr/local/bin/firecracker
+
+# Full environment setup (DPDK, guest kernel, rootfs, QAT, vaigai build):
+sudo bash scripts/test-env.sh
+
+# Or build individual components:
+sudo bash scripts/test-env.sh --step dpdk
+sudo bash scripts/test-env.sh --step rootfs
+sudo bash scripts/test-env.sh --step verify
+```
+
+## Coding Conventions
+
+- **Keep `docs/ARCHITECTURE.md` updated** for any change that impacts the architecture — new modules, changed startup sequence, new IPC commands, protocol additions, modified data flows, or telemetry counter changes. The architecture doc is the canonical design reference; it must stay in sync with the code.
+- **Keep `docs/CLI.md` updated** when CLI commands change — new commands, renamed/removed commands, changed flags, defaults, or syntax. The CLI doc is the user-facing command reference.
+- License: BSD-3-Clause on all source files
+- All source is under `src/`, tests under `tests/`, docs under `docs/`
+- Header guards: `TGEN_<MODULE>_H`
+- Log macros: `RTE_LOG(level, TGEN, ...)` — domains defined in `types.h`
+- Metrics: single `++` per counter, no atomics — each worker slab is single-writer
+- IPC: `config_update_t` (256 bytes) over SPSC `rte_ring` — never share state directly
+- Meson feature flags: `tls`, `cli`, `af_xdp`, `rest` (all default to `auto`)
+
+## Confluence Wiki
+
+The architecture and HLD wiki page is at:
+`https://citrix.atlassian.net/wiki/spaces/~shankarkr/pages/1125875781/L4+7+DPDK+Linux+Traffic+Generator` (page ID: `1125875781`).
+
+**Credentials**: See auto-memory (`MEMORY.md`) for the credentials file path. Do not hardcode secrets in tracked files.
+
+- **View page**: `GET /wiki/rest/api/content/1125875781?expand=body.storage,version` with Basic auth (email + API token from the credentials file).
+- **Update page**: `PUT /wiki/rest/api/content/1125875781` with JSON body containing `version.number` (increment from current), `title`, `type: "page"`, and `body.storage.value` in Confluence storage format HTML.
+- **Attachments**: 9 SVG diagrams are uploaded as page attachments. Update via `POST /wiki/rest/api/content/1125875781/child/attachment/{attId}/data`.
+
+When architecture or CLI changes are made, update both `docs/ARCHITECTURE.md` and the Confluence wiki page to keep them in sync.
+
+## Custom Slash Commands
+
+The following slash commands are available under `.claude/commands/`:
+
+- `/jira <ISSUE-KEY>` — Fetch JIRA ticket details, extract linked SR number, and generate a summary
+- `/download-artifact <version>` — Download build artifacts from Citrite SJC Artifactory

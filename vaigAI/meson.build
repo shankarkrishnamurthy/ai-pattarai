@@ -114,6 +114,7 @@ tls_src = files(
 
 app_src = files(
   'src/app/http11.c',
+  'src/app/server.c',
 )
 
 mgmt_src = files(

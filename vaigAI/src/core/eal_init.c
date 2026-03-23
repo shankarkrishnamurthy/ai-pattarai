@@ -39,6 +39,7 @@ static const struct option g_long_opts[] = {
     { "netmask",                required_argument, NULL, 'N' },
     { "sslkeylog",              required_argument, NULL, 'K' },
     { "verbose",                no_argument,       NULL, 'v' },
+    { "server",                 no_argument,       NULL, 'S' },
     { NULL, 0, NULL, 0 },
 };
 
@@ -70,7 +71,7 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
     optind = 1;
     opterr = 0; /* suppress errors for unknown options (belong to EAL) */
 
-    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:X:R:I:G:N:K:v", g_long_opts,
+    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:X:R:I:G:N:K:vS", g_long_opts,
                               &opt_idx)) != -1) {
         switch (opt) {
         case 'W': a->num_worker_cores = (uint32_t)atoi(optarg); break;
@@ -105,6 +106,7 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
                      "%s", optarg);
             break;
         case 'v': a->verbose = true; break;
+        case 'S': a->server_mode = true; break;
         default:  break; /* unknown → EAL handles */
         }
     }

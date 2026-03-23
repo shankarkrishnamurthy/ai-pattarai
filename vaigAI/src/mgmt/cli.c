@@ -26,6 +26,7 @@
 #include "../tls/tls_session.h"
 #include "../tls/tls_engine.h"
 #include "../app/http11.h"
+#include "../app/server.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -897,12 +898,36 @@ cmd_set(int argc, char **argv)
            port_id, ip_buf, gw_buf, nm_buf);
 }
 
+/* Forward declarations for show sub-commands */
+static void cmd_listeners(int argc, char **argv);
+static void cmd_connections(int argc, char **argv);
+
 /* ── Show interface details ──────────────────────────────────────────────── */
 static void
 cmd_show(int argc, char **argv)
 {
-    if (argc < 2 || strcmp(argv[1], "interface") != 0) {
+    if (argc < 2) {
         printf("Usage: show interface [port_id]\n");
+        if (g_config.server_mode)
+            printf("       show listeners\n"
+                   "       show connections\n");
+        return;
+    }
+
+    if (strcmp(argv[1], "listeners") == 0) {
+        cmd_listeners(argc - 1, argv + 1);
+        return;
+    }
+    if (strcmp(argv[1], "connections") == 0) {
+        cmd_connections(argc - 1, argv + 1);
+        return;
+    }
+
+    if (strcmp(argv[1], "interface") != 0) {
+        printf("Usage: show interface [port_id]\n");
+        if (g_config.server_mode)
+            printf("       show listeners\n"
+                   "       show connections\n");
         return;
     }
 
@@ -982,6 +1007,318 @@ cmd_show(int argc, char **argv)
         if (p + 1 < end)
             printf("\n");
     }
+}
+
+/* ── Server mode: serve command ───────────────────────────────────────────── */
+static int
+parse_listen_spec(const char *spec, srv_listen_spec_t *out)
+{
+    /* Format: proto:port[:handler]
+     * e.g., tcp:5000:echo, http:80, https:443, tls:4433:echo */
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s", spec);
+
+    char *proto_s = strtok(buf, ":");
+    char *port_s  = strtok(NULL, ":");
+    char *hdl_s   = strtok(NULL, ":");
+
+    if (!proto_s || !port_s) return -1;
+
+    out->port = (uint16_t)atoi(port_s);
+    if (out->port == 0) return -1;
+
+    if (strcmp(proto_s, "tcp") == 0) {
+        if (!hdl_s || strcmp(hdl_s, "echo") == 0)
+            out->handler = SRV_HANDLER_ECHO;
+        else if (strcmp(hdl_s, "discard") == 0)
+            out->handler = SRV_HANDLER_DISCARD;
+        else if (strcmp(hdl_s, "chargen") == 0)
+            out->handler = SRV_HANDLER_CHARGEN;
+        else return -1;
+    } else if (strcmp(proto_s, "http") == 0) {
+        out->handler = SRV_HANDLER_HTTP;
+    } else if (strcmp(proto_s, "https") == 0) {
+        out->handler = SRV_HANDLER_HTTPS;
+    } else if (strcmp(proto_s, "tls") == 0) {
+        if (!hdl_s || strcmp(hdl_s, "echo") == 0)
+            out->handler = SRV_HANDLER_TLS_ECHO;
+        else return -1;
+    } else {
+        return -1;
+    }
+    return 0;
+}
+
+static void
+cmd_serve(int argc, char **argv)
+{
+    if (!g_config.server_mode) {
+        printf("serve: not available in client mode (use 'start' instead)\n");
+        return;
+    }
+
+    srv_ipc_payload_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.http_body_size = 1024; /* default */
+
+    const char *tls_cert = NULL;
+    const char *tls_key  = NULL;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
+            i++;
+            if (cfg.count >= SRV_MAX_LISTENERS) {
+                printf("serve: max %d listeners\n", SRV_MAX_LISTENERS);
+                return;
+            }
+            if (parse_listen_spec(argv[i], &cfg.specs[cfg.count]) < 0) {
+                printf("serve: invalid spec '%s'\n"
+                       "  Format: proto:port[:handler]\n"
+                       "  e.g., tcp:5000:echo, http:80, https:443\n",
+                       argv[i]);
+                return;
+            }
+            cfg.count++;
+        } else if (strcmp(argv[i], "--tls-cert") == 0 && i + 1 < argc) {
+            tls_cert = argv[++i];
+        } else if (strcmp(argv[i], "--tls-key") == 0 && i + 1 < argc) {
+            tls_key = argv[++i];
+        } else if (strcmp(argv[i], "--http-body-size") == 0 && i + 1 < argc) {
+            cfg.http_body_size = (uint32_t)atoi(argv[++i]);
+        } else {
+            printf("serve: unknown option '%s'\n", argv[i]);
+            return;
+        }
+    }
+
+    if (cfg.count == 0) {
+        printf("serve: at least one --listen spec required\n");
+        return;
+    }
+
+    /* Check TLS requirements */
+    bool needs_tls = false;
+    for (uint32_t i = 0; i < cfg.count; i++) {
+        if (cfg.specs[i].handler == SRV_HANDLER_HTTPS ||
+            cfg.specs[i].handler == SRV_HANDLER_TLS_ECHO) {
+            needs_tls = true;
+            break;
+        }
+    }
+    if (needs_tls && (!tls_cert || !tls_key)) {
+        printf("serve: --tls-cert and --tls-key required for https/tls listeners\n");
+        return;
+    }
+
+    /* Store TLS cert/key paths globally */
+    if (tls_cert)
+        snprintf(g_srv_tls_cert_path, sizeof(g_srv_tls_cert_path), "%s", tls_cert);
+    if (tls_key)
+        snprintf(g_srv_tls_key_path, sizeof(g_srv_tls_key_path), "%s", tls_key);
+
+    /* Save mgmt-side shadow for listeners display */
+    g_srv_active_cfg = cfg;
+    g_srv_active = true;
+
+    /* Broadcast to all workers */
+    config_update_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cmd = CFG_CMD_SERVE;
+    memcpy(cmd.payload, &cfg, sizeof(cfg));
+    tgen_ipc_broadcast(&cmd);
+
+    printf("Listening on %u endpoint(s):\n", cfg.count);
+    for (uint32_t i = 0; i < cfg.count; i++) {
+        const char *hname = srv_handler_name(cfg.specs[i].handler);
+        /* Reconstruct spec string */
+        const char *proto = "tcp";
+        if (cfg.specs[i].handler == SRV_HANDLER_HTTP)     proto = "http";
+        if (cfg.specs[i].handler == SRV_HANDLER_HTTPS)    proto = "https";
+        if (cfg.specs[i].handler == SRV_HANDLER_TLS_ECHO) proto = "tls";
+        printf("  #%u  %s:%u:%s\n", i, proto, cfg.specs[i].port, hname);
+    }
+}
+
+/* ── Server mode: listeners command ──────────────────────────────────────── */
+static void
+cmd_listeners(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    if (!g_config.server_mode) {
+        printf("listeners: not available in client mode\n");
+        return;
+    }
+
+    /* Read from mgmt-side shadow config */
+    if (!g_srv_active || g_srv_active_cfg.count == 0) {
+        printf("No active listeners. Use 'serve --listen ...' to start.\n");
+        return;
+    }
+
+    srv_ipc_payload_t *scfg = &g_srv_active_cfg;
+    uint32_t n_workers = g_core_map.num_workers;
+
+    printf("  #  %-20s %-8s %7s %12s %12s %10s\n",
+           "SPEC", "STATE", "CONNS", "RX bytes", "TX bytes", "HTTP resps");
+    printf("  -  %-20s %-8s %7s %12s %12s %10s\n",
+           "----", "-----", "-----", "--------", "--------", "----------");
+
+    for (uint32_t i = 0; i < scfg->count; i++) {
+        srv_listen_spec_t *sp = &scfg->specs[i];
+
+        /* Aggregate stats across all workers */
+        uint64_t conns = 0, rx = 0, tx = 0, http = 0;
+        for (uint32_t w = 0; w < n_workers; w++) {
+            if (i < g_srv_tables[w].count) {
+                srv_listener_t *lw = &g_srv_tables[w].listeners[i];
+                conns += lw->conns_accepted;
+                rx    += lw->rx_bytes;
+                tx    += lw->tx_bytes;
+                http  += lw->http_resps_sent;
+            }
+        }
+        /* Use mgmt shadow for active state (workers may lag IPC) */
+        bool active = g_srv_active;
+
+        /* Build spec string */
+        char spec[32];
+        const char *proto = "tcp";
+        if (sp->handler == SRV_HANDLER_HTTP)     proto = "http";
+        if (sp->handler == SRV_HANDLER_HTTPS)    proto = "https";
+        if (sp->handler == SRV_HANDLER_TLS_ECHO) proto = "tls";
+        const char *hname = srv_handler_name(sp->handler);
+        if (sp->handler == SRV_HANDLER_HTTP || sp->handler == SRV_HANDLER_HTTPS)
+            snprintf(spec, sizeof(spec), "%s:%u", proto, sp->port);
+        else
+            snprintf(spec, sizeof(spec), "%s:%u:%s", proto, sp->port, hname);
+
+        /* Format byte counts */
+        char rx_s[16], tx_s[16];
+        if (rx >= (1ULL << 30))
+            snprintf(rx_s, sizeof(rx_s), "%.1f GB", (double)rx / (1ULL << 30));
+        else if (rx >= (1ULL << 20))
+            snprintf(rx_s, sizeof(rx_s), "%.1f MB", (double)rx / (1ULL << 20));
+        else if (rx >= (1ULL << 10))
+            snprintf(rx_s, sizeof(rx_s), "%.1f KB", (double)rx / (1ULL << 10));
+        else
+            snprintf(rx_s, sizeof(rx_s), "%lu B", (unsigned long)rx);
+
+        if (tx >= (1ULL << 30))
+            snprintf(tx_s, sizeof(tx_s), "%.1f GB", (double)tx / (1ULL << 30));
+        else if (tx >= (1ULL << 20))
+            snprintf(tx_s, sizeof(tx_s), "%.1f MB", (double)tx / (1ULL << 20));
+        else if (tx >= (1ULL << 10))
+            snprintf(tx_s, sizeof(tx_s), "%.1f KB", (double)tx / (1ULL << 10));
+        else
+            snprintf(tx_s, sizeof(tx_s), "%lu B", (unsigned long)tx);
+
+        printf("  %u  %-20s %-8s %7lu %12s %12s %10lu\n",
+               i, spec, active ? "active" : "stopped",
+               (unsigned long)conns, rx_s, tx_s, (unsigned long)http);
+    }
+}
+
+/* ── Server mode: connections command ────────────────────────────────────── */
+static void
+cmd_connections(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    if (!g_config.server_mode) {
+        printf("connections: not available in client mode\n");
+        return;
+    }
+
+    uint32_t n_workers = g_core_map.num_workers;
+    uint32_t total_active = 0;
+
+    printf("  Worker  Active TCBs  Capacity\n");
+    printf("  ------  -----------  --------\n");
+    for (uint32_t w = 0; w < n_workers; w++) {
+        tcb_store_t *store = &g_tcb_stores[w];
+        uint32_t active = store->count;
+        total_active += active;
+        printf("  %6u  %11u  %8u\n", w, active, store->capacity);
+    }
+    printf("  ------  -----------  --------\n");
+    printf("  Total   %11u\n", total_active);
+}
+
+/* ── Mode-gated wrappers ─────────────────────────────────────────────────── */
+static void
+cmd_start_gated(int argc, char **argv)
+{
+    if (g_config.server_mode) {
+        printf("start: not available in server mode (use 'serve' instead)\n");
+        return;
+    }
+    cmd_start(argc, argv);
+}
+
+static void
+cmd_ping_gated(int argc, char **argv)
+{
+    if (g_config.server_mode) {
+        printf("ping: not available in server mode\n");
+        return;
+    }
+    cmd_ping(argc, argv);
+}
+
+static void
+cmd_stop_gated(int argc, char **argv)
+{
+    if (g_config.server_mode) {
+        /* Server mode: stop listeners */
+        if (argc >= 2) {
+            /* stop by spec or index */
+            /* Try as numeric index first */
+            char *endp;
+            long idx = strtol(argv[1], &endp, 10);
+            if (*endp == '\0' && idx >= 0) {
+                /* Stop by index */
+                config_update_t cmd;
+                memset(&cmd, 0, sizeof(cmd));
+                cmd.cmd = CFG_CMD_STOP_LISTENER;
+                uint32_t li = (uint32_t)idx;
+                memcpy(cmd.payload, &li, sizeof(li));
+                tgen_ipc_broadcast(&cmd);
+                printf("Stopped listener #%ld\n", idx);
+            } else {
+                /* Stop by spec — find matching port */
+                srv_listen_spec_t spec;
+                if (parse_listen_spec(argv[1], &spec) == 0) {
+                    int li = srv_find_listener(0, spec.port);
+                    if (li >= 0) {
+                        config_update_t cmd;
+                        memset(&cmd, 0, sizeof(cmd));
+                        cmd.cmd = CFG_CMD_STOP_LISTENER;
+                        uint32_t liu = (uint32_t)li;
+                        memcpy(cmd.payload, &liu, sizeof(liu));
+                        tgen_ipc_broadcast(&cmd);
+                        printf("Stopped listener %s\n", argv[1]);
+                    } else {
+                        printf("stop: no listener matching '%s'\n", argv[1]);
+                    }
+                } else {
+                    printf("stop: invalid spec '%s'\n", argv[1]);
+                }
+            }
+        } else {
+            /* Stop all listeners */
+            config_update_t cmd;
+            memset(&cmd, 0, sizeof(cmd));
+            cmd.cmd = CFG_CMD_STOP_LISTENER;
+            uint32_t all = UINT32_MAX;
+            memcpy(cmd.payload, &all, sizeof(all));
+            tgen_ipc_broadcast(&cmd);
+            g_srv_active = false;
+            printf("Stopped all listeners.\n");
+        }
+        return;
+    }
+    cmd_stop_gen(argc, argv);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1077,7 +1414,7 @@ cli_run(void)
         "  ping 10.0.0.2\n"
         "  ping 10.0.0.2 10 128 500\n"
         "  ping 10.10.10.10 3 56 1000 1\n",
-        cmd_ping);
+        cmd_ping_gated);
 
     cli_register("start",    "Start traffic: start --ip <ip> --port <N> --duration <s> [flags]",
         "Usage: start --ip <addr> --port <N> --duration <secs>\n"
@@ -1107,9 +1444,9 @@ cli_run(void)
         "  start --ip 10.0.0.2 --port 5000 --duration 10\n"
         "  start --ip 10.0.0.2 --port 80 --proto http --duration 5 --rate 100\n"
         "  start --ip 10.0.0.2 --port 443 --proto https --one --url /\n",
-        cmd_start);
+        cmd_start_gated);
 
-    cli_register("stop",     "Stop active traffic generation", NULL, cmd_stop_gen);
+    cli_register("stop",     "Stop traffic/listeners: stop [spec|#]", NULL, cmd_stop_gated);
 
     cli_register("reset",   "Reset all TCP state (connections, ports)",
         "Usage: reset\n"
@@ -1134,16 +1471,27 @@ cli_run(void)
         "  trace stop\n",
         cmd_trace);
 
-    cli_register("show",     "Show interface details: show interface [port]",
+    cli_register("show",     "Show details: show interface|listeners|connections",
         "Usage: show interface [port_id]\n"
+        "       show listeners           (server mode)\n"
+        "       show connections          (server mode)\n"
         "\n"
-        "Displays driver, MAC, IP, gateway, netmask, link status,\n"
-        "offload capabilities, and packet statistics.\n"
-        "Without port_id, shows all ports.\n"
+        "show interface:\n"
+        "  Displays driver, MAC, IP, gateway, netmask, link status,\n"
+        "  offload capabilities, and packet statistics.\n"
+        "  Without port_id, shows all ports.\n"
+        "\n"
+        "show listeners:\n"
+        "  Shows active listeners with stats (SPEC is copy-pasteable for 'stop').\n"
+        "\n"
+        "show connections:\n"
+        "  Shows per-worker active TCB count.\n"
         "\n"
         "Examples:\n"
         "  show interface\n"
-        "  show interface 0\n",
+        "  show interface 0\n"
+        "  show listeners\n"
+        "  show connections\n",
         cmd_show);
 
     cli_register("set",      "Set config: set ip <port> <ip> <gateway> <netmask>",
@@ -1156,6 +1504,28 @@ cli_run(void)
         "  set ip 0 10.88.33.65 10.88.32.1 255.255.252.0\n"
         "  set ip 1 10.10.10.11 0.0.0.0 255.255.255.0\n",
         cmd_set);
+
+    /* ── Server-mode commands ──────────────────────────────────────────── */
+    cli_register("serve",    "Start listeners: serve --listen <spec> [--listen ...] [opts]",
+        "Usage: serve --listen <spec> [--listen <spec> ...]\n"
+        "             [--tls-cert <path>] [--tls-key <path>]\n"
+        "             [--http-body-size <bytes>]\n"
+        "\n"
+        "  <spec> = proto:port[:handler]\n"
+        "\n"
+        "  Proto     Handler     Description\n"
+        "  -----     -------     -----------\n"
+        "  tcp       echo        Reflect received data\n"
+        "  tcp       discard     ACK + drop payload\n"
+        "  tcp       chargen     Send bulk data\n"
+        "  http      (implicit)  HTTP/1.1 response\n"
+        "  https     (implicit)  TLS + HTTP response\n"
+        "  tls       echo        TLS + echo\n"
+        "\n"
+        "Examples:\n"
+        "  serve --listen tcp:5000:echo --listen http:80\n"
+        "  serve --listen https:443 --tls-cert /path/cert.pem --tls-key /path/key.pem\n",
+        cmd_serve);
 
     /* Start CLI socket server for remote attach */
     cli_server_init(NULL);

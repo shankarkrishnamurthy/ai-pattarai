@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <rte_mbuf.h>
+#include <rte_ether.h>
 #include "../common/types.h"
 
 #ifdef __cplusplus
@@ -91,6 +92,10 @@ typedef struct {
     uint16_t    port_id;         /* DPDK egress port for this connection */
     bool        active_open;     /* we initiated the connection */
 
+    /* Cached destination MAC (resolved once, reused per segment) */
+    struct rte_ether_addr dst_mac;
+    bool        dst_mac_valid;
+
     /* Out-of-order queue */
     ooo_seg_t   ooo[TGEN_OOO_QUEUE_SZ];
     uint8_t     ooo_count;
@@ -146,6 +151,9 @@ typedef struct {
     int32_t    *ht;             /* -1 = empty */
     uint32_t    ht_size;
     uint32_t    ht_mask;
+    /* free-index stack: O(1) alloc/free instead of linear scan */
+    uint32_t   *free_stack;     /* indices of unused TCB slots */
+    uint32_t    free_top;       /* next pop position (grows downward) */
 } tcb_store_t;
 
 /** Initialise per-worker TCB store.  capacity = max_connections_per_core. */

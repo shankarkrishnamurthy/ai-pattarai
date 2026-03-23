@@ -30,6 +30,9 @@ typedef struct {
 
     /* TCB sizing */
     uint32_t    max_concurrent; /**< max connections per worker */
+
+    /* Server mode */
+    bool        server_mode;    /**< true = server mode (accept connections) */
 } tgen_config_t;
 
 extern tgen_config_t g_config;

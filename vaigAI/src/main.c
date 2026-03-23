@@ -240,6 +240,9 @@ main(int argc, char **argv)
     /* ---- 7. Populate runtime config from binary args ---- */
     g_config.max_concurrent = eal_args.max_conn;
     g_config.rest_port      = eal_args.rest_port;
+    g_config.server_mode    = eal_args.server_mode;
+    if (g_config.server_mode)
+        RTE_LOG(INFO, USER1, "Server mode enabled\n");
 
     /* ---- 8. TLS client context (always available for --tls flag) ---- */
     rc = cert_mgr_init(&g_config.cert, &g_tls_client, &g_tls_server);

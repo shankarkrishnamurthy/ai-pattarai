@@ -41,6 +41,7 @@ typedef struct {
     char        sslkeylog_path[256]; /* SSLKEYLOG file path (--sslkeylog) */
 
     bool        verbose;            /* -v/--verbose: show all startup log messages */
+    bool        server_mode;        /* --server: start in server mode */
 } tgen_eal_args_t;
 
 /** Parse argv, populate tgen_eal_args_t, then call rte_eal_init().
