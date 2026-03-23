@@ -82,6 +82,17 @@ tls_session_attach(uint32_t worker_idx, uint32_t conn_idx,
     return 0;
 }
 
+int
+tls_server_ctx_load(const char *cert_pem, const char *key_pem)
+{
+    if (!g_server_ctx) return -ENOENT;
+
+    /* Tear down previous context if any */
+    tls_ctx_fini(g_server_ctx);
+
+    return tls_ctx_init(g_server_ctx, cert_pem, key_pem, NULL, true);
+}
+
 void
 tls_session_detach(uint32_t worker_idx, uint32_t conn_idx)
 {

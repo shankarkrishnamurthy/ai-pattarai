@@ -1116,6 +1116,14 @@ cmd_serve(int argc, char **argv)
     if (tls_key)
         snprintf(g_srv_tls_key_path, sizeof(g_srv_tls_key_path), "%s", tls_key);
 
+    /* Initialise server TLS context with the provided cert/key */
+    if (needs_tls) {
+        if (tls_server_ctx_load(tls_cert, tls_key) < 0) {
+            printf("serve: failed to load TLS certificate/key\n");
+            return;
+        }
+    }
+
     /* Save mgmt-side shadow for listeners display */
     g_srv_active_cfg = cfg;
     g_srv_active = true;
@@ -1178,8 +1186,9 @@ cmd_listeners(int argc, char **argv)
                 http  += lw->http_resps_sent;
             }
         }
-        /* Use mgmt shadow for active state (workers may lag IPC) */
-        bool active = g_srv_active;
+        /* Read per-listener active state from worker 0 */
+        bool active = (i < g_srv_tables[0].count) &&
+                       g_srv_tables[0].listeners[i].active;
 
         /* Build spec string */
         char spec[32];

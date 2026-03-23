@@ -44,6 +44,12 @@ int tls_session_attach(uint32_t worker_idx, uint32_t conn_idx,
 /** Detach and free the TLS session for a connection. */
 void tls_session_detach(uint32_t worker_idx, uint32_t conn_idx);
 
+/**
+ * (Re-)initialise the server TLS context with a certificate and key.
+ * Called from cmd_serve() when HTTPS/TLS listeners are configured.
+ */
+int tls_server_ctx_load(const char *cert_pem, const char *key_pem);
+
 #ifdef __cplusplus
 }
 #endif

@@ -153,9 +153,6 @@ teardown() {
 }
 trap teardown EXIT
 
-# ── JSON value extractor ─────────────────────────────────────────────────────
-json_val() { grep -oP "\"$1\": *\K[0-9]+" <<< "$OUTPUT" | tail -1 || echo "0"; }
-
 # ── Send command to vaigai, capture new output ───────────────────────────────
 vaigai_cmd() {
     local cmd="$1"
@@ -166,29 +163,6 @@ vaigai_cmd() {
     printf '%s\n' "$cmd" >&7
     sleep "$wait_s"
 
-    OUTPUT=$(tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null || true)
-}
-
-# Send command and also request stats JSON
-vaigai_cmd_stats() {
-    local cmd="$1"
-    local wait_s="${2:-3}"
-    local start_bytes
-    start_bytes=$(stat -c%s "$VAIGAI_LOG" 2>/dev/null || echo 0)
-
-    printf '%s\n' "$cmd" >&7
-    sleep "$wait_s"
-    printf 'stats\n' >&7
-
-    # Wait for JSON closing brace
-    local attempts=0
-    while (( attempts < 30 )); do
-        if tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null | grep -q '^}'; then
-            break
-        fi
-        sleep 0.5; ((attempts++))
-    done
-    sleep 0.5
     OUTPUT=$(tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null || true)
 }
 
@@ -273,7 +247,7 @@ run_t1() {
     fi
 
     local active_count
-    active_count=$(echo "$OUTPUT" | grep -c "active" || true)
+    active_count=$(echo "$OUTPUT" | grep -cE '^\s+[0-9]+\s.*active' || true)
     local expected=4
     [[ $HAS_TLS -eq 1 ]] && expected=6
     if (( active_count >= expected )); then
@@ -360,14 +334,15 @@ run_t5() {
 run_t6() {
     info "T6: show connections during active connection"
 
-    # Open a long-lived socat connection in background
-    socat - "TCP:${VAIGAI_IP}:${PORT_ECHO},bind=${CLIENT_IP}" </dev/null &>/dev/null &
+    # Open a long-lived socat connection in background (sleep keeps stdin open)
+    { sleep 10; } | socat - "TCP:${VAIGAI_IP}:${PORT_ECHO},bind=${CLIENT_IP}" &>/dev/null &
     local SOCAT_PID=$!
     sleep 2
 
     vaigai_cmd "show connections" 2
 
-    kill "$SOCAT_PID" 2>/dev/null; wait "$SOCAT_PID" 2>/dev/null || true
+    kill "$SOCAT_PID" 2>/dev/null || true
+    wait "$SOCAT_PID" 2>/dev/null || true
 
     if echo "$OUTPUT" | grep -qE "W[0-9]|worker|Active|active"; then
         pass "T6 show connections produced output during active connection"
@@ -418,10 +393,10 @@ run_t8() {
 
     vaigai_cmd "stop" 2
 
-    # Verify all stopped
+    # Verify all stopped — match only table rows (start with spaces + digit)
     vaigai_cmd "show listeners" 2
     local active
-    active=$(echo "$OUTPUT" | grep -c "active" || true)
+    active=$(echo "$OUTPUT" | grep -cE '^\s+[0-9]+\s.*active' || true)
     if (( active == 0 )); then
         pass "T8 all listeners stopped"
     else
@@ -483,9 +458,10 @@ run_t10() {
 
     info "T10: TLS echo (openssl s_client → :${PORT_TLS_ECHO})"
     local REPLY
-    REPLY=$(echo "tls-echo-test" | timeout 5 openssl s_client \
+    # Keep stdin open for 2s after sending data so echo has time to return
+    REPLY=$( (echo "tls-echo-test"; sleep 2) | timeout 5 openssl s_client \
         -connect "${VAIGAI_IP}:${PORT_TLS_ECHO}" \
-        -quiet -no_ign_eof 2>/dev/null || true)
+        -quiet 2>/dev/null || true)
 
     if echo "$REPLY" | grep -q "tls-echo-test"; then
         pass "T10 TLS echo reflected data correctly"
@@ -509,9 +485,9 @@ should_run 9  && run_t9
 should_run 10 && run_t10
 
 # ── Stats summary ────────────────────────────────────────────────────────────
-vaigai_cmd_stats "" 1
-tcp_open=$(json_val tcp_conn_open)
-tcp_close=$(json_val tcp_conn_close)
+vaigai_cmd "stats" 3
+tcp_open=$(echo "$OUTPUT" | grep -oP 'Conn open:\s*\K[0-9]+' || echo 0)
+tcp_close=$(echo "$OUTPUT" | grep -oP 'Conn close:\s*\K[0-9]+' || echo 0)
 info "Final stats: tcp_conn_open=$tcp_open tcp_conn_close=$tcp_close"
 
 if (( tcp_open > 0 )); then
