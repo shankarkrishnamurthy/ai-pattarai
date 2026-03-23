@@ -164,6 +164,7 @@ void arp_mgmt_process(uint16_t port_id, struct rte_mbuf *m)
 
     uint32_t sh = rte_be_to_cpu_32(sender_ip);
     uint32_t th = rte_be_to_cpu_32(arp->arp_data.arp_tip);
+
     if (op == RTE_ARP_OP_REPLY) {
         RTE_LOG(DEBUG, USER1,
                 "ARP: mgmt_process port=%u REPLY sender=%u.%u.%u.%u target=%u.%u.%u.%u\n",

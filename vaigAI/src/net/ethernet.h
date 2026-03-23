@@ -13,10 +13,12 @@
 extern "C" {
 #endif
 
-/** Return pointer to the Ethernet header, or NULL if mbuf too short. */
+/** Return pointer to the Ethernet header, or NULL if mbuf too short
+ *  or buffer address is invalid. */
 static inline struct rte_ether_hdr *eth_hdr(struct rte_mbuf *m)
 {
     if (m->data_len < sizeof(struct rte_ether_hdr)) return NULL;
+    if (unlikely(m->buf_addr == NULL)) return NULL;
     return rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 }
 

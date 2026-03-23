@@ -178,7 +178,9 @@ void srv_on_established(uint32_t worker_idx, void *tcb_ptr,
     case SRV_HANDLER_ECHO:
     case SRV_HANDLER_DISCARD:
     case SRV_HANDLER_HTTP:
-        /* These handlers activate on data arrival, nothing to do now */
+        /* Mark as server-active so tcp_fsm dispatches data to srv_on_data.
+         * app_state >= 10 is required by the FSM dispatch check. */
+        tcb->app_state = 11;
         break;
 
     default:

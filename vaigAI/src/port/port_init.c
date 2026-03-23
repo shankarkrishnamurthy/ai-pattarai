@@ -16,6 +16,33 @@
 #include <rte_log.h>
 #include <rte_malloc.h>
 #include <rte_flow.h>
+#include <rte_mbuf.h>
+
+/* ── AF_XDP mbuf fixup RX callback ────────────────────────────────────────── */
+/* On mlx5 ConnectX-4 with AF_XDP (zero-copy UMEM path), the kernel XDP
+ * redirect corrupts the mbuf header (buf_addr, pool, refcnt).  This RX
+ * callback reconstructs the critical fields from known-good values.
+ * Registered first so it runs before any other callback (e.g. pktrace). */
+static uint16_t
+afxdp_fixup_rx_cb(uint16_t port, uint16_t queue,
+                  struct rte_mbuf **pkts, uint16_t nb_pkts,
+                  uint16_t max_pkts, void *user_param)
+{
+    (void)port; (void)queue; (void)max_pkts;
+    struct rte_mempool *mp = user_param;
+    for (uint16_t i = 0; i < nb_pkts; i++) {
+        if (unlikely(pkts[i]->buf_addr == NULL)) {
+            pkts[i]->buf_addr = (char *)pkts[i] + sizeof(struct rte_mbuf);
+            pkts[i]->pool     = mp;
+            pkts[i]->buf_len  = (uint16_t)rte_pktmbuf_data_room_size(mp);
+            rte_mbuf_refcnt_set(pkts[i], 1);
+            pkts[i]->nb_segs  = 1;
+            pkts[i]->next     = NULL;
+            pkts[i]->ol_flags = 0;
+        }
+    }
+    return nb_pkts;
+}
 
 /* ── Symmetric Toeplitz RSS key (40 bytes) ────────────────────────────────── */
 static const uint8_t g_rss_key_sym[52] = {
@@ -202,6 +229,22 @@ static int port_setup(uint16_t port_id,
         RTE_LOG(ERR, PORT, "Port %u: rte_eth_dev_start failed: %d\n",
                 port_id, rc);
         return -1;
+    }
+
+    /* Register AF_XDP mbuf fixup callback on af_xdp ports. Must be
+     * registered FIRST (before pktrace) so it runs before any other
+     * callback that accesses buf_addr. */
+    if (strstr(caps->driver_name, "af_xdp")) {
+        for (uint16_t q = 0; q < n_rxq; q++) {
+            if (!rte_eth_add_rx_callback(port_id, q,
+                                         afxdp_fixup_rx_cb, mp))
+                RTE_LOG(WARNING, PORT,
+                    "Port %u: failed to register AF_XDP fixup callback\n",
+                    port_id);
+        }
+        RTE_LOG(INFO, PORT,
+            "Port %u (net_af_xdp): zero-copy mbuf fixup callback registered\n",
+            port_id);
     }
 
     char mac_buf[18];

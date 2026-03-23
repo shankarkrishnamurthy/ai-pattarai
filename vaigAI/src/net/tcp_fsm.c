@@ -167,6 +167,49 @@ static uint32_t isn_generate(uint32_t sip, uint16_t sport,
 /* ── Per-worker IP ID counter ────────────────────────────────────────────── */
 static uint32_t g_tcp_ip_id[TGEN_MAX_WORKERS];
 
+/* ── Per-worker TCP TX batch buffer ──────────────────────────────────────── */
+/* Accumulates TCP segments and flushes them in a single rte_eth_tx_burst()
+ * call, amortizing the sendto() syscall overhead of AF_PACKET/TAP PMDs.
+ * Only used on worker lcores; management lcore sends immediately. */
+#define TCP_TX_BATCH_MAX 64
+static struct {
+    struct rte_mbuf *pkts[TCP_TX_BATCH_MAX];
+    uint16_t count;
+    uint16_t port_id;
+    uint16_t tx_queue;
+} g_tcp_tx_buf[TGEN_MAX_WORKERS];
+
+static inline void
+tcp_tx_enqueue(uint32_t worker_idx, uint16_t port_id, uint16_t tx_q,
+               struct rte_mbuf *m)
+{
+    typeof(g_tcp_tx_buf[0]) *tb = &g_tcp_tx_buf[worker_idx];
+
+    /* Flush if port/queue changed or buffer full */
+    if (tb->count > 0 &&
+        (tb->port_id != port_id || tb->tx_queue != tx_q ||
+         tb->count >= TCP_TX_BATCH_MAX)) {
+        tcp_tx_flush(worker_idx);
+    }
+
+    tb->port_id  = port_id;
+    tb->tx_queue = tx_q;
+    tb->pkts[tb->count++] = m;
+}
+
+void
+tcp_tx_flush(uint32_t worker_idx)
+{
+    typeof(g_tcp_tx_buf[0]) *tb = &g_tcp_tx_buf[worker_idx];
+    if (tb->count == 0) return;
+
+    uint16_t sent = rte_eth_tx_burst(tb->port_id, tb->tx_queue,
+                                      tb->pkts, tb->count);
+    for (uint16_t i = sent; i < tb->count; i++)
+        rte_pktmbuf_free(tb->pkts[i]);
+    tb->count = 0;
+}
+
 /* ── Build and send a TCP segment ────────────────────────────────────────── */
 static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
                               uint8_t flags,
@@ -268,14 +311,16 @@ static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
 
     m->port = port_id;
 
-    /* Transmit — use dedicated mgmt TX queue if called from mgmt lcore */
+    /* Transmit — batch on worker lcores, send immediately on mgmt lcore */
     uint16_t tx_q;
-    if (is_worker_lcore())
+    if (is_worker_lcore()) {
         tx_q = (uint16_t)worker_idx % g_port_caps[port_id].max_tx_queues;
-    else
+        tcp_tx_enqueue(worker_idx, port_id, tx_q, m);
+    } else {
         tx_q = g_port_caps[port_id].mgmt_tx_q;
-    uint16_t sent = rte_eth_tx_burst(port_id, tx_q, &m, 1);
-    if (sent == 0) { rte_pktmbuf_free(m); return -1; }
+        uint16_t sent = rte_eth_tx_burst(port_id, tx_q, &m, 1);
+        if (sent == 0) { rte_pktmbuf_free(m); return -1; }
+    }
     worker_metrics_add_tx(worker_idx, 1, (uint32_t)seg_len);
     /* Piggybacking an ACK clears any pending delayed-ACK. */
     if ((flags & RTE_TCP_ACK_FLAG) && !(flags & RTE_TCP_SYN_FLAG))
@@ -386,12 +431,15 @@ static void tcp_send_rst_no_tcb(uint32_t worker_idx, struct rte_mbuf *m,
                      g_port_caps[port_id].has_tcp_cksum_offload);
     rst->port = port_id;
 
-    uint16_t tx_q = is_worker_lcore()
-        ? (uint16_t)worker_idx % g_port_caps[port_id].max_tx_queues
-        : g_port_caps[port_id].mgmt_tx_q;
-    uint16_t sent = rte_eth_tx_burst(port_id, tx_q, &rst, 1);
-    if (sent == 0) rte_pktmbuf_free(rst);
-    else worker_metrics_add_tcp_reset_sent(worker_idx);
+    if (is_worker_lcore()) {
+        uint16_t tx_q = (uint16_t)worker_idx % g_port_caps[port_id].max_tx_queues;
+        tcp_tx_enqueue(worker_idx, port_id, tx_q, rst);
+    } else {
+        uint16_t tx_q = g_port_caps[port_id].mgmt_tx_q;
+        uint16_t sent = rte_eth_tx_burst(port_id, tx_q, &rst, 1);
+        if (sent == 0) { rte_pktmbuf_free(rst); return; }
+    }
+    worker_metrics_add_tcp_reset_sent(worker_idx);
 }
 
 /* ── FSM: input ──────────────────────────────────────────────────────────── */
