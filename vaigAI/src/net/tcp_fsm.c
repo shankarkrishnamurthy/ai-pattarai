@@ -503,9 +503,9 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->wscale_local  = 7;
             tcb->rcv_wnd       = 65535 << tcb->wscale_local;
             tcb->snd_wnd       = 65535;
-            /* RFC 5681 §3.1: IW = min(10*SMSS, max(2*SMSS, 4380)) */
-            tcb->cwnd          = TGEN_MIN(10u * tcb->mss_remote,
-                                   TGEN_MAX(2u * tcb->mss_remote, 4380u));
+            /* Traffic generator: allow full-window initial burst.
+             * No send buffer, so data beyond cwnd is lost. */
+            tcb->cwnd          = 65535;
             tcb->ssthresh      = UINT32_MAX;
             tcb->sack_enabled  = opts.has_sack_perm;
             tcb->ts_enabled    = opts.has_timestamps;
@@ -556,9 +556,8 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->ts_ecr        = opts.ts_val;
             /* RFC 7323 §2.2: window in SYN-ACK is NOT scaled */
             tcb->snd_wnd       = rte_be_to_cpu_16(tcp->rx_win);
-            /* Recalculate IW now that we know peer MSS (RFC 5681 §3.1) */
-            tcb->cwnd          = TGEN_MIN(10u * tcb->mss_remote,
-                                    TGEN_MAX(2u * tcb->mss_remote, 4380u));
+            /* Traffic generator: allow full-window initial burst */
+            tcb->cwnd          = rte_be_to_cpu_16(tcp->rx_win);
             tcb->state = TCP_ESTABLISHED;
             tcb->retransmit_count = 0;
             tcb->rto_deadline_tsc = 0;  /* disarm SYN RTO */
@@ -1274,27 +1273,34 @@ int tcp_fsm_send(uint32_t worker_idx, tcb_t *tcb,
     if (tcb->state != TCP_ESTABLISHED && tcb->state != TCP_CLOSE_WAIT)
         return -1;
 
-    /* Flow control: limit by window minus in-flight data */
-    uint32_t in_flight = tcb->snd_nxt - tcb->snd_una;
-    uint32_t wnd = TGEN_MIN(tcb->cwnd, tcb->snd_wnd);
-    uint32_t avail = (wnd > in_flight) ? wnd - in_flight : 0;
-    uint32_t send_len = TGEN_MIN(len, avail);
-    if (send_len == 0) return 0;
-
     /* Cap payload by effective MSS (account for TCP options that reduce MTU space) */
     uint32_t opts_overhead = tcb->ts_enabled ? 12 : 0;
     uint32_t effective_mss = (tcb->mss_remote > opts_overhead)
                              ? tcb->mss_remote - opts_overhead : 1;
-    send_len = TGEN_MIN(send_len, effective_mss);
 
-    int rc = tcp_send_segment(worker_idx, tcb,
-                      RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG,
-                      data, send_len, tcb->snd_nxt, tcb->rcv_nxt);
-    if (rc < 0) return 0;  /* TX failed — don't advance snd_nxt */
-    tcb->snd_nxt += send_len;
+    uint32_t total_sent = 0;
+    while (total_sent < len) {
+        /* Flow control: limit by window minus in-flight data */
+        uint32_t in_flight = tcb->snd_nxt - tcb->snd_una;
+        uint32_t wnd = TGEN_MIN(tcb->cwnd, tcb->snd_wnd);
+        uint32_t avail = (wnd > in_flight) ? wnd - in_flight : 0;
+        uint32_t send_len = TGEN_MIN(len - total_sent, avail);
+        if (send_len == 0) break; /* send window exhausted */
+
+        send_len = TGEN_MIN(send_len, effective_mss);
+
+        int rc = tcp_send_segment(worker_idx, tcb,
+                          RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG,
+                          data + total_sent, send_len,
+                          tcb->snd_nxt, tcb->rcv_nxt);
+        if (rc < 0) break;  /* TX failed — stop sending */
+        tcb->snd_nxt += send_len;
+        total_sent += send_len;
+        worker_metrics_add_tcp_payload_tx(worker_idx, send_len);
+    }
+
     /* RFC 6298: only start RTO timer when not already running */
-    if (tcb->rto_deadline_tsc == 0)
+    if (total_sent > 0 && tcb->rto_deadline_tsc == 0)
         arm_rto(tcb);
-    worker_metrics_add_tcp_payload_tx(worker_idx, send_len);
-    return (int)send_len;
+    return (int)total_sent;
 }

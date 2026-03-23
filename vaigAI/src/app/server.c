@@ -45,10 +45,10 @@ const char *srv_handler_name(srv_handler_t h)
 void srv_build_http_response(srv_table_t *tbl, uint32_t body_size)
 {
     if (body_size == 0) body_size = 1024;
-    if (body_size > 3000) body_size = 3000; /* fit in 4096 with headers */
+    if (body_size > 16384) body_size = 16384; /* fit in 18000 with headers */
 
     /* Build a body of repeating 'A' characters */
-    uint8_t body[3000];
+    uint8_t body[16384];
     memset(body, 'A', body_size);
 
     int len = http11_tx_response(tbl->http_response, sizeof(tbl->http_response),
@@ -284,7 +284,7 @@ int srv_on_data(uint32_t worker_idx, void *tcb_ptr,
                 /* HTTPS: look for HTTP request in plaintext */
                 const uint8_t *end = memmem(plain, plen, "\r\n\r\n", 4);
                 if (end && tbl->http_response_len > 0) {
-                    uint8_t ct[4096];
+                    uint8_t ct[18000];
                     int ct_len = tls_encrypt(ts,
                                              tbl->http_response,
                                              tbl->http_response_len,

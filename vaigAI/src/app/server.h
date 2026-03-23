@@ -57,7 +57,7 @@ typedef struct {
     bool           serving;     /* true when at least one listener is active */
 
     /* Pre-built HTTP response (shared across all HTTP/HTTPS listeners) */
-    uint8_t        http_response[4096];
+    uint8_t        http_response[18000];
     uint32_t       http_response_len;
 
     /* Chargen pattern buffer (1 MSS worth of data) */
