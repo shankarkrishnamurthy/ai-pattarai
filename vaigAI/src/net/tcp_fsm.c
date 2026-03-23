@@ -3,6 +3,7 @@
  */
 #include "tcp_fsm.h"
 #include "tcp_tcb.h"
+#include "tcp_snd_buf.h"
 #include "tcp_options.h"
 #include "tcp_port_pool.h"
 #include "tcp_checksum.h"
@@ -442,6 +443,96 @@ static void tcp_send_rst_no_tcb(uint32_t worker_idx, struct rte_mbuf *m,
     worker_metrics_add_tcp_reset_sent(worker_idx);
 }
 
+/* ── HTTP keep-alive transaction helper ───────────────────────────────────
+ * After an HTTP response is received on a keep-alive connection, decide
+ * whether to send the next request (state 4), enter think-time (state 7),
+ * or close the connection.  Returns the new app_state. */
+static inline uint8_t
+http_next_txn(tcb_t *tcb)
+{
+    http_prebuilt_req_t *hpb = (http_prebuilt_req_t *)tcb->app_ctx;
+    if (!hpb || !hpb->keep_alive) return 0; /* no keep-alive → close */
+
+    tcb->http_txn_count++;
+
+    /* Check transaction limit */
+    if (hpb->txn_per_conn > 0 && tcb->http_txn_count >= hpb->txn_per_conn)
+        return 0; /* limit reached → close */
+
+    /* Think-time delay before next request */
+    if (hpb->think_time_us > 0) {
+        tcb->think_deadline_tsc = rte_rdtsc() +
+            (uint64_t)hpb->think_time_us * g_tsc_hz / 1000000ULL;
+        return 7; /* think-time wait */
+    }
+
+    return 4; /* send next request immediately */
+}
+
+/* ── Send next HTTP request on a keep-alive connection ────────────────────
+ * Handles both plain HTTP and HTTPS (encrypts if TLS session exists).
+ * Sets app_state = 5 (response pending) and records sent timestamp. */
+static void
+http_send_next_request(uint32_t worker_idx, tcb_t *tcb)
+{
+    http_prebuilt_req_t *hp = (http_prebuilt_req_t *)tcb->app_ctx;
+    if (!hp || hp->hdr_len == 0) return;
+
+    uint32_t ci = (uint32_t)(tcb - g_tcb_stores[worker_idx].tcbs);
+    tls_session_t *ts = tls_session_get(worker_idx, ci);
+    if (ts) {
+        uint8_t ct_buf[4096];
+        int ct_len = tls_encrypt(ts, hp->hdr, hp->hdr_len,
+                                  ct_buf, sizeof(ct_buf));
+        if (ct_len > 0)
+            tcp_fsm_send(worker_idx, tcb, ct_buf, (uint32_t)ct_len);
+        worker_metrics_add_tls_tx(worker_idx);
+    } else {
+        tcp_fsm_send(worker_idx, tcb, hp->hdr, hp->hdr_len);
+    }
+    worker_metrics_add_http_req(worker_idx);
+    tcb->http_req_sent_tsc = rte_rdtsc();
+    tcb->app_state = 5; /* HTTP response pending */
+}
+
+/* ── Effective MSS helper ─────────────────────────────────────────────────── */
+static inline uint32_t
+tcb_effective_mss(const tcb_t *tcb)
+{
+    uint32_t opts = tcb->ts_enabled ? 12 : 0;
+    return (tcb->mss_remote > opts) ? tcb->mss_remote - opts : 1;
+}
+
+/* ── Send-buffer drain: transmit unsent data within the current window ─── */
+static void
+snd_buf_drain(uint32_t worker_idx, tcb_t *tcb)
+{
+    tcp_snd_buf_t *sb = tcb->snd_buf;
+    if (!sb || sb->len == 0) return;
+
+    uint32_t eff_mss = tcb_effective_mss(tcb);
+    uint32_t offset  = tcb->snd_nxt - tcb->snd_una;
+
+    while (offset < sb->len) {
+        uint32_t in_flight = tcb->snd_nxt - tcb->snd_una;
+        uint32_t wnd   = TGEN_MIN(tcb->cwnd, tcb->snd_wnd);
+        uint32_t avail = (wnd > in_flight) ? wnd - in_flight : 0;
+        uint32_t unsent = sb->len - offset;
+        uint32_t send_len = TGEN_MIN(unsent, avail);
+        if (send_len == 0) break;
+        send_len = TGEN_MIN(send_len, eff_mss);
+
+        int rc = tcp_send_segment(worker_idx, tcb,
+                     RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG,
+                     sb->data + offset, send_len,
+                     tcb->snd_nxt, tcb->rcv_nxt);
+        if (rc < 0) break;
+        tcb->snd_nxt += send_len;
+        offset       += send_len;
+        worker_metrics_add_tcp_payload_tx(worker_idx, send_len);
+    }
+}
+
 /* ── FSM: input ──────────────────────────────────────────────────────────── */
 void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
 {
@@ -703,6 +794,9 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                 congestion_on_ack(tcb, acked);
                 /* RFC 6298: on new ACK */
                 tcb->retransmit_count = 0;
+                /* Trim ACKed data from send buffer */
+                if (tcb->snd_buf)
+                    tcp_snd_buf_ack(tcb->snd_buf, acked);
                 if (tcb->snd_una == tcb->snd_nxt) {
                     /* All data acknowledged — disarm RTO */
                     tcb->rto_deadline_tsc = 0;
@@ -717,10 +811,27 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                     if (rtt_us < 60000000U)
                         update_rtt(tcb, rtt_us);
                 }
+                /* Drain queued unsent data now that window opened */
+                snd_buf_drain(worker_idx, tcb);
+                /* Pump more chunked response data if streaming */
+                if (tcb->app_state == 12)
+                    srv_stream_pump(worker_idx, tcb);
             } else if (ack == tcb->snd_una) {
                 tcb->dup_ack_count++;
-                if (tcb->dup_ack_count == 3)
+                if (tcb->dup_ack_count == 3) {
                     congestion_fast_retransmit(worker_idx, tcb);
+                    /* Retransmit oldest unACKed segment from send buffer
+                     * (RFC 5681 §3.2: retransmit what appears to be lost) */
+                    if (tcb->snd_buf && tcb->snd_buf->len > 0) {
+                        uint32_t rtx_mss = tcb_effective_mss(tcb);
+                        uint32_t rtx_len = TGEN_MIN(tcb->snd_buf->len, rtx_mss);
+                        tcp_send_segment(worker_idx, tcb,
+                                         RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG,
+                                         tcb->snd_buf->data, rtx_len,
+                                         tcb->snd_una, tcb->rcv_nxt);
+                        worker_metrics_add_tcp_retransmit(worker_idx);
+                    }
+                }
             }
             /* Update snd_wnd */
             tcb->snd_wnd = rte_be_to_cpu_16(tcp->rx_win) << tcb->wscale_remote;
@@ -831,18 +942,22 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                     uint16_t status =
                                         (uint16_t)atoi((const char *)plain + 9);
                                     worker_metrics_add_http_rsp(worker_idx, status);
-                                    /* Record HTTPS request→response latency */
+                                    /* Record HTTPS request→response latency (CO-corrected) */
                                     if (tcb->http_req_sent_tsc) {
                                         uint64_t lat_us =
                                             (rte_rdtsc() - tcb->http_req_sent_tsc)
                                             * 1000000ULL / rte_get_tsc_hz();
-                                        hist_record(&g_latency_hist[worker_idx],
-                                                    lat_us);
+                                        http_prebuilt_req_t *hlat =
+                                            (http_prebuilt_req_t *)tcb->app_ctx;
+                                        uint64_t ei = hlat ? hlat->expected_interval_us : 0;
+                                        hist_record_corrected(&g_latency_hist[worker_idx],
+                                                              lat_us, ei);
                                     }
-                                    http_prebuilt_req_t *hpb =
-                                        (http_prebuilt_req_t *)tcb->app_ctx;
-                                    if (hpb && hpb->keep_alive) {
-                                        tcb->app_state = 4;
+                                    uint8_t nxt = http_next_txn(tcb);
+                                    if (nxt == 4) {
+                                        http_send_next_request(worker_idx, tcb);
+                                    } else if (nxt == 7) {
+                                        tcb->app_state = 7; /* think-time wait */
                                     } else if (!tcb->graceful_close) {
                                         tcp_fsm_reset(worker_idx, tcb);
                                         goto done;
@@ -878,22 +993,26 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                 (uint16_t)atoi((const char *)hp + 9);
                             worker_metrics_add_http_rsp(worker_idx,
                                                         status);
-                            /* Record HTTP request→response latency */
+                            /* Record HTTP request→response latency (CO-corrected) */
                             if (tcb->http_req_sent_tsc) {
                                 uint64_t lat_us =
                                     (rte_rdtsc() - tcb->http_req_sent_tsc)
                                     * 1000000ULL / rte_get_tsc_hz();
-                                hist_record(&g_latency_hist[worker_idx],
-                                            lat_us);
+                                http_prebuilt_req_t *hlat2 =
+                                    (http_prebuilt_req_t *)tcb->app_ctx;
+                                uint64_t ei2 = hlat2 ? hlat2->expected_interval_us : 0;
+                                hist_record_corrected(&g_latency_hist[worker_idx],
+                                                      lat_us, ei2);
                             }
                         } else {
                             worker_metrics_add_http_parse_err(
                                 worker_idx);
                         }
-                        http_prebuilt_req_t *hpb =
-                            (http_prebuilt_req_t *)tcb->app_ctx;
-                        if (hpb && hpb->keep_alive) {
-                            tcb->app_state = 4; /* re-send next request */
+                        uint8_t nxt2 = http_next_txn(tcb);
+                        if (nxt2 == 4) {
+                            http_send_next_request(worker_idx, tcb);
+                        } else if (nxt2 == 7) {
+                            tcb->app_state = 7; /* think-time wait */
                         } else if (!tcb->graceful_close) {
                             tcp_fsm_reset(worker_idx, tcb);
                             goto done;
@@ -1046,11 +1165,14 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                 tcb->snd_una = ack;
                 tcb->dup_ack_count = 0;
                 congestion_on_ack(tcb, acked);
+                if (tcb->snd_buf)
+                    tcp_snd_buf_ack(tcb->snd_buf, acked);
                 tcb->retransmit_count = 0;
                 if (tcb->snd_una == tcb->snd_nxt)
                     tcb->rto_deadline_tsc = 0;
                 else
                     arm_rto(tcb);
+                snd_buf_drain(worker_idx, tcb);
             }
             tcb->snd_wnd = rte_be_to_cpu_16(tcp->rx_win)
                            << tcb->wscale_remote;
@@ -1197,6 +1319,10 @@ void tcp_fsm_reset_all(uint32_t worker_idx)
         tcp_send_segment(worker_idx, tcb, RTE_TCP_RST_FLAG | RTE_TCP_ACK_FLAG,
                           NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
         tls_detach_if_needed(worker_idx, tcb);
+        if (tcb->snd_buf) {
+            tcp_snd_buf_free(tcb->snd_buf);
+            tcb->snd_buf = NULL;
+        }
     }
     tcb_store_reset(store);
 }
@@ -1232,8 +1358,19 @@ void tcp_fsm_rto_expired(uint32_t worker_idx, tcb_t *tcb)
                           RTE_TCP_FIN_FLAG | RTE_TCP_ACK_FLAG,
                           NULL, 0, tcb->snd_una, tcb->rcv_nxt);
         break;
+    case TCP_ESTABLISHED:
+    case TCP_CLOSE_WAIT:
+        /* Retransmit oldest unACKed segment from send buffer (RFC 6298 §5.4) */
+        if (tcb->snd_buf && tcb->snd_buf->len > 0) {
+            uint32_t rtx_mss = tcb_effective_mss(tcb);
+            uint32_t rtx_len = TGEN_MIN(tcb->snd_buf->len, rtx_mss);
+            tcp_send_segment(worker_idx, tcb,
+                              RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG,
+                              tcb->snd_buf->data, rtx_len,
+                              tcb->snd_una, tcb->rcv_nxt);
+        }
+        break;
     default:
-        /* ESTABLISHED: would need TX buffer replay — not yet supported */
         break;
     }
     arm_rto(tcb);
@@ -1273,34 +1410,55 @@ int tcp_fsm_send(uint32_t worker_idx, tcb_t *tcb,
     if (tcb->state != TCP_ESTABLISHED && tcb->state != TCP_CLOSE_WAIT)
         return -1;
 
-    /* Cap payload by effective MSS (account for TCP options that reduce MTU space) */
-    uint32_t opts_overhead = tcb->ts_enabled ? 12 : 0;
-    uint32_t effective_mss = (tcb->mss_remote > opts_overhead)
-                             ? tcb->mss_remote - opts_overhead : 1;
-
-    uint32_t total_sent = 0;
-    while (total_sent < len) {
-        /* Flow control: limit by window minus in-flight data */
-        uint32_t in_flight = tcb->snd_nxt - tcb->snd_una;
-        uint32_t wnd = TGEN_MIN(tcb->cwnd, tcb->snd_wnd);
-        uint32_t avail = (wnd > in_flight) ? wnd - in_flight : 0;
-        uint32_t send_len = TGEN_MIN(len - total_sent, avail);
-        if (send_len == 0) break; /* send window exhausted */
-
-        send_len = TGEN_MIN(send_len, effective_mss);
-
-        int rc = tcp_send_segment(worker_idx, tcb,
-                          RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG,
-                          data + total_sent, send_len,
-                          tcb->snd_nxt, tcb->rcv_nxt);
-        if (rc < 0) break;  /* TX failed — stop sending */
-        tcb->snd_nxt += send_len;
-        total_sent += send_len;
-        worker_metrics_add_tcp_payload_tx(worker_idx, send_len);
+    /* Throughput mode (app_ctx == 1): bypass send buffer for maximum PPS.
+     * No retransmission needed — throughput tests measure raw NIC rate. */
+    if (tcb->app_ctx == (void *)1) {
+        uint32_t eff_mss = tcb_effective_mss(tcb);
+        uint32_t total_sent = 0;
+        while (total_sent < len) {
+            uint32_t in_flight = tcb->snd_nxt - tcb->snd_una;
+            uint32_t wnd = TGEN_MIN(tcb->cwnd, tcb->snd_wnd);
+            uint32_t avail = (wnd > in_flight) ? wnd - in_flight : 0;
+            uint32_t send_len = TGEN_MIN(len - total_sent, avail);
+            if (send_len == 0) break;
+            send_len = TGEN_MIN(send_len, eff_mss);
+            int rc = tcp_send_segment(worker_idx, tcb,
+                              RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG,
+                              data + total_sent, send_len,
+                              tcb->snd_nxt, tcb->rcv_nxt);
+            if (rc < 0) break;
+            tcb->snd_nxt += send_len;
+            total_sent += send_len;
+            worker_metrics_add_tcp_payload_tx(worker_idx, send_len);
+        }
+        if (total_sent > 0 && tcb->rto_deadline_tsc == 0)
+            arm_rto(tcb);
+        return (int)total_sent;
     }
 
-    /* RFC 6298: only start RTO timer when not already running */
-    if (total_sent > 0 && tcb->rto_deadline_tsc == 0)
+    /* Normal mode: queue all data in send buffer for retransmission. */
+    if (!tcb->snd_buf) {
+        uint32_t cap = TCP_SND_BUF_DEFAULT_CAP;
+        if (len > cap) cap = len + 4096; /* ensure first send fits */
+        tcb->snd_buf = tcp_snd_buf_alloc(cap);
+        if (!tcb->snd_buf)
+            return -1;
+    }
+
+    uint32_t queued = tcp_snd_buf_append(tcb->snd_buf, data, len);
+
+    /* Drain: send unsent data from the buffer within the window */
+    snd_buf_drain(worker_idx, tcb);
+
+    /* RFC 6298: arm RTO if data is now in flight */
+    if (tcb->snd_nxt != tcb->snd_una && tcb->rto_deadline_tsc == 0)
         arm_rto(tcb);
-    return (int)total_sent;
+
+    return (int)queued;
+}
+
+/* ── Public wrapper for http_send_next_request (used by tcp_timer) ──────── */
+void tcp_fsm_http_send_next(uint32_t worker_idx, tcb_t *tcb)
+{
+    http_send_next_request(worker_idx, tcb);
 }

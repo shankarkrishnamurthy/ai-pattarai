@@ -129,6 +129,29 @@ int http11_tx_response(uint8_t *buf, size_t buf_len,
                        const char *content_type,
                        const uint8_t *body, uint32_t body_len);
 
+/**
+ * Build HTTP/1.1 response headers for chunked transfer encoding.
+ * No Content-Length; body is sent via http11_tx_chunk() calls.
+ * Returns bytes written, or negative on error.
+ */
+int http11_tx_response_chunked_hdr(uint8_t *buf, size_t buf_len,
+                                    uint16_t status, const char *status_str,
+                                    const char *content_type);
+
+/**
+ * Wrap a body segment in HTTP chunked transfer framing.
+ * Writes "<hex-len>\r\n<data>\r\n" into buf.
+ * Returns bytes written, or negative on error.
+ */
+int http11_tx_chunk(uint8_t *buf, size_t buf_len,
+                    const uint8_t *data, uint32_t data_len);
+
+/**
+ * Write the final chunk terminator "0\r\n\r\n".
+ * Returns bytes written (always 5), or negative on error.
+ */
+int http11_tx_chunk_end(uint8_t *buf, size_t buf_len);
+
 #ifdef __cplusplus
 }
 #endif

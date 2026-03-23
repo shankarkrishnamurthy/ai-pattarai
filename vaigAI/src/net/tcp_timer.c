@@ -5,8 +5,10 @@
 #include "tcp_fsm.h"
 #include "tcp_port_pool.h"
 #include "../core/core_assign.h"
+#include "../core/tx_gen.h"
 #include "../telemetry/metrics.h"
 #include "../tls/tls_session.h"
+#include "../app/server.h"
 
 #include <rte_cycles.h>
 #include <rte_log.h>
@@ -72,6 +74,21 @@ void tcp_timer_tick(uint32_t worker_idx)
                     tcb->app_state = 0;
                     tcp_fsm_reset(worker_idx, tcb);
                 }
+            }
+            /* Think-time wait: send next HTTP request after delay expires.
+             * app_state 7 = thinking between transactions. */
+            if (tcb->state == TCP_ESTABLISHED &&
+                tcb->app_state == 7 &&
+                tcb->think_deadline_tsc != 0 &&
+                now >= tcb->think_deadline_tsc) {
+                tcb->think_deadline_tsc = 0;
+                tcp_fsm_http_send_next(worker_idx, tcb);
+            }
+            /* Chunked streaming pump: send next chunk of body data.
+             * app_state 12 = streaming server HTTP response. */
+            if (tcb->state == TCP_ESTABLISHED &&
+                tcb->app_state == 12) {
+                srv_stream_pump(worker_idx, tcb);
             }
             /* HTTP response timeout: abort connections that sent a request
              * (app_state == 5) but haven't received a response in time.

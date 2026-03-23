@@ -55,6 +55,26 @@ hist_record(histogram_t *h, uint64_t us)
  */
 uint64_t hist_percentile(const histogram_t *h, double p);
 
+/**
+ * Record a latency sample with coordinated-omission correction (Gil Tene).
+ * expected_interval_us = 1/rate in µs (0 = no correction).
+ * If us > expected_interval, additional samples are injected for
+ * the "missing" requests that would have been issued on time.
+ */
+static inline void
+hist_record_corrected(histogram_t *h, uint64_t us, uint64_t expected_interval_us)
+{
+    hist_record(h, us);
+    if (expected_interval_us == 0 || us <= expected_interval_us)
+        return;
+    /* Inject correction samples for missed intervals */
+    uint64_t extra = us - expected_interval_us;
+    while (extra >= expected_interval_us) {
+        hist_record(h, extra);
+        extra -= expected_interval_us;
+    }
+}
+
 /** Copy src → dst (used by management thread to take a snapshot). */
 static inline void
 hist_copy(histogram_t *dst, const histogram_t *src)

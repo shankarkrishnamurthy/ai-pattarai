@@ -443,6 +443,9 @@ typedef struct {
     uint64_t    rate;
     uint16_t    size;
     uint32_t    streams;
+    uint32_t    ramp;       /* --ramp: ramp-up seconds (0 = instant) */
+    uint32_t    txn_per_conn;  /* --txn-per-conn: HTTP txns per connection */
+    uint32_t    think_time;    /* --think-time: ms between transactions */
     bool        reuse;
     bool        tls;
     bool        one;        /* --one: single request/handshake/connection */
@@ -456,8 +459,8 @@ start_usage(void)
 {
     return "Usage: start --ip <addr> --port <N> --duration <secs>\n"
            "             [--proto tcp|http|https|udp|icmp|tls]\n"
-           "             [--rate <pps>] [--size <bytes>]\n"
-           "             [--reuse] [--streams <N>]\n"
+           "             [--rate <pps>] [--cps <N>] [--ramp <secs>]\n"
+           "             [--size <bytes>] [--reuse] [--streams <N>]\n"
            "             [--url <path>] [--host <name>] [--tls]\n"
            "             [--one]  (single request; mutually exclusive with --duration/--rate)\n";
 }
@@ -482,6 +485,14 @@ parse_start_args(int argc, char **argv, start_args_t *a)
             a->proto = argv[++i];
         } else if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc) {
             a->rate = strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--cps") == 0 && i + 1 < argc) {
+            a->rate = strtoull(argv[++i], NULL, 10); /* alias for --rate */
+        } else if (strcmp(argv[i], "--ramp") == 0 && i + 1 < argc) {
+            a->ramp = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--txn-per-conn") == 0 && i + 1 < argc) {
+            a->txn_per_conn = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--think-time") == 0 && i + 1 < argc) {
+            a->think_time = (uint32_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
             a->size = (uint16_t)strtoul(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--streams") == 0 && i + 1 < argc) {
@@ -634,6 +645,9 @@ cmd_start(int argc, char **argv)
     gcfg.port_id    = port_id;
     gcfg.rate_pps   = a.rate;
     gcfg.duration_s = a.duration;
+    gcfg.ramp_s         = a.ramp;
+    gcfg.txn_per_conn   = a.txn_per_conn;
+    gcfg.think_time_us  = a.think_time * 1000; /* ms → µs */
     gcfg.max_initiations = a.one ? 1 : 0;
     gcfg.enable_tls = a.tls;
 
@@ -845,9 +859,31 @@ cmd_reset(int argc, char **argv)
 static void
 cmd_set(int argc, char **argv)
 {
-    if (argc < 2 || strcmp(argv[1], "ip") != 0) {
+    if (argc < 2) {
         printf("Usage: set ip <port> <ip> <gateway> <netmask>\n"
-               "  Example: set ip 0 10.88.33.65 10.88.32.1 255.255.252.0\n");
+               "       set rate <pps>   (change rate for running test)\n");
+        return;
+    }
+
+    /* set rate <pps> — dynamic rate change for running test */
+    if (strcmp(argv[1], "rate") == 0) {
+        if (argc < 3) {
+            printf("Usage: set rate <pps>\n");
+            return;
+        }
+        uint64_t new_rate = strtoull(argv[2], NULL, 10);
+        config_update_t cmd;
+        memset(&cmd, 0, sizeof(cmd));
+        cmd.cmd = CFG_CMD_SET_RATE;
+        memcpy(cmd.payload, &new_rate, sizeof(new_rate));
+        tgen_ipc_broadcast(&cmd);
+        printf("Rate set to %lu pps\n", (unsigned long)new_rate);
+        return;
+    }
+
+    if (strcmp(argv[1], "ip") != 0) {
+        printf("Usage: set ip <port> <ip> <gateway> <netmask>\n"
+               "       set rate <pps>   (change rate for running test)\n");
         return;
     }
 
@@ -1428,8 +1464,8 @@ cli_run(void)
     cli_register("start",    "Start traffic: start --ip <ip> --port <N> --duration <s> [flags]",
         "Usage: start --ip <addr> --port <N> --duration <secs>\n"
         "             [--proto tcp|http|https|udp|icmp|tls]\n"
-        "             [--rate <pps>] [--size <bytes>]\n"
-        "             [--reuse] [--streams <N>]\n"
+        "             [--rate <pps>] [--cps <N>] [--ramp <secs>]\n"
+        "             [--size <bytes>] [--reuse] [--streams <N>]\n"
         "             [--url <path>] [--host <name>] [--tls]\n"
         "             [--one]\n"
         "\n"
@@ -1441,6 +1477,8 @@ cli_run(void)
         "Optional:\n"
         "  --proto <name>    Protocol: tcp, http, https, udp, icmp, tls (default: tcp)\n"
         "  --rate <pps>      Rate limit in packets/sec (0 = unlimited)\n"
+        "  --cps <N>         Connections per second (alias for --rate in TCP/HTTP)\n"
+        "  --ramp <secs>     Gradual ramp-up from 0 to target rate\n"
         "  --size <bytes>    Payload size in bytes (default: 56)\n"
         "  --streams <N>     Concurrent streams, max 16 (default: 1)\n"
         "  --reuse           Enable connection reuse (throughput mode)\n"
@@ -1448,10 +1486,14 @@ cli_run(void)
         "  --host <name>     HTTP Host header (default: --ip value)\n"
         "  --tls             Enable TLS encryption\n"
         "  --one             Single request/handshake then stop\n"
+        "  --txn-per-conn <N>  HTTP transactions per connection (enables keep-alive)\n"
+        "  --think-time <ms>   Delay between transactions on same connection\n"
         "\n"
         "Examples:\n"
         "  start --ip 10.0.0.2 --port 5000 --duration 10\n"
-        "  start --ip 10.0.0.2 --port 80 --proto http --duration 5 --rate 100\n"
+        "  start --ip 10.0.0.2 --port 80 --proto http --duration 5 --cps 1000\n"
+        "  start --ip 10.0.0.2 --port 80 --proto http --cps 5000 --ramp 5 --duration 30\n"
+        "  start --ip 10.0.0.2 --port 80 --proto http --txn-per-conn 10 --think-time 100\n"
         "  start --ip 10.0.0.2 --port 443 --proto https --one --url /\n",
         cmd_start_gated);
 
@@ -1503,15 +1545,17 @@ cli_run(void)
         "  show connections\n",
         cmd_show);
 
-    cli_register("set",      "Set config: set ip <port> <ip> <gateway> <netmask>",
+    cli_register("set",      "Set config: set ip ... | set rate <pps>",
         "Usage: set ip <port> <ip> <gateway> <netmask>\n"
+        "       set rate <pps>\n"
         "\n"
-        "Set or change the IP address, gateway, and netmask for a port.\n"
-        "Use 0.0.0.0 as gateway for same-subnet direct-link traffic.\n"
+        "Sub-commands:\n"
+        "  ip      Set IP address, gateway, and netmask for a port\n"
+        "  rate    Change rate limit for running test (broadcast to workers)\n"
         "\n"
         "Examples:\n"
         "  set ip 0 10.88.33.65 10.88.32.1 255.255.252.0\n"
-        "  set ip 1 10.10.10.11 0.0.0.0 255.255.255.0\n",
+        "  set rate 5000\n",
         cmd_set);
 
     /* ── Server-mode commands ──────────────────────────────────────────── */

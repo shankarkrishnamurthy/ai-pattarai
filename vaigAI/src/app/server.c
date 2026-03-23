@@ -5,6 +5,7 @@
 #include "http11.h"
 #include "../net/tcp_fsm.h"
 #include "../net/tcp_tcb.h"
+#include "../net/tcp_snd_buf.h"
 #include "../tls/tls_session.h"
 #include "../tls/tls_engine.h"
 #include "../telemetry/metrics.h"
@@ -45,16 +46,25 @@ const char *srv_handler_name(srv_handler_t h)
 void srv_build_http_response(srv_table_t *tbl, uint32_t body_size)
 {
     if (body_size == 0) body_size = 1024;
-    if (body_size > 16384) body_size = 16384; /* fit in 18000 with headers */
+    tbl->chunked_body_size = body_size;
 
-    /* Build a body of repeating 'A' characters */
-    uint8_t body[16384];
-    memset(body, 'A', body_size);
-
-    int len = http11_tx_response(tbl->http_response, sizeof(tbl->http_response),
-                                  200, "OK", "text/plain",
-                                  body, body_size);
-    tbl->http_response_len = (len > 0) ? (uint32_t)len : 0;
+    if (body_size <= 16384) {
+        /* Small response: pre-build headers + body in one buffer */
+        uint8_t body[16384];
+        memset(body, 'A', body_size);
+        int len = http11_tx_response(tbl->http_response,
+                                      sizeof(tbl->http_response),
+                                      200, "OK", "text/plain",
+                                      body, body_size);
+        tbl->http_response_len = (len > 0) ? (uint32_t)len : 0;
+    } else {
+        /* Large response: pre-build chunked headers only.
+         * Body will be streamed chunk-by-chunk from srv_stream_pump(). */
+        int len = http11_tx_response_chunked_hdr(tbl->http_response,
+                                                  sizeof(tbl->http_response),
+                                                  200, "OK", "text/plain");
+        tbl->http_response_len = (len > 0) ? (uint32_t)len : 0;
+    }
 }
 
 /* ── Configure listener table ─────────────────────────────────────────────── */
@@ -224,12 +234,24 @@ int srv_on_data(uint32_t worker_idx, void *tcb_ptr,
         /* Look for end of HTTP request headers (\r\n\r\n) */
         const uint8_t *end = memmem(data, len, "\r\n\r\n", 4);
         if (end && tbl->http_response_len > 0) {
-            /* Send pre-built HTTP response */
-            tcp_fsm_send(worker_idx, tcb,
-                         tbl->http_response, tbl->http_response_len);
-            l->tx_bytes += tbl->http_response_len;
+            if (tbl->chunked_body_size <= 16384) {
+                /* Small response: send pre-built headers + body */
+                tcp_fsm_send(worker_idx, tcb,
+                             tbl->http_response, tbl->http_response_len);
+                l->tx_bytes += tbl->http_response_len;
+            } else {
+                /* Large response: send chunked headers, then stream */
+                tcp_fsm_send(worker_idx, tcb,
+                             tbl->http_response, tbl->http_response_len);
+                l->tx_bytes += tbl->http_response_len;
+                tcb->srv_stream_total = tbl->chunked_body_size;
+                tcb->srv_stream_sent  = 0;
+                tcb->app_state = 12; /* streaming chunked response */
+                /* Pump first chunk immediately */
+                srv_stream_pump(worker_idx, tcb);
+            }
             l->http_resps_sent++;
-            worker_metrics_add_http_req(worker_idx); /* reuse as server req_rx */
+            worker_metrics_add_http_req(worker_idx);
         }
         return (int)len;
     }
@@ -306,5 +328,56 @@ int srv_on_data(uint32_t worker_idx, void *tcb_ptr,
 
     default:
         return (int)len;
+    }
+}
+
+/* ── Streaming chunked response pump ─────────────────────────────────────── */
+#define SRV_CHUNK_SIZE 4096u  /* body bytes per chunk (MSS-aligned) */
+
+void srv_stream_pump(uint32_t worker_idx, void *tcb_ptr)
+{
+    tcb_t *tcb = (tcb_t *)tcb_ptr;
+    if (tcb->app_state != 12 || tcb->srv_stream_total == 0)
+        return;
+
+    /* Don't pump if the send buffer already has queued data —
+     * wait for it to drain first to avoid unbounded memory growth. */
+    if (tcb->snd_buf && tcb->snd_buf->len > SRV_CHUNK_SIZE * 4)
+        return;
+
+    uint32_t remaining = tcb->srv_stream_total - tcb->srv_stream_sent;
+    if (remaining == 0) {
+        /* All body sent — emit final chunk and finish */
+        uint8_t end_buf[8];
+        int elen = http11_tx_chunk_end(end_buf, sizeof(end_buf));
+        if (elen > 0)
+            tcp_fsm_send(worker_idx, tcb, end_buf, (uint32_t)elen);
+        tcb->app_state = 11; /* back to normal server state */
+        tcb->srv_stream_total = 0;
+        tcb->srv_stream_sent  = 0;
+
+        /* Update listener TX stats */
+        int li = srv_find_listener(worker_idx, tcb->dst_port);
+        if (li < 0) li = srv_find_listener(worker_idx, tcb->src_port);
+        /* Stats already tracked incrementally */
+        return;
+    }
+
+    /* Send one chunk of body data (fill pattern) */
+    uint32_t chunk_body = remaining < SRV_CHUNK_SIZE ? remaining : SRV_CHUNK_SIZE;
+    uint8_t frame[SRV_CHUNK_SIZE + 16]; /* chunk framing + body */
+    uint8_t body[SRV_CHUNK_SIZE];
+    memset(body, 'A', chunk_body);
+
+    int flen = http11_tx_chunk(frame, sizeof(frame), body, chunk_body);
+    if (flen > 0) {
+        tcp_fsm_send(worker_idx, tcb, frame, (uint32_t)flen);
+        tcb->srv_stream_sent += chunk_body;
+
+        /* Track TX bytes on the listener */
+        uint16_t lport = tcb->active_open ? tcb->dst_port : tcb->src_port;
+        int li = srv_find_listener(worker_idx, lport);
+        if (li >= 0)
+            g_srv_tables[worker_idx].listeners[li].tx_bytes += (uint32_t)flen;
     }
 }

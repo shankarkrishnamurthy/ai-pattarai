@@ -56,9 +56,12 @@ typedef struct {
     uint32_t       count;
     bool           serving;     /* true when at least one listener is active */
 
-    /* Pre-built HTTP response (shared across all HTTP/HTTPS listeners) */
+    /* Pre-built HTTP response (shared across all HTTP/HTTPS listeners).
+     * For small bodies (≤16 KB): contains headers + body.
+     * For large bodies (>16 KB): contains chunked headers only. */
     uint8_t        http_response[18000];
     uint32_t       http_response_len;
+    uint32_t       chunked_body_size;   /* total body size for chunked mode */
 
     /* Chargen pattern buffer (1 MSS worth of data) */
     uint8_t        chargen_buf[1460];
@@ -145,6 +148,14 @@ const char *srv_handler_name(srv_handler_t h);
 
 /** Build pre-built HTTP response into the listener table. */
 void srv_build_http_response(srv_table_t *tbl, uint32_t body_size);
+
+/**
+ * Pump chunked HTTP response data for a streaming TCB.
+ * Called from timer tick or ACK path when app_state == 12.
+ * Sends up to one chunk of body data, then transitions to FIN
+ * when the full body has been streamed.
+ */
+void srv_stream_pump(uint32_t worker_idx, void *tcb_ptr);
 
 #ifdef __cplusplus
 }

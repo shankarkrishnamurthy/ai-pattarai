@@ -52,6 +52,9 @@ void tcp_fsm_rto_expired(uint32_t worker_idx, tcb_t *tcb);
 /** Called once per poll iteration to flush delayed ACKs. */
 void tcp_fsm_flush_delayed_acks(uint32_t worker_idx);
 
+/** Send next HTTP request on a keep-alive connection (plain or TLS). */
+void tcp_fsm_http_send_next(uint32_t worker_idx, tcb_t *tcb);
+
 /** Flush the per-worker TCP TX batch buffer via rte_eth_tx_burst.
  *  Called from the worker loop after RX and TX-gen phases to amortize
  *  the per-packet sendto() overhead of AF_PACKET/TAP PMDs. */

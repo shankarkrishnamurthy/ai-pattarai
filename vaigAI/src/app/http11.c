@@ -310,3 +310,55 @@ http11_tx_response(uint8_t *buf, size_t buf_len,
     }
     return (int)p;
 }
+
+/* ------------------------------------------------------------------ */
+/* TX: chunked response builder                                         */
+/* ------------------------------------------------------------------ */
+int
+http11_tx_response_chunked_hdr(uint8_t *buf, size_t buf_len,
+                                uint16_t status, const char *status_str,
+                                const char *content_type)
+{
+    char tmp[128];
+    size_t p = 0;
+    size_t cap = buf_len;
+
+    int n = snprintf(tmp, sizeof(tmp), "HTTP/1.1 %u %s\r\n",
+                     status, status_str ? status_str : "");
+    append(buf, &p, cap, tmp, (size_t)n);
+
+    if (content_type) {
+        APPC(buf, &p, cap, "Content-Type: ");
+        APPS(buf, &p, cap, content_type);
+        APPC(buf, &p, cap, "\r\n");
+    }
+    APPC(buf, &p, cap, "Transfer-Encoding: chunked\r\n");
+    APPC(buf, &p, cap, "Connection: keep-alive\r\n");
+    APPC(buf, &p, cap, "\r\n");
+    return (int)p;
+}
+
+int
+http11_tx_chunk(uint8_t *buf, size_t buf_len,
+                const uint8_t *data, uint32_t data_len)
+{
+    /* Format: "<hex-len>\r\n<data>\r\n" */
+    char hdr[16];
+    int hdr_len = snprintf(hdr, sizeof(hdr), "%x\r\n", data_len);
+    size_t total = (size_t)hdr_len + data_len + 2; /* +2 for trailing \r\n */
+    if (total > buf_len) return -ENOSPC;
+
+    memcpy(buf, hdr, (size_t)hdr_len);
+    memcpy(buf + hdr_len, data, data_len);
+    buf[hdr_len + data_len]     = '\r';
+    buf[hdr_len + data_len + 1] = '\n';
+    return (int)total;
+}
+
+int
+http11_tx_chunk_end(uint8_t *buf, size_t buf_len)
+{
+    if (buf_len < 5) return -ENOSPC;
+    memcpy(buf, "0\r\n\r\n", 5);
+    return 5;
+}

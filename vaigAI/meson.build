@@ -99,6 +99,7 @@ net_src = files(
   'src/net/udp.c',
   'src/net/tcp_tcb.c',
   'src/net/tcp_fsm.c',
+  'src/net/tcp_snd_buf.c',
   'src/net/tcp_options.c',
   'src/net/tcp_timer.c',
   'src/net/tcp_congestion.c',

@@ -52,7 +52,7 @@ export_json(const metrics_snapshot_t *snap, char *buf, size_t len)
         "  \"http_rsp_5xx\": %"PRIu64", \"http_parse_err\": %"PRIu64",\n"
         "  \"tls_handshake_ok\": %"PRIu64", \"tls_handshake_fail\": %"PRIu64",\n"
         "  \"tls_records_tx\": %"PRIu64", \"tls_records_rx\": %"PRIu64",\n"
-        "  \"p50\": %"PRIu64", \"p95\": %"PRIu64", \"p99\": %"PRIu64"\n"
+        "  \"p50\": %"PRIu64", \"p90\": %"PRIu64", \"p95\": %"PRIu64", \"p99\": %"PRIu64", \"p999\": %"PRIu64"\n"
         "}\n",
         snap->n_workers,
         t->tx_pkts, t->tx_bytes,
@@ -80,8 +80,10 @@ export_json(const metrics_snapshot_t *snap, char *buf, size_t len)
         t->tls_handshake_ok, t->tls_handshake_fail,
         t->tls_records_tx, t->tls_records_rx,
         hist_percentile(&snap->latency, 50.0),
+        hist_percentile(&snap->latency, 90.0),
         hist_percentile(&snap->latency, 95.0),
-        hist_percentile(&snap->latency, 99.0));
+        hist_percentile(&snap->latency, 99.0),
+        hist_percentile(&snap->latency, 99.9));
     return n;
 }
 
@@ -152,10 +154,12 @@ export_summary(const metrics_snapshot_t *snap, double actual_s,
     const worker_metrics_t *t = &snap->total;
     int p = 0;
     double dur = actual_s > 0.0 ? actual_s : 1.0;
-    char tmp1[32], tmp2[32], tmp3[32];
-    uint64_t p50 = hist_percentile(&snap->latency, 50.0);
-    uint64_t p95 = hist_percentile(&snap->latency, 95.0);
-    uint64_t p99 = hist_percentile(&snap->latency, 99.0);
+    char tmp1[32], tmp2[32], tmp3[32], tmp4[32], tmp5[32];
+    uint64_t p50  = hist_percentile(&snap->latency, 50.0);
+    uint64_t p90  = hist_percentile(&snap->latency, 90.0);
+    uint64_t p95  = hist_percentile(&snap->latency, 95.0);
+    uint64_t p99  = hist_percentile(&snap->latency, 99.0);
+    uint64_t p999 = hist_percentile(&snap->latency, 99.9);
 
     /* ── STATUS line ───────────────────────────────────────────────── */
     const char *status_str = "OK";
@@ -170,12 +174,13 @@ export_summary(const metrics_snapshot_t *snap, double actual_s,
         double pct = (double)t->http_rsp_rx * 100.0 / (double)t->http_req_tx;
         p = append(buf, len, p,
             "STATUS: %s | %"PRIu64"/%"PRIu64" req completed (%.1f%%) | "
-            "%.1f req/s | %"PRIu64" errs | p50=%s p95=%s p99=%s\n",
+            "%.1f req/s | %"PRIu64" errs | p50=%s p90=%s p99=%s p99.9=%s\n",
             status_str, t->http_rsp_rx, t->http_req_tx, pct,
             (double)t->http_rsp_rx / dur, errs,
             fmt_lat(p50, tmp1, sizeof(tmp1)),
-            fmt_lat(p95, tmp2, sizeof(tmp2)),
-            fmt_lat(p99, tmp3, sizeof(tmp3)));
+            fmt_lat(p90, tmp2, sizeof(tmp2)),
+            fmt_lat(p99, tmp3, sizeof(tmp3)),
+            fmt_lat(p999, tmp4, sizeof(tmp4)));
     } else if (t->udp_tx > 0) {
         p = append(buf, len, p,
             "STATUS: %s | %"PRIu64" pkts | %s | %s TX | %"PRIu64" errs\n",
@@ -328,10 +333,12 @@ export_summary(const metrics_snapshot_t *snap, double actual_s,
     /* ── Latency (only if measured) ────────────────────────────────── */
     if (p50 || p95 || p99) {
         p = append(buf, len, p, "\n--- latency ---\n");
-        p = append(buf, len, p, "  p50: %s  p95: %s  p99: %s\n",
+        p = append(buf, len, p, "  p50: %s  p90: %s  p95: %s  p99: %s  p99.9: %s\n",
                    fmt_lat(p50, tmp1, sizeof(tmp1)),
-                   fmt_lat(p95, tmp2, sizeof(tmp2)),
-                   fmt_lat(p99, tmp3, sizeof(tmp3)));
+                   fmt_lat(p90, tmp2, sizeof(tmp2)),
+                   fmt_lat(p95, tmp3, sizeof(tmp3)),
+                   fmt_lat(p99, tmp4, sizeof(tmp4)),
+                   fmt_lat(p999, tmp5, sizeof(tmp5)));
         if (snap->latency.total_count > 0) {
             uint64_t avg = snap->latency.total_sum_us / snap->latency.total_count;
             p = append(buf, len, p, "  min: %s  avg: %s  max: %s  samples: %"PRIu64"\n",
@@ -896,16 +903,22 @@ export_net_text(const metrics_snapshot_t *snap, char *buf, size_t len)
         "└──────────────────────────────────────────────────────────┘\n");
 
     /* ── Latency ───────────────────────────────────────────────────── */
-    uint64_t p50 = hist_percentile(&snap->latency, 50.0);
-    uint64_t p95 = hist_percentile(&snap->latency, 95.0);
-    uint64_t p99 = hist_percentile(&snap->latency, 99.0);
+    uint64_t p50  = hist_percentile(&snap->latency, 50.0);
+    uint64_t p90  = hist_percentile(&snap->latency, 90.0);
+    uint64_t p95  = hist_percentile(&snap->latency, 95.0);
+    uint64_t p99  = hist_percentile(&snap->latency, 99.0);
+    uint64_t p999 = hist_percentile(&snap->latency, 99.9);
     p = append(buf, len, p,
         "┌─ Latency ────────────────────────────────────────────────┐\n");
     p = append(buf, len, p,
-        "│  p50: %-12s  p95: %-12s  p99: %-9s│\n",
+        "│  p50: %-12s  p90: %-12s  p99: %-9s│\n",
         fmt_lat(p50, tmp1, sizeof(tmp1)),
-        fmt_lat(p95, tmp2, sizeof(tmp2)),
+        fmt_lat(p90, tmp2, sizeof(tmp2)),
         fmt_lat(p99, tmp3, sizeof(tmp3)));
+    p = append(buf, len, p,
+        "│  p95: %-12s  p99.9: %-33s│\n",
+        fmt_lat(p95, tmp1, sizeof(tmp1)),
+        fmt_lat(p999, tmp2, sizeof(tmp2)));
     if (snap->latency.total_count > 0) {
         uint64_t avg = snap->latency.total_sum_us / snap->latency.total_count;
         p = append(buf, len, p,

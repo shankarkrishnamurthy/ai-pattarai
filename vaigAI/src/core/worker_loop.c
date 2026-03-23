@@ -232,6 +232,13 @@ int tgen_worker_loop(void *arg)
                 tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
                 continue;
             }
+            if (cmd.cmd == CFG_CMD_SET_RATE) {
+                uint64_t new_rate;
+                memcpy(&new_rate, cmd.payload, sizeof(new_rate));
+                ctx->tx_gen.cfg.rate_pps = new_rate;
+                tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
+                continue;
+            }
             if (cmd.cmd == CFG_CMD_STOP_LISTENER) {
                 /* payload[0..3] = listener index, UINT32_MAX = stop all */
                 uint32_t li;

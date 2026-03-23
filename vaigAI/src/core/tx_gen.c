@@ -269,8 +269,15 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
     /* ── Token-bucket rate control ──────────────────────────────────── */
     uint32_t to_send = TX_GEN_MAX_BURST;
     if (state->cfg.rate_pps > 0) {
+        /* Compute effective rate (with optional ramp-up) */
+        uint64_t eff_rate = state->cfg.rate_pps;
+        if (state->cfg.ramp_s > 0) {
+            uint64_t age = (now - state->start_tsc) / rte_get_tsc_hz();
+            if (age < state->cfg.ramp_s)
+                eff_rate = state->cfg.rate_pps * (age + 1) / state->cfg.ramp_s;
+        }
         uint64_t elapsed  = now - state->last_refill_tsc;
-        uint64_t new_tok  = elapsed * state->cfg.rate_pps / rte_get_tsc_hz();
+        uint64_t new_tok  = elapsed * eff_rate / rte_get_tsc_hz();
         if (new_tok > 0) {
             state->tokens += new_tok;
             state->last_refill_tsc = now;
@@ -297,18 +304,25 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
         /* Pre-build HTTP request headers on first burst */
         if (state->cfg.proto == TX_GEN_PROTO_HTTP &&
             g_http_req[worker_idx].hdr_len == 0) {
+            bool ka = state->cfg.txn_per_conn > 1;
             http_conn_t tmp;
             http11_conn_init(&tmp);
             http_request_t req = {
                 .method     = (http_method_t)state->cfg.http_method,
                 .url        = state->cfg.http_url[0] ? state->cfg.http_url : "/",
                 .host       = state->cfg.http_host[0] ? state->cfg.http_host : "localhost",
-                .keep_alive = false,
+                .keep_alive = ka,
             };
             int n = http11_tx_request(&tmp, &req);
             if (n > 0) {
                 memcpy(g_http_req[worker_idx].hdr, tmp.tx_hdr, (size_t)n);
                 g_http_req[worker_idx].hdr_len = (uint32_t)n;
+                g_http_req[worker_idx].keep_alive = ka;
+                g_http_req[worker_idx].txn_per_conn = state->cfg.txn_per_conn;
+                g_http_req[worker_idx].think_time_us = state->cfg.think_time_us;
+                g_http_req[worker_idx].expected_interval_us =
+                    state->cfg.rate_pps > 0
+                        ? 1000000ULL / state->cfg.rate_pps : 0;
             }
         }
 

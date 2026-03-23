@@ -126,13 +126,25 @@ typedef struct {
      * http_content_length is parsed from the Content-Length header.
      * 0 means unknown (chunked / connection-close / not yet parsed).
      * http_body_rx accumulates body bytes received across segments.
-     * app_state 6 = waiting for remaining body data after headers parsed. */
+     * app_state 6 = waiting for remaining body data after headers parsed.
+     * app_state 7 = think-time wait (timer transitions to 4). */
     uint32_t    http_content_length;
     uint32_t    http_body_rx;
+    uint32_t    http_txn_count;       /* completed HTTP transactions */
+    uint64_t    think_deadline_tsc;   /* TSC deadline for think-time wait */
+
+    /* Server streaming state (chunked HTTP response pump).
+     * app_state 12 = streaming; srv_stream_total > 0 means active. */
+    uint32_t    srv_stream_total;     /* total body bytes to stream */
+    uint32_t    srv_stream_sent;      /* body bytes sent so far */
 
     /* When true, use graceful FIN close instead of RST at end of
      * transaction (--one flag).  Set by tx_gen when max_initiations > 0. */
     bool        graceful_close;
+
+    /* TCP send buffer (lazily allocated for retransmission + queuing).
+     * NULL when no buffered data; allocated on first tcp_fsm_send(). */
+    struct tcp_snd_buf_s *snd_buf;
 
     /* Valid flag */
     bool        in_use;

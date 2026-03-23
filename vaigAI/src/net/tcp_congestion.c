@@ -82,11 +82,8 @@ congestion_fast_retransmit(uint32_t worker_idx, tcb_t *tcb)
             "Fast retransmit lcore=%u tcb=%p ssthresh=%u cwnd=%u\n",
             worker_idx, (void *)tcb, tcb->ssthresh, tcb->cwnd);
 
-    /*
-     * TODO: retransmit the oldest unacknowledged segment from TX buffer.
-     * Without a TX buffer, we cannot actually retransmit here — just
-     * adjust congestion state and rely on new data sends.
-     */
+    /* Actual retransmission from the send buffer is done in tcp_fsm.c
+     * after this function returns (at the dup_ack_count == 3 site). */
 }
 
 /* ------------------------------------------------------------------ */

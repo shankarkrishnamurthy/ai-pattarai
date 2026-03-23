@@ -2,6 +2,7 @@
  * vaigAI: TCP TCB store — per-lcore open-addressing hash table.
  */
 #include "tcp_tcb.h"
+#include "tcp_snd_buf.h"
 #include "../core/core_assign.h"
 #include "../common/util.h"
 
@@ -127,6 +128,12 @@ tcb_t *tcb_lookup(tcb_store_t *store,
 void tcb_free(tcb_store_t *store, tcb_t *tcb)
 {
     if (!tcb || !tcb->in_use) return;
+
+    /* Free send buffer before zeroing the TCB */
+    if (tcb->snd_buf) {
+        tcp_snd_buf_free(tcb->snd_buf);
+        tcb->snd_buf = NULL;
+    }
 
     uint32_t s_ip   = tcb->src_ip,  d_ip   = tcb->dst_ip;
     uint16_t s_port = tcb->src_port, d_port = tcb->dst_port;

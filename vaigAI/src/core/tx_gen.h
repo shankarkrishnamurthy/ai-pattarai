@@ -50,6 +50,9 @@ typedef struct {
     uint8_t               http_method;  /* http_method_t (0=GET,1=POST…) */
     uint8_t               throughput_streams; /* streams for THROUGHPUT (1-16) */
     uint8_t               _pad[1];      /* alignment padding             */
+    uint32_t              ramp_s;       /* ramp-up duration (0 = instant) */
+    uint32_t              txn_per_conn; /* HTTP txns per conn (0 = 1 shot) */
+    uint32_t              think_time_us;/* think time between txns in µs  */
     char                  http_url[64]; /* URL path for HTTP TPS         */
     char                  http_host[64];/* Host: header for HTTP TPS    */
 } tx_gen_config_t;
@@ -91,7 +94,10 @@ typedef struct {
 typedef struct {
     uint8_t  hdr[512];
     uint32_t hdr_len;
-    bool     keep_alive;  /* recycle: state 4→5→4 loop */
+    bool     keep_alive;          /* recycle: state 4→5→4 loop */
+    uint32_t txn_per_conn;        /* max transactions per conn (0 = 1 shot) */
+    uint32_t think_time_us;       /* inter-transaction think time in µs */
+    uint64_t expected_interval_us;/* CO correction: 1M/rate_pps (0 = disabled) */
 } http_prebuilt_req_t;
 
 extern http_prebuilt_req_t g_http_req[TGEN_MAX_WORKERS];
