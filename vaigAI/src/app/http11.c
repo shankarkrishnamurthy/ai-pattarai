@@ -78,6 +78,10 @@ http11_tx_request(http_conn_t *conn, const http_request_t *req)
         append(b, &p, cap, tmp, (size_t)n);
     }
 
+    /* Custom headers (pre-formatted "Name: Value\r\n" strings) */
+    if (req->extra_headers && req->extra_headers[0])
+        APPS(b, &p, cap, req->extra_headers);
+
     APPC(b, &p, cap, "\r\n");
 
     /* Append body inline if present */

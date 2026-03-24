@@ -246,12 +246,14 @@ int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
 
     bool is_v6 = (tcb->ip_version == 6);
     size_t ip_hdr_sz = is_v6 ? IPV6_HDR_LEN : sizeof(struct rte_ipv4_hdr);
+    size_t eth_hdr_sz = sizeof(struct rte_ether_hdr) +
+                        (tcb->vlan_id ? sizeof(struct rte_vlan_hdr) : 0);
 
     char *buf = rte_pktmbuf_append(m, (uint16_t)(
-        sizeof(struct rte_ether_hdr) + ip_hdr_sz + seg_len));
+        eth_hdr_sz + ip_hdr_sz + seg_len));
     if (!buf) { rte_pktmbuf_free(m); return -1; }
 
-    /* Ethernet header */
+    /* Ethernet header (with optional 802.1Q VLAN tag) */
     uint16_t port_id = tcb->port_id;
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)buf;
     rte_ether_addr_copy(&g_port_caps[port_id].mac_addr, &eth->src_addr);
@@ -274,15 +276,25 @@ int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
         }
         rte_ether_addr_copy(&resolved_mac, &eth->dst_addr);
     }
-    eth->ether_type = rte_cpu_to_be_16(is_v6 ? RTE_ETHER_TYPE_IPV6 : RTE_ETHER_TYPE_IPV4);
+    uint16_t inner_etype = is_v6 ? RTE_ETHER_TYPE_IPV6 : RTE_ETHER_TYPE_IPV4;
+    if (tcb->vlan_id) {
+        eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_VLAN);
+        struct rte_vlan_hdr *vhdr = (struct rte_vlan_hdr *)(
+            buf + sizeof(struct rte_ether_hdr));
+        vhdr->vlan_tci  = rte_cpu_to_be_16(tcb->vlan_id & 0x0FFF);
+        vhdr->eth_proto = rte_cpu_to_be_16(inner_etype);
+    } else {
+        eth->ether_type = rte_cpu_to_be_16(inner_etype);
+    }
 
     struct rte_tcp_hdr *tcp_h;
 
     if (is_v6) {
         /* IPv6 header */
         struct rte_ipv6_hdr *ip6 =
-            (struct rte_ipv6_hdr *)(buf + sizeof(struct rte_ether_hdr));
-        ip6->vtc_flow = rte_cpu_to_be_32(0x60000000);
+            (struct rte_ipv6_hdr *)(buf + eth_hdr_sz);
+        ip6->vtc_flow = rte_cpu_to_be_32(0x60000000 |
+                            ((uint32_t)(tcb->dscp << 2) << 20));
         ip6->payload_len = rte_cpu_to_be_16((uint16_t)seg_len);
         ip6->proto = IPPROTO_TCP;
         ip6->hop_limits = 64;
@@ -293,9 +305,9 @@ int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     } else {
         /* IPv4 header */
         struct rte_ipv4_hdr *ip =
-            (struct rte_ipv4_hdr *)(buf + sizeof(struct rte_ether_hdr));
+            (struct rte_ipv4_hdr *)(buf + eth_hdr_sz);
         ip->version_ihl   = RTE_IPV4_VHL_DEF;
-        ip->type_of_service = 0;
+        ip->type_of_service = (uint8_t)(tcb->dscp << 2);
         ip->total_length  = rte_cpu_to_be_16(
             (uint16_t)(sizeof(*ip) + seg_len));
         ip->packet_id     = rte_cpu_to_be_16(
@@ -330,7 +342,7 @@ int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
         memcpy((uint8_t *)tcp_h + tcp_hdr_sz, payload, payload_len);
 
     /* Set L2/L3/L4 lengths and compute checksums */
-    m->l2_len = sizeof(struct rte_ether_hdr);
+    m->l2_len = (uint16_t)eth_hdr_sz;
     m->l3_len = (uint16_t)ip_hdr_sz;
     m->l4_len = (uint16_t)tcp_hdr_sz;
     if (is_v6) {
@@ -339,7 +351,7 @@ int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
                             g_port_caps[port_id].has_tcp_cksum_offload);
     } else {
         struct rte_ipv4_hdr *ip =
-            (struct rte_ipv4_hdr *)(buf + sizeof(struct rte_ether_hdr));
+            (struct rte_ipv4_hdr *)(buf + eth_hdr_sz);
         tcp_checksum_set(m, ip, tcp_h,
                          g_port_caps[port_id].has_tcp_cksum_offload);
     }

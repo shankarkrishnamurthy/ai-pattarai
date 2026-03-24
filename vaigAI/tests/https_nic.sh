@@ -346,7 +346,7 @@ vaigai_cmd() {
         return 1
     fi
 
-    printf 'stats\n' >&7
+    printf 'stat net\n' >&7
 
     local attempts=0 found=0
     while [[ $found -eq 0 ]]; do

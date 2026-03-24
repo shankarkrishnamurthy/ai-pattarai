@@ -485,7 +485,7 @@ should_run 9  && run_t9
 should_run 10 && run_t10
 
 # ── Stats summary ────────────────────────────────────────────────────────────
-vaigai_cmd "stats" 3
+vaigai_cmd "stat net" 3
 tcp_open=$(echo "$OUTPUT" | grep -oP 'Conn open:\s*\K[0-9]+' || echo 0)
 tcp_close=$(echo "$OUTPUT" | grep -oP 'Conn close:\s*\K[0-9]+' || echo 0)
 info "Final stats: tcp_conn_open=$tcp_open tcp_conn_close=$tcp_close"

@@ -13,6 +13,7 @@
 #include "../net/tcp_fsm.h"
 #include "../net/tcp_tcb.h"
 #include "../net/tcp_port_pool.h"
+#include "../net/tcp_congestion.h"
 #include "../telemetry/pktrace.h"
 #include "../common/util.h"
 #include "../telemetry/metrics.h"
@@ -87,15 +88,6 @@ cmd_help(int argc, char **argv)
 /* Forward declarations */
 static void cmd_stat(int argc, char **argv);
 static void dispatch(char *line);
-
-static void
-cmd_stats(int argc, char **argv)
-{
-    /* Legacy alias: bare "stats" → "stat net" */
-    char *stat_argv[] = { (char *)"stat", (char *)"net" };
-    (void)argc; (void)argv;
-    cmd_stat(2, stat_argv);
-}
 
 /* ── Shared stat flags ────────────────────────────────────────────────────── */
 typedef struct {
@@ -251,7 +243,7 @@ stat_net(const stat_opts_t *opts)
                    t2->http_req_tx - t1->http_req_tx,
                    t2->http_rsp_rx - t1->http_rsp_rx);
     } else {
-        /* Same as old "stats" — JSON dump */
+        /* Default: JSON dump of all network counters */
         cli_print_stats();
     }
 }
@@ -479,6 +471,14 @@ typedef struct {
     bool        has_ip;
     bool        has_port;
     bool        has_duration;
+    /* New enhancements */
+    uint8_t     dscp;       /* --dscp: DSCP value 0-63 */
+    uint16_t    vlan_id;    /* --vlan: 802.1Q VLAN ID (0=none) */
+    const char *cc;         /* --cc: congestion control algorithm */
+    uint32_t    src_ip_count; /* --src-ip-count: IPs in source range */
+    /* Custom HTTP headers: accumulated "Name: Value\r\n" strings */
+    char        custom_hdrs[512];
+    uint32_t    custom_hdrs_len;
 } start_args_t;
 
 static const char *
@@ -489,7 +489,9 @@ start_usage(void)
            "             [--rate <pps>] [--cps <N>] [--ramp <secs>]\n"
            "             [--size <bytes>] [--reuse] [--streams <N>]\n"
            "             [--url <path>] [--host <name>] [--tls]\n"
-           "             [--one]  (single request; mutually exclusive with --duration/--rate)\n";
+           "             [--one] [--dscp <0-63>] [--vlan <id>]\n"
+           "             [--cc newreno|cubic] [--src-ip-count <N>]\n"
+           "             [--header \"Name: Value\"]\n";
 }
 
 static int
@@ -534,6 +536,32 @@ parse_start_args(int argc, char **argv, start_args_t *a)
             a->tls = true;
         } else if (strcmp(argv[i], "--one") == 0) {
             a->one = true;
+        } else if (strcmp(argv[i], "--dscp") == 0 && i + 1 < argc) {
+            a->dscp = (uint8_t)strtoul(argv[++i], NULL, 10);
+            if (a->dscp > 63) {
+                printf("start: --dscp must be 0-63\n");
+                return -1;
+            }
+        } else if (strcmp(argv[i], "--vlan") == 0 && i + 1 < argc) {
+            a->vlan_id = (uint16_t)strtoul(argv[++i], NULL, 10);
+            if (a->vlan_id > 4094) {
+                printf("start: --vlan must be 1-4094\n");
+                return -1;
+            }
+        } else if (strcmp(argv[i], "--cc") == 0 && i + 1 < argc) {
+            a->cc = argv[++i];
+        } else if (strcmp(argv[i], "--src-ip-count") == 0 && i + 1 < argc) {
+            a->src_ip_count = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--header") == 0 && i + 1 < argc) {
+            i++;
+            size_t hlen = strlen(argv[i]);
+            if (a->custom_hdrs_len + hlen + 2 < sizeof(a->custom_hdrs)) {
+                memcpy(a->custom_hdrs + a->custom_hdrs_len, argv[i], hlen);
+                a->custom_hdrs_len += (uint32_t)hlen;
+                a->custom_hdrs[a->custom_hdrs_len++] = '\r';
+                a->custom_hdrs[a->custom_hdrs_len++] = '\n';
+                a->custom_hdrs[a->custom_hdrs_len] = '\0';
+            }
         } else {
             printf("Unknown flag: %s\n", argv[i]);
             return -1;
@@ -596,17 +624,17 @@ cmd_start(int argc, char **argv)
     if (!a.has_duration) { printf("start: --duration is required (or use --one)\n%s", start_usage()); return; }
     if (a.duration == 0) { printf("start: --duration must be > 0\n");  return; }
 
-    /* Find a free stream slot */
-    uint32_t stream_idx = UINT32_MAX;
-    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_STREAMS; i++) {
-        if (!g_client_streams[i].active) {
-            stream_idx = i;
+    /* Find a free flow slot */
+    uint32_t flow_idx = UINT32_MAX;
+    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_FLOWS; i++) {
+        if (!g_client_flows[i].active) {
+            flow_idx = i;
             break;
         }
     }
-    if (stream_idx == UINT32_MAX) {
-        printf("start: all %d stream slots in use — run 'stop' or 'stop <id>' first\n",
-               TGEN_MAX_CLIENT_STREAMS);
+    if (flow_idx == UINT32_MAX) {
+        printf("start: all %d flow slots in use — run 'stop' or 'stop <id>' first\n",
+               TGEN_MAX_CLIENT_FLOWS);
         return;
     }
 
@@ -685,7 +713,16 @@ cmd_start(int argc, char **argv)
     gcfg.think_time_us  = a.think_time * 1000; /* ms → µs */
     gcfg.max_initiations = a.one ? 1 : 0;
     gcfg.enable_tls = a.tls;
-    gcfg.stream_idx = stream_idx;
+    gcfg.flow_idx = flow_idx;
+    gcfg.dscp = a.dscp;
+    gcfg.vlan_id = a.vlan_id;
+    gcfg.src_ip_count = a.src_ip_count;
+
+    /* CC algorithm: default to NewReno, support CUBIC */
+    if (a.cc && strcmp(a.cc, "cubic") == 0)
+        gcfg.cc_algo = CC_CUBIC;
+    else
+        gcfg.cc_algo = CC_NEWRENO;
 
     if (a.reuse)
         gcfg.throughput_streams = (uint8_t)a.streams;
@@ -697,10 +734,15 @@ cmd_start(int argc, char **argv)
         strncpy(gcfg.http_host, a.host, sizeof(gcfg.http_host) - 1);
     }
 
+    /* Store custom HTTP headers for this flow */
+    memset(g_http_custom_hdrs[flow_idx], 0, sizeof(g_http_custom_hdrs[0]));
+    if (a.custom_hdrs_len > 0)
+        memcpy(g_http_custom_hdrs[flow_idx], a.custom_hdrs, a.custom_hdrs_len + 1);
+
     /* ── Reset counters & push to workers ───────────────────────────── */
     uint32_t n_workers = g_core_map.num_workers;
-    bool first_stream = !client_any_active();
-    if (first_stream) {
+    bool first_flow = !client_any_active();
+    if (first_flow) {
         metrics_reset(n_workers);
         rte_eth_stats_reset(port_id);
     }
@@ -715,7 +757,7 @@ cmd_start(int argc, char **argv)
         uint8_t key_len = pcap->rss_key_size;
         if (key_len == 0 || key_len > tgen_rss_key_max_len())
             key_len = 40;
-        if (first_stream) {
+        if (first_flow) {
             /* Reset pools first then filter */
             for (uint32_t w = 0; w < n_workers; w++)
                 tcp_port_pool_reset(w);
@@ -743,15 +785,15 @@ cmd_start(int argc, char **argv)
     /* ── Print initial progress ──────────────────────────────────────── */
     if (a.reuse) {
         printf("[#%u] Traffic %s → %s:%u  streams=%u  duration=%us%s\n",
-               stream_idx, a.proto, a.ip, a.port, a.streams, a.duration,
+               flow_idx, a.proto, a.ip, a.port, a.streams, a.duration,
                a.tls ? " [TLS]" : "");
         printf("[ ID]  Interval       Transfer     Throughput\n");
     } else if (a.one) {
         printf("[#%u] Single %s → %s:%u%s\n",
-               stream_idx, a.proto, a.ip, a.port, a.tls ? " [TLS]" : "");
+               flow_idx, a.proto, a.ip, a.port, a.tls ? " [TLS]" : "");
     } else {
         printf("[#%u] Traffic %s → %s:%u  %u-byte payload, %s, %u seconds%s\n",
-               stream_idx, a.proto, a.ip, a.port, a.size,
+               flow_idx, a.proto, a.ip, a.port, a.size,
                a.rate ? "rate-limited" : "unlimited",
                a.duration, a.tls ? " [TLS]" : "");
     }
@@ -759,7 +801,7 @@ cmd_start(int argc, char **argv)
     /* ── Set up async traffic gen state ──────────────────────────────── */
     traffic_gen_state_t tgs;
     memset(&tgs, 0, sizeof(tgs));
-    tgs.stream_idx = stream_idx;
+    tgs.flow_idx = flow_idx;
     tgs.one_shot   = a.one;
     tgs.reuse      = a.reuse;
     tgs.is_tty     = isatty(STDOUT_FILENO);
@@ -774,7 +816,7 @@ cmd_start(int argc, char **argv)
     strncpy(tgs.proto, a.proto, sizeof(tgs.proto) - 1);
     strncpy(tgs.dst_ip_str, a.ip, sizeof(tgs.dst_ip_str) - 1);
 
-    output_start(stream_idx, a.proto, a.ip, a.port,
+    output_start(flow_idx, a.proto, a.ip, a.port,
                  a.duration, a.rate, a.size, a.tls,
                  a.streams, a.reuse);
 
@@ -782,7 +824,7 @@ cmd_start(int argc, char **argv)
      * then prints the result and returns the prompt. */
     if (a.one) {
         mgmt_traffic_start(&tgs);
-        traffic_gen_state_t *cs = &g_client_streams[stream_idx];
+        traffic_gen_state_t *cs = &g_client_flows[flow_idx];
         uint64_t hz        = rte_get_tsc_hz();
         uint64_t chk_itvl  = hz / 100;              /* 10 ms in TSC ticks  */
         uint64_t last_chk   = rte_rdtsc() - chk_itvl; /* check on 1st iter */
@@ -797,7 +839,7 @@ cmd_start(int argc, char **argv)
                 uint64_t elapsed_s =
                     (now - cs->start_tsc) / hz;
                 if (elapsed_s >= cs->duration_s) {
-                    mgmt_traffic_stop_stream(stream_idx);
+                    mgmt_traffic_stop_flow(flow_idx);
                     break;
                 }
                 if (cs->one_shot) {
@@ -818,7 +860,7 @@ cmd_start(int argc, char **argv)
                                ms.total.tcp_reset_sent >= 1 ||
                                ms.total.tcp_reset_rx >= 1;
                     if (done) {
-                        mgmt_traffic_stop_stream(stream_idx);
+                        mgmt_traffic_stop_flow(flow_idx);
                         break;
                     }
                 }
@@ -830,8 +872,8 @@ cmd_start(int argc, char **argv)
 
     /* Interactive mode: non-blocking — return to prompt immediately */
     mgmt_traffic_start(&tgs);
-    printf("(running in background — use 'show clients' to monitor, "
-           "'stop' or 'stop %u' to abort)\n", stream_idx);
+    printf("(running in background — use 'show flows' to monitor, "
+           "'stop' or 'stop %u' to abort)\n", flow_idx);
 }
 
 static void
@@ -841,34 +883,34 @@ cmd_stop_client(int argc, char **argv)
         /* stop <id> or stop all */
         if (strcmp(argv[1], "all") == 0) {
             if (!client_any_active()) {
-                printf("No active client streams.\n");
+                printf("No active client flows.\n");
                 return;
             }
             mgmt_traffic_stop_all();
-            printf("All client streams stopped.\n");
+            printf("All client flows stopped.\n");
             return;
         }
         char *endp;
         long idx = strtol(argv[1], &endp, 10);
-        if (*endp == '\0' && idx >= 0 && idx < TGEN_MAX_CLIENT_STREAMS) {
-            if (!g_client_streams[idx].active) {
-                printf("Stream #%ld is not active.\n", idx);
+        if (*endp == '\0' && idx >= 0 && idx < TGEN_MAX_CLIENT_FLOWS) {
+            if (!g_client_flows[idx].active) {
+                printf("Flow #%ld is not active.\n", idx);
                 return;
             }
-            mgmt_traffic_stop_stream((uint32_t)idx);
+            mgmt_traffic_stop_flow((uint32_t)idx);
             return;
         }
-        printf("stop: invalid stream id '%s' (use 0-%d or 'all')\n",
-               argv[1], TGEN_MAX_CLIENT_STREAMS - 1);
+        printf("stop: invalid flow id '%s' (use 0-%d or 'all')\n",
+               argv[1], TGEN_MAX_CLIENT_FLOWS - 1);
         return;
     }
-    /* Bare stop: stop all streams */
+    /* Bare stop: stop all flows */
     if (!client_any_active()) {
-        printf("No active client streams.\n");
+        printf("No active client flows.\n");
         return;
     }
     mgmt_traffic_stop_all();
-    printf("All client streams stopped.\n");
+    printf("All client flows stopped.\n");
 }
 
 /* ── Reset all TCP state ─────────────────────────────────────────────────── */
@@ -880,7 +922,7 @@ cmd_reset(int argc, char **argv)
     /* Refuse if traffic generation is still active */
     uint32_t n_workers = g_core_map.num_workers;
     for (uint32_t w = 0; w < n_workers; w++) {
-        for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++) {
+        for (uint32_t s = 0; s < TGEN_MAX_CLIENT_FLOWS; s++) {
             if (__atomic_load_n(&g_worker_ctx[w].tx_gen[s].active,
                                 __ATOMIC_ACQUIRE)) {
                 printf("reset: traffic generation is still active — "
@@ -992,7 +1034,7 @@ static void cmd_listeners(int argc, char **argv);
 static void cmd_connections(int argc, char **argv);
 static void cmd_show_clients(int argc, char **argv);
 
-/* ── Show active client streams ─────────────────────────────────────────── */
+/* ── Show active client flows ───────────────────────────────────────────── */
 static void
 cmd_show_clients(int argc, char **argv)
 {
@@ -1007,8 +1049,8 @@ cmd_show_clients(int argc, char **argv)
     printf("  -  %-8s %-16s %-6s %-10s %-8s %s\n",
            "-----", "-----------", "----", "--------", "-------", "-----");
 
-    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_STREAMS; i++) {
-        traffic_gen_state_t *cs = &g_client_streams[i];
+    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_FLOWS; i++) {
+        traffic_gen_state_t *cs = &g_client_flows[i];
         if (!cs->active && cs->duration_s == 0)
             continue; /* never used */
 
@@ -1034,7 +1076,7 @@ cmd_show_clients(int argc, char **argv)
     }
 
     if (!any)
-        printf("  (no client streams configured — use 'start' to begin)\n");
+        printf("  (no client flows configured — use 'start' to begin)\n");
 }
 
 /* ── Show interface details ──────────────────────────────────────────────── */
@@ -1044,14 +1086,14 @@ cmd_show(int argc, char **argv)
     if (argc < 2) {
         printf("Usage: show interface [port_id]\n");
         if (!g_config.server_mode)
-            printf("       show clients\n");
+            printf("       show flows\n");
         if (g_config.server_mode)
             printf("       show listeners\n"
                    "       show connections\n");
         return;
     }
 
-    if (strcmp(argv[1], "clients") == 0) {
+    if (strcmp(argv[1], "flows") == 0 || strcmp(argv[1], "clients") == 0) {
         cmd_show_clients(argc - 1, argv + 1);
         return;
     }
@@ -1067,7 +1109,7 @@ cmd_show(int argc, char **argv)
     if (strcmp(argv[1], "interface") != 0) {
         printf("Usage: show interface [port_id]\n");
         if (!g_config.server_mode)
-            printf("       show clients\n");
+            printf("       show flows\n");
         if (g_config.server_mode)
             printf("       show listeners\n"
                    "       show connections\n");
@@ -1538,13 +1580,25 @@ dispatch(char *line)
     /* Log raw command before strtok destroys whitespace */
     output_cmd(line);
 
-    /* Tokenise */
+    /* Tokenise (quote-aware: "foo bar" or 'foo bar' → single token) */
     char *argv[MAX_ARGS];
     int   argc = 0;
-    char *tok  = strtok(line, " \t\r\n");
-    while (tok && (uint32_t)argc < MAX_ARGS) {
-        argv[argc++] = tok;
-        tok = strtok(NULL, " \t\r\n");
+    char *p = line;
+    while (*p && (uint32_t)argc < MAX_ARGS) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (!*p) break;
+        char *start;
+        if (*p == '"' || *p == '\'') {
+            char q = *p++;
+            start = p;
+            while (*p && *p != q) p++;
+            if (*p) *p++ = '\0';
+        } else {
+            start = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n') p++;
+            if (*p) *p++ = '\0';
+        }
+        argv[argc++] = start;
     }
     if (argc == 0) return;
 
@@ -1586,8 +1640,6 @@ cli_run(void)
         "Without a sub-command, prints a brief summary of all domains.\n",
         cmd_stat);
 
-    cli_register("stats",    "Alias for 'stat net'", NULL, cmd_stats);
-
     cli_register("ping",     "ICMP ping: ping <ip> [count] [size] [ms] [port]",
         "Usage: ping <dst_ip> [count] [size] [interval_ms] [port]\n"
         "\n"
@@ -1623,7 +1675,7 @@ cli_run(void)
         "  --cps <N>         Connections per second (alias for --rate in TCP/HTTP)\n"
         "  --ramp <secs>     Gradual ramp-up from 0 to target rate\n"
         "  --size <bytes>    Payload size in bytes (default: 56)\n"
-        "  --streams <N>     Concurrent streams, max 16 (default: 1)\n"
+        "  --streams <N>     Concurrent TCP connections for throughput, max 16 (default: 1)\n"
         "  --reuse           Enable connection reuse (throughput mode)\n"
         "  --url <path>      HTTP request path (default: /)\n"
         "  --host <name>     HTTP Host header (default: --ip value)\n"
@@ -1631,6 +1683,11 @@ cli_run(void)
         "  --one             Single request/handshake then stop\n"
         "  --txn-per-conn <N>  HTTP transactions per connection (enables keep-alive)\n"
         "  --think-time <ms>   Delay between transactions on same connection\n"
+        "  --dscp <0-63>     Set DSCP value in IP TOS field (default: 0)\n"
+        "  --vlan <id>       Insert 802.1Q VLAN tag (1-4094, default: none)\n"
+        "  --cc <algo>       Congestion control: newreno (default), cubic\n"
+        "  --src-ip-count <N>  Use N consecutive IPs from --ip as source pool\n"
+        "  --header \"K: V\"   Add custom HTTP header (repeatable)\n"
         "\n"
         "Examples:\n"
         "  start --ip 10.0.0.2 --port 5000 --duration 10\n"
@@ -1639,19 +1696,19 @@ cli_run(void)
         "  start --ip 10.0.0.2 --port 80 --proto http --txn-per-conn 10 --think-time 100\n"
         "  start --ip 10.0.0.2 --port 443 --proto https --one --url /\n"
         "\n"
-        "Multiple concurrent streams:\n"
-        "  start can be called multiple times to run concurrent streams.\n"
-        "  Each stream gets a unique ID shown as [#N].\n"
-        "  Use 'show clients' to see all streams, 'stop <N>' to stop one.\n",
+        "Multiple concurrent flows:\n"
+        "  start can be called multiple times to run concurrent flows.\n"
+        "  Each flow gets a unique ID shown as [#N].\n"
+        "  Use 'show flows' to see all flows, 'stop <N>' to stop one.\n",
         cmd_start_gated);
 
     cli_register("stop",     "Stop traffic/listeners: stop [#|all|spec]",
         "Usage: stop [<id>|all|<spec>]\n"
         "\n"
         "Client mode:\n"
-        "  stop              Stop all active client streams\n"
-        "  stop <id>         Stop a specific stream by index\n"
-        "  stop all          Stop all active client streams (explicit)\n"
+        "  stop              Stop all active client flows\n"
+        "  stop <id>         Stop a specific flow by index\n"
+        "  stop all          Stop all active client flows (explicit)\n"
         "\n"
         "Server mode:\n"
         "  stop              Stop all listeners\n"
@@ -1661,7 +1718,7 @@ cli_run(void)
         "\n"
         "Examples:\n"
         "  stop              # stop everything\n"
-        "  stop 0            # stop stream/listener #0\n"
+        "  stop 0            # stop flow/listener #0\n"
         "  stop all          # stop all\n",
         cmd_stop_gated);
 
@@ -1688,9 +1745,9 @@ cli_run(void)
         "  trace stop\n",
         cmd_trace);
 
-    cli_register("show",     "Show details: show interface|clients|listeners|connections",
+    cli_register("show",     "Show details: show interface|flows|listeners|connections",
         "Usage: show interface [port_id]\n"
-        "       show clients             (client mode)\n"
+        "       show flows               (client mode)\n"
         "       show listeners           (server mode)\n"
         "       show connections          (server mode)\n"
         "\n"
@@ -1699,8 +1756,8 @@ cli_run(void)
         "  offload capabilities, and packet statistics.\n"
         "  Without port_id, shows all ports.\n"
         "\n"
-        "show clients:\n"
-        "  Shows active client traffic streams with proto, destination,\n"
+        "show flows:\n"
+        "  Shows active client traffic flows with proto, destination,\n"
         "  duration, elapsed time, and state.\n"
         "\n"
         "show listeners:\n"
@@ -1712,7 +1769,7 @@ cli_run(void)
         "Examples:\n"
         "  show interface\n"
         "  show interface 0\n"
-        "  show clients\n"
+        "  show flows\n"
         "  show listeners\n"
         "  show connections\n",
         cmd_show);

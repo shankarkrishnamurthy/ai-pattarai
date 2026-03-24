@@ -41,8 +41,8 @@ void output_port(uint16_t port_id);
 /** Emit "cmd" event: record a CLI command. */
 void output_cmd(const char *input);
 
-/** Emit "start" event: test parameters for a client stream. */
-void output_start(uint32_t stream_idx, const char *proto,
+/** Emit "start" event: test parameters for a client flow. */
+void output_start(uint32_t flow_idx, const char *proto,
                   const char *dst_ip, uint16_t dst_port,
                   uint32_t duration, uint64_t rate, uint16_t size,
                   bool tls, uint32_t streams, bool reuse);
@@ -51,11 +51,11 @@ void output_start(uint32_t stream_idx, const char *proto,
 void output_serve(const char *listeners, const char *ciphers);
 
 /** Emit "progress" event: periodic stats snapshot. */
-void output_progress(uint32_t stream_idx, uint64_t elapsed_s,
+void output_progress(uint32_t flow_idx, uint64_t elapsed_s,
                      const metrics_snapshot_t *snap);
 
-/** Emit "result" event: final metrics for a completed stream. */
-void output_result(uint32_t stream_idx, const char *proto,
+/** Emit "result" event: final metrics for a completed flow. */
+void output_result(uint32_t flow_idx, const char *proto,
                    double actual_s, const metrics_snapshot_t *snap);
 
 /** Emit "error" event: structured error/warning. */

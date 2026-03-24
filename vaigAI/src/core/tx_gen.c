@@ -16,6 +16,7 @@
 
 #include <rte_cycles.h>
 #include <rte_ethdev.h>
+#include <rte_byteorder.h>
 #include <rte_ip.h>
 #include <rte_icmp.h>
 #include <rte_udp.h>
@@ -48,6 +49,9 @@ static uint8_t g_tp_zero_buf[1400]; /* zero-filled plaintext for throughput
 /* ── Pre-built HTTP request (one per worker, reused across connections) ──── */
 http_prebuilt_req_t g_http_req[TGEN_MAX_WORKERS];
 
+/* ── Per-flow custom HTTP headers (set by CLI, consumed by tx_gen_burst) ── */
+char g_http_custom_hdrs[TGEN_MAX_CLIENT_FLOWS][512];
+
 /* ══════════════════════════════════════════════════════════════════════════
  *  Protocol-specific builders
  *  Each returns a single rte_mbuf ready for TX, or NULL on alloc failure.
@@ -58,7 +62,10 @@ static struct rte_mbuf *
 build_icmp_echo(tx_gen_state_t *state, struct rte_mempool *mp)
 {
     uint16_t payload_len = state->cfg.pkt_size;
-    size_t total = sizeof(struct rte_ether_hdr)
+    uint16_t vlan_id = state->cfg.vlan_id;
+    size_t eth_sz = sizeof(struct rte_ether_hdr)
+                  + (vlan_id ? sizeof(struct rte_vlan_hdr) : 0);
+    size_t total = eth_sz
                  + sizeof(struct rte_ipv4_hdr)
                  + ICMP_HDR_LEN + payload_len;
 
@@ -68,17 +75,25 @@ build_icmp_echo(tx_gen_state_t *state, struct rte_mempool *mp)
     char *buf = rte_pktmbuf_append(m, (uint16_t)total);
     if (unlikely(!buf)) { rte_pktmbuf_free(m); return NULL; }
 
-    /* Ethernet */
+    /* Ethernet (with optional 802.1Q VLAN) */
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)buf;
     rte_ether_addr_copy(&state->cfg.src_mac, &eth->src_addr);
     rte_ether_addr_copy(&state->cfg.dst_mac, &eth->dst_addr);
-    eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    if (vlan_id) {
+        eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_VLAN);
+        struct rte_vlan_hdr *vh = (struct rte_vlan_hdr *)(
+            buf + sizeof(struct rte_ether_hdr));
+        vh->vlan_tci  = rte_cpu_to_be_16(vlan_id & 0x0FFF);
+        vh->eth_proto = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    } else {
+        eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    }
 
     /* IPv4 */
     struct rte_ipv4_hdr *ip =
-        (struct rte_ipv4_hdr *)(buf + sizeof(struct rte_ether_hdr));
+        (struct rte_ipv4_hdr *)(buf + eth_sz);
     ip->version_ihl     = RTE_IPV4_VHL_DEF;
-    ip->type_of_service = 0;
+    ip->type_of_service = (uint8_t)(state->cfg.dscp << 2);
     ip->total_length    = rte_cpu_to_be_16(
         (uint16_t)(sizeof(*ip) + ICMP_HDR_LEN + payload_len));
     ip->packet_id       = rte_cpu_to_be_16(state->seq);
@@ -86,7 +101,15 @@ build_icmp_echo(tx_gen_state_t *state, struct rte_mempool *mp)
     ip->time_to_live    = 64;
     ip->next_proto_id   = IPPROTO_ICMP;
     ip->hdr_checksum    = 0;
-    ip->src_addr        = state->cfg.src_ip;
+    /* IP range pool for ICMP */
+    uint32_t icmp_src_ip = state->cfg.src_ip;
+    if (state->cfg.src_ip_count > 1) {
+        uint32_t off = state->ip_pool_idx % state->cfg.src_ip_count;
+        state->ip_pool_idx++;
+        icmp_src_ip = rte_cpu_to_be_32(
+            rte_be_to_cpu_32(state->cfg.src_ip) + off);
+    }
+    ip->src_addr        = icmp_src_ip;
     ip->dst_addr        = state->cfg.dst_ip;
     ip->hdr_checksum    = rte_ipv4_cksum(ip);
 
@@ -115,7 +138,10 @@ build_udp_datagram(tx_gen_state_t *state, struct rte_mempool *mp)
 {
     uint16_t payload_len = state->cfg.pkt_size;
     uint16_t udp_total   = (uint16_t)(sizeof(struct rte_udp_hdr) + payload_len);
-    size_t   total       = sizeof(struct rte_ether_hdr)
+    uint16_t vlan_id = state->cfg.vlan_id;
+    size_t eth_sz = sizeof(struct rte_ether_hdr)
+                  + (vlan_id ? sizeof(struct rte_vlan_hdr) : 0);
+    size_t   total       = eth_sz
                          + sizeof(struct rte_ipv4_hdr)
                          + udp_total;
 
@@ -125,17 +151,25 @@ build_udp_datagram(tx_gen_state_t *state, struct rte_mempool *mp)
     char *buf = rte_pktmbuf_append(m, (uint16_t)total);
     if (unlikely(!buf)) { rte_pktmbuf_free(m); return NULL; }
 
-    /* Ethernet */
+    /* Ethernet (with optional 802.1Q VLAN) */
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)buf;
     rte_ether_addr_copy(&state->cfg.src_mac, &eth->src_addr);
     rte_ether_addr_copy(&state->cfg.dst_mac, &eth->dst_addr);
-    eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    if (vlan_id) {
+        eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_VLAN);
+        struct rte_vlan_hdr *vh = (struct rte_vlan_hdr *)(
+            buf + sizeof(struct rte_ether_hdr));
+        vh->vlan_tci  = rte_cpu_to_be_16(vlan_id & 0x0FFF);
+        vh->eth_proto = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    } else {
+        eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    }
 
     /* IPv4 */
     struct rte_ipv4_hdr *ip =
-        (struct rte_ipv4_hdr *)(buf + sizeof(struct rte_ether_hdr));
+        (struct rte_ipv4_hdr *)(buf + eth_sz);
     ip->version_ihl     = RTE_IPV4_VHL_DEF;
-    ip->type_of_service = 0;
+    ip->type_of_service = (uint8_t)(state->cfg.dscp << 2);
     ip->total_length    = rte_cpu_to_be_16(
         (uint16_t)(sizeof(*ip) + udp_total));
     ip->packet_id       = rte_cpu_to_be_16(state->seq);
@@ -143,7 +177,15 @@ build_udp_datagram(tx_gen_state_t *state, struct rte_mempool *mp)
     ip->time_to_live    = 64;
     ip->next_proto_id   = IPPROTO_UDP;
     ip->hdr_checksum    = 0;
-    ip->src_addr        = state->cfg.src_ip;
+    /* IP range pool for UDP */
+    uint32_t udp_src_ip = state->cfg.src_ip;
+    if (state->cfg.src_ip_count > 1) {
+        uint32_t off = state->ip_pool_idx % state->cfg.src_ip_count;
+        state->ip_pool_idx++;
+        udp_src_ip = rte_cpu_to_be_32(
+            rte_be_to_cpu_32(state->cfg.src_ip) + off);
+    }
+    ip->src_addr        = udp_src_ip;
     ip->dst_addr        = state->cfg.dst_ip;
     ip->hdr_checksum    = rte_ipv4_cksum(ip);
 
@@ -307,11 +349,13 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
             bool ka = state->cfg.txn_per_conn > 1;
             http_conn_t tmp;
             http11_conn_init(&tmp);
+            const char *extra = g_http_custom_hdrs[state->cfg.flow_idx];
             http_request_t req = {
-                .method     = (http_method_t)state->cfg.http_method,
-                .url        = state->cfg.http_url[0] ? state->cfg.http_url : "/",
-                .host       = state->cfg.http_host[0] ? state->cfg.http_host : "localhost",
-                .keep_alive = ka,
+                .method        = (http_method_t)state->cfg.http_method,
+                .url           = state->cfg.http_url[0] ? state->cfg.http_url : "/",
+                .host          = state->cfg.http_host[0] ? state->cfg.http_host : "localhost",
+                .keep_alive    = ka,
+                .extra_headers = (extra && extra[0]) ? extra : NULL,
             };
             int n = http11_tx_request(&tmp, &req);
             if (n > 0) {
@@ -328,18 +372,31 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
 
         uint32_t initiated = 0;
         for (uint32_t i = 0; i < to_send; i++) {
+            /* IP range pool: cycle through src IPs */
+            uint32_t cur_src_ip = state->cfg.src_ip;
+            if (state->cfg.src_ip_count > 1) {
+                uint32_t offset = state->ip_pool_idx %
+                                  state->cfg.src_ip_count;
+                state->ip_pool_idx++;
+                /* src_ip is network byte order — convert, add, convert back */
+                cur_src_ip = rte_cpu_to_be_32(
+                    rte_be_to_cpu_32(state->cfg.src_ip) + offset);
+            }
             uint16_t src_port;
-            if (tcp_port_alloc(worker_idx, state->cfg.src_ip,
+            if (tcp_port_alloc(worker_idx, cur_src_ip,
                                &src_port) < 0)
                 break;   /* port pool exhausted */
             tcb_t *tcb = tcp_fsm_connect(worker_idx,
-                             state->cfg.src_ip, src_port,
+                             cur_src_ip, src_port,
                              state->cfg.dst_ip, state->cfg.dst_port,
                              state->cfg.port_id);
             if (!tcb) {
-                tcp_port_free_immediate(worker_idx, state->cfg.src_ip, src_port);
+                tcp_port_free_immediate(worker_idx, cur_src_ip, src_port);
                 break;   /* TCB store full */
             }
+            tcb->dscp    = state->cfg.dscp;
+            tcb->vlan_id = state->cfg.vlan_id;
+            tcb->cc_algo = state->cfg.cc_algo;
             if (state->cfg.max_initiations > 0)
                 tcb->graceful_close = true;
             /* Mark connection for HTTP request after ESTABLISHED */
@@ -399,6 +456,9 @@ tx_gen_burst(tx_gen_state_t *state, struct rte_mempool *mp,
                     break;
                 }
                 tcb->app_ctx = (void *)1; /* mark as throughput (not SYN-only) */
+                tcb->dscp    = state->cfg.dscp;
+                tcb->vlan_id = state->cfg.vlan_id;
+                tcb->cc_algo = state->cfg.cc_algo;
                 if (tls) {
                     tcb->app_state = 1; /* request TLS handshake */
                 }

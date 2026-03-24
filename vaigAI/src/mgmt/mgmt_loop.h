@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-/* ── Per-stream traffic generation state (async, non-blocking) ─────── */
+/* ── Per-flow traffic generation state (async, non-blocking) ────────── */
 typedef struct {
     bool        active;         /* traffic gen in progress */
     bool        one_shot;       /* --one mode */
@@ -32,28 +32,28 @@ typedef struct {
     uint16_t    port_id;        /* DPDK port used */
     uint64_t    last_progress;  /* TSC of last progress print */
     char        proto[16];      /* protocol name for summary */
-    uint32_t    streams;        /* stream count (throughput mode) */
+    uint32_t    streams;        /* TCP connection count (throughput mode) */
     uint64_t    rate;           /* rate limit (pps) */
     uint16_t    size;           /* packet size */
     bool        tls;            /* TLS enabled */
-    uint32_t    stream_idx;     /* slot index in g_client_streams[] */
+    uint32_t    flow_idx;       /* slot index in g_client_flows[] */
     char        dst_ip_str[16]; /* destination IP for display */
     uint16_t    dst_port;       /* destination port for display */
 } traffic_gen_state_t;
 
-/* ── Client stream table (mirrors srv_table_t pattern) ─────────────── */
-extern traffic_gen_state_t g_client_streams[TGEN_MAX_CLIENT_STREAMS];
-extern uint32_t            g_client_stream_count; /* high-water mark */
+/* ── Client flow table (mirrors srv_table_t pattern) ───────────────── */
+extern traffic_gen_state_t g_client_flows[TGEN_MAX_CLIENT_FLOWS];
+extern uint32_t            g_client_flow_count; /* high-water mark */
 
-/** Check if any client stream is active. */
+/** Check if any client flow is active. */
 static inline bool client_any_active(void) {
-    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_STREAMS; i++)
-        if (g_client_streams[i].active) return true;
+    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_FLOWS; i++)
+        if (g_client_flows[i].active) return true;
     return false;
 }
 
-/* Backward-compat alias — points to stream 0 for legacy callers */
-#define g_traffic_state g_client_streams[0]
+/* Backward-compat alias — points to flow 0 for legacy callers */
+#define g_traffic_state g_client_flows[0]
 
 /* ── Management core CPU stats ────────────────────────────────────── */
 typedef struct {
@@ -77,19 +77,19 @@ typedef void (*mgmt_dispatch_fn_t)(char *line);
 void mgmt_loop_run(mgmt_dispatch_fn_t dispatch);
 
 /**
- * Start async traffic generation for a specific stream slot.
+ * Start async traffic generation for a specific flow slot.
  * Called by cmd_start after ARP resolve and IPC broadcast.
  */
 void mgmt_traffic_start(const traffic_gen_state_t *state);
 
 /**
- * Stop a specific client stream by index.  Broadcasts CFG_CMD_STOP_STREAM
- * to workers and prints summary for that stream.
+ * Stop a specific client flow by index.  Broadcasts CFG_CMD_STOP_FLOW
+ * to workers and prints summary for that flow.
  */
-void mgmt_traffic_stop_stream(uint32_t stream_idx);
+void mgmt_traffic_stop_flow(uint32_t flow_idx);
 
 /**
- * Stop all active client streams.
+ * Stop all active client flows.
  */
 void mgmt_traffic_stop_all(void);
 

@@ -233,7 +233,7 @@ output_cmd(const char *input)
 
 /* ── start ─────────────────────────────────────────────────────────── */
 void
-output_start(uint32_t stream_idx, const char *proto,
+output_start(uint32_t flow_idx, const char *proto,
              const char *dst_ip, uint16_t dst_port,
              uint32_t duration, uint64_t rate, uint16_t size,
              bool tls, uint32_t streams, bool reuse)
@@ -244,7 +244,7 @@ output_start(uint32_t stream_idx, const char *proto,
 
     fprintf(g_output_fp,
         "{\"ts\":\"%s\",\"type\":\"start\""
-        ",\"stream_idx\":%u"
+        ",\"flow_idx\":%u"
         ",\"proto\":\"%s\""
         ",\"dst_ip\":\"%s\""
         ",\"dst_port\":%u"
@@ -255,7 +255,7 @@ output_start(uint32_t stream_idx, const char *proto,
         ",\"streams\":%u"
         ",\"reuse\":%s"
         "}\n",
-        ts, stream_idx, proto, dst_ip, dst_port,
+        ts, flow_idx, proto, dst_ip, dst_port,
         duration, rate, size,
         tls ? "true" : "false",
         streams, reuse ? "true" : "false");
@@ -340,7 +340,7 @@ write_metrics(FILE *fp, const worker_metrics_t *t, const histogram_t *lat)
 
 /* ── progress ──────────────────────────────────────────────────────── */
 void
-output_progress(uint32_t stream_idx, uint64_t elapsed_s,
+output_progress(uint32_t flow_idx, uint64_t elapsed_s,
                 const metrics_snapshot_t *snap)
 {
     if (!g_output_fp) return;
@@ -350,20 +350,20 @@ output_progress(uint32_t stream_idx, uint64_t elapsed_s,
     const worker_metrics_t *t = &snap->total;
     fprintf(g_output_fp,
         "{\"ts\":\"%s\",\"type\":\"progress\""
-        ",\"stream_idx\":%u"
+        ",\"flow_idx\":%u"
         ",\"elapsed_s\":%"PRIu64
         ",\"tx_pkts\":%"PRIu64
         ",\"rx_pkts\":%"PRIu64
         ",\"tcp_conn_open\":%"PRIu64
         ",\"http_rsp_rx\":%"PRIu64
         "}\n",
-        ts, stream_idx, elapsed_s,
+        ts, flow_idx, elapsed_s,
         t->tx_pkts, t->rx_pkts, t->tcp_conn_open, t->http_rsp_rx);
 }
 
 /* ── result ────────────────────────────────────────────────────────── */
 void
-output_result(uint32_t stream_idx, const char *proto,
+output_result(uint32_t flow_idx, const char *proto,
               double actual_s, const metrics_snapshot_t *snap)
 {
     if (!g_output_fp) return;
@@ -381,12 +381,12 @@ output_result(uint32_t stream_idx, const char *proto,
 
     fprintf(g_output_fp,
         "{\"ts\":\"%s\",\"type\":\"result\""
-        ",\"stream_idx\":%u"
+        ",\"flow_idx\":%u"
         ",\"proto\":\"%s\""
         ",\"status\":\"%s\""
         ",\"actual_duration_s\":%.3f"
         ",\"metrics\":",
-        ts, stream_idx, proto, status, actual_s);
+        ts, flow_idx, proto, status, actual_s);
 
     write_metrics(g_output_fp, t, &snap->latency);
 

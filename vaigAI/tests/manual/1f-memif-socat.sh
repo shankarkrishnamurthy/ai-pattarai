@@ -285,7 +285,7 @@ vaigai_cmd() {
     dur=$(echo "$cmd" | grep -oP '(?<=--duration )\d+' || echo 0)
     [[ "$dur" -gt 0 ]] && sleep $((dur + 2)) || sleep 3
 
-    printf 'stats\n' >&7
+    printf 'stat net\n' >&7
 
     local attempts=0
     while true; do

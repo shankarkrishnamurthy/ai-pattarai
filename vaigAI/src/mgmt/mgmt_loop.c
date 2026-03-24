@@ -55,8 +55,8 @@ static inline void delay_ms_flush(uint32_t ms) { mgmt_delay_ms_flush(ms); }
 
 /* ── Globals ──────────────────────────────────────────────────────── */
 mgmt_cpu_stats_t    g_mgmt_cpu_stats;
-traffic_gen_state_t g_client_streams[TGEN_MAX_CLIENT_STREAMS];
-uint32_t            g_client_stream_count;
+traffic_gen_state_t g_client_flows[TGEN_MAX_CLIENT_FLOWS];
+uint32_t            g_client_flow_count;
 
 /* Dispatch function stored for callback use */
 static mgmt_dispatch_fn_t g_dispatch;
@@ -76,9 +76,9 @@ ipc_ack_drain(void)
     }
 }
 
-/* ── Async traffic gen tick (per-stream) ──────────────────────────── */
+/* ── Async traffic gen tick (per-flow) ────────────────────────────── */
 static void
-traffic_gen_tick_stream(traffic_gen_state_t *ts)
+traffic_gen_tick_flow(traffic_gen_state_t *ts)
 {
     if (!ts->active)
         return;
@@ -106,14 +106,14 @@ traffic_gen_tick_stream(traffic_gen_state_t *ts)
                    ms.total.tcp_reset_sent >= 1 ||
                    ms.total.tcp_reset_rx >= 1;
         if (done) {
-            mgmt_traffic_stop_stream(ts->stream_idx);
+            mgmt_traffic_stop_flow(ts->flow_idx);
             return;
         }
     }
 
     /* Check duration */
     if (elapsed_s >= ts->duration_s) {
-        mgmt_traffic_stop_stream(ts->stream_idx);
+        mgmt_traffic_stop_flow(ts->flow_idx);
         return;
     }
 
@@ -124,7 +124,7 @@ traffic_gen_tick_stream(traffic_gen_state_t *ts)
         if (output_enabled()) {
             metrics_snapshot_t snap;
             metrics_snapshot(&snap, ts->n_workers);
-            output_progress(ts->stream_idx, elapsed_s + 1, &snap);
+            output_progress(ts->flow_idx, elapsed_s + 1, &snap);
         }
 
         /* TTY progress print (only if no partial input buffered) */
@@ -138,7 +138,7 @@ traffic_gen_tick_stream(traffic_gen_state_t *ts)
                 metrics_snapshot_t snap;
                 metrics_snapshot(&snap, ts->n_workers);
                 printf("\r  [#%u %"PRIu64"/%us] %"PRIu64" pkts",
-                       ts->stream_idx,
+                       ts->flow_idx,
                        elapsed_s + 1, ts->duration_s,
                        snap.total.tx_pkts);
                 fflush(stdout);
@@ -151,44 +151,44 @@ traffic_gen_tick_stream(traffic_gen_state_t *ts)
 static void
 traffic_gen_tick(void)
 {
-    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_STREAMS; i++)
-        traffic_gen_tick_stream(&g_client_streams[i]);
+    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_FLOWS; i++)
+        traffic_gen_tick_flow(&g_client_flows[i]);
 }
 
 void
 mgmt_traffic_start(const traffic_gen_state_t *state)
 {
-    uint32_t si = state->stream_idx;
-    if (si >= TGEN_MAX_CLIENT_STREAMS)
+    uint32_t si = state->flow_idx;
+    if (si >= TGEN_MAX_CLIENT_FLOWS)
         return;
 
-    g_client_streams[si] = *state;
-    g_client_streams[si].active = true;
-    g_client_streams[si].start_tsc = rte_rdtsc();
-    g_client_streams[si].last_progress = rte_rdtsc();
+    g_client_flows[si] = *state;
+    g_client_flows[si].active = true;
+    g_client_flows[si].start_tsc = rte_rdtsc();
+    g_client_flows[si].last_progress = rte_rdtsc();
 
-    if (si >= g_client_stream_count)
-        g_client_stream_count = si + 1;
+    if (si >= g_client_flow_count)
+        g_client_flow_count = si + 1;
 }
 
 void
-mgmt_traffic_stop_stream(uint32_t stream_idx)
+mgmt_traffic_stop_flow(uint32_t flow_idx)
 {
-    if (stream_idx >= TGEN_MAX_CLIENT_STREAMS)
+    if (flow_idx >= TGEN_MAX_CLIENT_FLOWS)
         return;
 
-    traffic_gen_state_t *ts = &g_client_streams[stream_idx];
+    traffic_gen_state_t *ts = &g_client_flows[flow_idx];
     if (!ts->active)
         return;
 
     ts->active = false;
     ts->stop_tsc = rte_rdtsc(); /* record actual stop time */
 
-    /* Broadcast STOP_STREAM to workers for this specific stream */
+    /* Broadcast STOP_FLOW to workers for this specific flow */
     config_update_t cmd;
     memset(&cmd, 0, sizeof(cmd));
-    cmd.cmd = CFG_CMD_STOP_STREAM;
-    uint32_t si = stream_idx;
+    cmd.cmd = CFG_CMD_STOP_FLOW;
+    uint32_t si = flow_idx;
     memcpy(cmd.payload, &si, sizeof(si));
     tgen_ipc_broadcast(&cmd);
 
@@ -208,7 +208,7 @@ mgmt_traffic_stop_stream(uint32_t stream_idx)
     if (actual_s > (double)ts->duration_s)
         actual_s = (double)ts->duration_s;
 
-    printf("--- stream #%u stopped ---\n", stream_idx);
+    printf("--- flow #%u stopped ---\n", flow_idx);
 
     if (ts->reuse) {
         uint64_t total_bytes = snap.total.tcp_payload_tx;
@@ -241,9 +241,9 @@ mgmt_traffic_stop_stream(uint32_t stream_idx)
     puts(summary);
 
     /* Structured output */
-    output_result(stream_idx, ts->proto, actual_s, &snap);
+    output_result(flow_idx, ts->proto, actual_s, &snap);
 
-    /* NIC stats — only print if this is the last active stream */
+    /* NIC stats — only print if this is the last active flow */
     if (!client_any_active()) {
         struct rte_eth_stats nic;
         if (rte_eth_stats_get(ts->port_id, &nic) == 0) {
@@ -273,7 +273,7 @@ mgmt_traffic_stop_stream(uint32_t stream_idx)
         }
     }
 
-    /* --one: reset TCBs, stores, metrics if no other streams active */
+    /* --one: reset TCBs, stores, metrics if no other flows active */
     if (ts->one_shot && !client_any_active()) {
         config_update_t rcmd;
         memset(&rcmd, 0, sizeof(rcmd));
@@ -290,21 +290,21 @@ mgmt_traffic_stop_stream(uint32_t stream_idx)
 void
 mgmt_traffic_stop_all(void)
 {
-    /* Broadcast a blanket STOP_STREAM(all) first */
+    /* Broadcast a blanket STOP_FLOW(all) first */
     config_update_t cmd;
     memset(&cmd, 0, sizeof(cmd));
-    cmd.cmd = CFG_CMD_STOP_STREAM;
+    cmd.cmd = CFG_CMD_STOP_FLOW;
     uint32_t all = UINT32_MAX;
     memcpy(cmd.payload, &all, sizeof(all));
     tgen_ipc_broadcast(&cmd);
 
-    /* Now print summary for each stream that was active */
+    /* Now print summary for each flow that was active */
     bool any_was_active = false;
     uint64_t stop_tsc = rte_rdtsc();
     uint32_t last_n_workers = g_core_map.num_workers;
 
-    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_STREAMS; i++) {
-        traffic_gen_state_t *ts = &g_client_streams[i];
+    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_FLOWS; i++) {
+        traffic_gen_state_t *ts = &g_client_flows[i];
         if (!ts->active)
             continue;
         any_was_active = true;
@@ -330,7 +330,7 @@ mgmt_traffic_stop_all(void)
     }
 
     if (!any_was_active) {
-        printf("No active client streams.\n");
+        printf("No active client flows.\n");
         return;
     }
 
@@ -339,7 +339,7 @@ mgmt_traffic_stop_all(void)
     /* Aggregate stats */
     metrics_snapshot_t snap;
     metrics_snapshot(&snap, last_n_workers);
-    printf("\n--- traffic statistics (all streams) ---\n"
+    printf("\n--- traffic statistics (all flows) ---\n"
            "%"PRIu64" packets transmitted\n",
            snap.total.tx_pkts);
 

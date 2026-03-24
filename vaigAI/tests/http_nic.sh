@@ -232,7 +232,7 @@ vaigai_cmd() {
     fi
 
     # Request stats
-    printf 'stats\n' >&7
+    printf 'stat net\n' >&7
 
     local attempts=0
     local found=0

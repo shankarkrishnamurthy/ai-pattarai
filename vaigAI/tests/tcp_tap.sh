@@ -171,7 +171,7 @@ vaigai_cmd() {
     fi
 
     # Now request stats
-    printf 'stats\n' >&7
+    printf 'stat net\n' >&7
 
     # Wait for stats table to finish (last line of table is "Workers: N")
     local attempts=0

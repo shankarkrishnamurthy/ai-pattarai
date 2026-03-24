@@ -187,13 +187,13 @@ int tgen_worker_loop(void *arg)
             }
             if (cmd.cmd == CFG_CMD_START) {
                 tx_gen_config_t *gcfg = (tx_gen_config_t *)cmd.payload;
-                uint32_t si = gcfg->stream_idx;
-                if (si >= TGEN_MAX_CLIENT_STREAMS)
+                uint32_t si = gcfg->flow_idx;
+                if (si >= TGEN_MAX_CLIENT_FLOWS)
                     si = 0;
-                /* Only reset TCP state if this is the first active stream.
-                 * Subsequent streams share the connection space. */
+                /* Only reset TCP state if this is the first active flow.
+                 * Subsequent flows share the connection space. */
                 bool any_active = false;
-                for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++) {
+                for (uint32_t s = 0; s < TGEN_MAX_CLIENT_FLOWS; s++) {
                     if (s != si && ctx->tx_gen[s].active) {
                         any_active = true;
                         break;
@@ -221,7 +221,7 @@ int tgen_worker_loop(void *arg)
                 continue;
             }
             if (cmd.cmd == CFG_CMD_STOP) {
-                for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++)
+                for (uint32_t s = 0; s < TGEN_MAX_CLIENT_FLOWS; s++)
                     tx_gen_stop(&ctx->tx_gen[s]);
                 /* Also stop server listeners if serving */
                 if (g_srv_tables[ctx->worker_idx].serving) {
@@ -231,14 +231,14 @@ int tgen_worker_loop(void *arg)
                 tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
                 continue;
             }
-            if (cmd.cmd == CFG_CMD_STOP_STREAM) {
-                /* payload[0..3] = stream index, UINT32_MAX = stop all */
+            if (cmd.cmd == CFG_CMD_STOP_FLOW) {
+                /* payload[0..3] = flow index, UINT32_MAX = stop all */
                 uint32_t si;
                 memcpy(&si, cmd.payload, sizeof(si));
                 if (si == UINT32_MAX) {
-                    for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++)
+                    for (uint32_t s = 0; s < TGEN_MAX_CLIENT_FLOWS; s++)
                         tx_gen_stop(&ctx->tx_gen[s]);
-                } else if (si < TGEN_MAX_CLIENT_STREAMS) {
+                } else if (si < TGEN_MAX_CLIENT_FLOWS) {
                     tx_gen_stop(&ctx->tx_gen[si]);
                 }
                 tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
@@ -254,7 +254,7 @@ int tgen_worker_loop(void *arg)
             if (cmd.cmd == CFG_CMD_SET_RATE) {
                 uint64_t new_rate;
                 memcpy(&new_rate, cmd.payload, sizeof(new_rate));
-                for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++)
+                for (uint32_t s = 0; s < TGEN_MAX_CLIENT_FLOWS; s++)
                     ctx->tx_gen[s].cfg.rate_pps = new_rate;
                 tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
                 continue;
@@ -331,7 +331,7 @@ int tgen_worker_loop(void *arg)
          * TX (echo, HTTP response, chargen) is handled inline by
          * srv_on_data() / srv_on_established() from tcp_fsm_input(). */
         if (!g_srv_tables[ctx->worker_idx].serving) {
-            for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++) {
+            for (uint32_t s = 0; s < TGEN_MAX_CLIENT_FLOWS; s++) {
                 if (ctx->tx_gen[s].active)
                     tx_gen_burst(&ctx->tx_gen[s], ctx->mempool,
                                  ctx->worker_idx);
@@ -358,7 +358,7 @@ int tgen_worker_loop(void *arg)
         cstats->cycles_timer += (t4 - t3);
         cstats->cycles_total += (t4 - t0);
         bool any_gen_active = false;
-        for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++) {
+        for (uint32_t s = 0; s < TGEN_MAX_CLIENT_FLOWS; s++) {
             if (ctx->tx_gen[s].active) { any_gen_active = true; break; }
         }
         if (nb_rx_total == 0 && !any_gen_active)

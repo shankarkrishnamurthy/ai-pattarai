@@ -147,6 +147,21 @@ typedef struct {
      * transaction (--one flag).  Set by tx_gen when max_initiations > 0. */
     bool        graceful_close;
 
+    /* DSCP/QoS marking: TOS byte = dscp << 2 */
+    uint8_t     dscp;
+
+    /* 802.1Q VLAN tag (0 = untagged) */
+    uint16_t    vlan_id;
+
+    /* Congestion control algorithm: 0=NewReno, 1=CUBIC */
+    uint8_t     cc_algo;
+
+    /* CUBIC congestion control state (RFC 8312) */
+    uint32_t    cubic_wmax;          /* W_max at last loss event (bytes) */
+    uint64_t    cubic_epoch_start;   /* TSC when congestion epoch began  */
+    uint32_t    cubic_origin_point;  /* cwnd at epoch start              */
+    uint32_t    cubic_k_us;          /* time to reach W_max (µs)         */
+
     /* TCP send buffer (lazily allocated for retransmission + queuing).
      * NULL when no buffered data; allocated on first tcp_fsm_send(). */
     struct tcp_snd_buf_s *snd_buf;

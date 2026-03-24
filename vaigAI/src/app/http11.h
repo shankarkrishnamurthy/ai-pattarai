@@ -40,6 +40,7 @@ typedef struct {
     const uint8_t *body;         /**< request body (may be NULL)          */
     uint32_t       body_len;
     bool           keep_alive;   /**< Connection: keep-alive              */
+    const char    *extra_headers;/**< pre-formatted "Name: Val\r\n..." or NULL */
 } http_request_t;
 
 /* ------------------------------------------------------------------ */

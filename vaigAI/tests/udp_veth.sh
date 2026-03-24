@@ -196,7 +196,7 @@ if [[ $FLOOD_MODE -eq 1 ]]; then
     OUTPUT=$({ printf 'start --proto udp --ip %s --duration %d --size %d --port %d\n' \
                    "$PEER_IP" "$FLOOD_SECONDS" "$PKT_SIZE" "$DST_PORT"
                sleep $(( FLOOD_SECONDS + 1 ))
-               printf 'stats\nquit\n'; } \
+               printf 'stat net\nquit\n'; } \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
                    --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
@@ -205,7 +205,7 @@ else
     OUTPUT=$({ printf 'start --proto udp --ip %s --duration 1 --rate 1000 --size %d --port %d\n' \
                    "$PEER_IP" "$PKT_SIZE" "$DST_PORT"
                sleep 2
-               printf 'stats\nquit\n'; } \
+               printf 'stat net\nquit\n'; } \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
                    --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true

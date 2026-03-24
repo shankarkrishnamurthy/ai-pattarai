@@ -157,7 +157,7 @@ vaigai_cmd() {
         sleep 3
     fi
 
-    printf 'stats\n' >&7
+    printf 'stat net\n' >&7
 
     local attempts=0
     local found=0
@@ -494,7 +494,7 @@ run_t2() {
 
     # Use arping reply count as primary assertion (direct network evidence).
     # Also check vaigai's ARP reply TX counter from the stats table.
-    printf 'stats\n' >&7
+    printf 'stat net\n' >&7
     local attempts=0
     local found=0
     while [[ $found -eq 0 ]]; do

@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: BSD-3-Clause
- * vaigAI: TCP congestion control — New Reno (§3.5, RFC 5681).
+ * vaigAI: TCP congestion control — New Reno (RFC 5681) + CUBIC (RFC 8312).
  */
 #ifndef TGEN_TCP_CONGESTION_H
 #define TGEN_TCP_CONGESTION_H
@@ -10,6 +10,10 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ── CC algorithm identifiers ────────────────────────────────────────────── */
+#define CC_NEWRENO  0
+#define CC_CUBIC    1
 
 /** Called when a new ACK advances snd_una by 'acked' bytes. */
 void congestion_on_ack(tcb_t *tcb, uint32_t acked);

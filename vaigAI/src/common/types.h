@@ -53,7 +53,7 @@
 #define TGEN_OOO_QUEUE_SZ       8
 #define TGEN_TEMPLATE_MAX_SZ    (64 * 1024)
 #define TGEN_IFNAMESIZ          16
-#define TGEN_MAX_CLIENT_STREAMS 16    /* concurrent client traffic streams */
+#define TGEN_MAX_CLIENT_FLOWS   16    /* concurrent client traffic flows */
 #define CACHE_LINE_SIZE         64
 
 /* ── IPv4 helpers ─────────────────────────────────────────────────────────── */

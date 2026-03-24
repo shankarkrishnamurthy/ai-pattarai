@@ -369,7 +369,7 @@ vaigai_cmd() {
         return 1
     fi
 
-    printf 'stats\n' >&7 2>/dev/null || { warn "vaigai pipe broken on stats"; OUTPUT=""; return 1; }
+    printf 'stat net\n' >&7 2>/dev/null || { warn "vaigai pipe broken on stats"; OUTPUT=""; return 1; }
 
     local attempts=0 found=0
     while [[ $found -eq 0 ]]; do

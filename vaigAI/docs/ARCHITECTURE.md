@@ -92,7 +92,7 @@ src/
 │   │                          #   TAP PMD l2_len offload, flow-controlled send
 │   ├── tcp_options.h/c        # MSS, WScale, SACK-Permitted, Timestamps
 │   ├── tcp_timer.h/c          # RTO retransmit (RFC 6298), TIME_WAIT expiry, delayed ACK
-│   ├── tcp_congestion.h/c     # New Reno congestion control (RFC 5681)
+│   ├── tcp_congestion.h/c     # Congestion control: New Reno (RFC 5681) + CUBIC (RFC 8312)
 │   ├── tcp_port_pool.h/c      # Ephemeral port bitmap [10000–59999] + reset API
 │   └── tcp_checksum.h         # HW/SW checksum inline helpers
 │
@@ -103,7 +103,7 @@ src/
 │   └── cryptodev.h/c          # DPDK Cryptodev AES-GCM offload
 │
 ├── app/                       ── Application layer ──
-│   ├── http11.h/c             # HTTP/1.1 request builder + response parser
+│   ├── http11.h/c             # HTTP/1.1 request builder + response parser (custom headers)
 │   └── server.h/c             # Server mode: listener table, handler dispatch
 │
 ├── mgmt/                      ── Management plane ──
@@ -281,7 +281,7 @@ Mempool allocation uses a 3-tier NUMA fallback: worker's socket with 1 GB pages 
 | `TGEN_DEFAULT_RX/TX_DESC` | 2048 | Ring descriptor count |
 | `TGEN_MBUF_DATA_SZ` | 2176 | mbuf data room (2048+128) |
 | `TGEN_ARP_CACHE_SZ` | 1024 | ARP hash entries |
-| `TGEN_MAX_CLIENT_STREAMS` | 16 | Concurrent client traffic streams |
+| `TGEN_MAX_CLIENT_FLOWS` | 16 | Concurrent client traffic flows |
 | `TGEN_TIMEWAIT_DEFAULT_MS` | 4000 | TIME_WAIT duration |
 
 ---
@@ -415,7 +415,7 @@ addressing (`ff02::1:ffXX:XXXX`).
 | 8    | `rte_eth_tx_burst()`         | *(DPDK)*            | Worker   |
 
 **Notes:**
-- `tcp_send_segment()` sets `m->l2_len = sizeof(struct rte_ether_hdr)` so the TAP PMD can compute L4 checksums via `RTE_MBUF_F_TX_TCP_CKSUM`.
+- `tcp_send_segment()` sets `m->l2_len` to the L2 header size (14 bytes, or 18 with 802.1Q VLAN tag) so the TAP PMD can compute L4 checksums via `RTE_MBUF_F_TX_TCP_CKSUM`.
 - FIN_WAIT_1 and FIN_WAIT_2 accept incoming data (half-open receive) — required for echo servers that flush buffered data after receiving FIN.
 - RST processing is skipped for TIME_WAIT and already-freed TCBs to avoid spurious `reset_rx` counts.
 - **CLOSE_WAIT auto-close:** When a peer sends FIN while in ESTABLISHED, the FSM transitions to CLOSE_WAIT, ACKs the FIN, and immediately calls `tcp_fsm_close()` to send our own FIN (→ LAST_ACK). The traffic generator has no pending data, so lingering in CLOSE_WAIT is unnecessary.
@@ -425,19 +425,19 @@ addressing (`ff02::1:ffXX:XXXX`).
 ### 2.2 Transmit Path — TX Generation Engine
 
 The TX generator produces synthetic traffic from worker cores, controlled by the
-management plane via IPC. Up to **16 concurrent client streams** can run
+management plane via IPC. Up to **16 concurrent client flows** can run
 simultaneously, each targeting a different destination/port/protocol. Each
-`start` command allocates a stream slot in `g_client_streams[]` (mgmt side)
-and `ctx->tx_gen[]` (per-worker side), identified by `stream_idx`.
+`start` command allocates a flow slot in `g_client_flows[]` (mgmt side)
+and `ctx->tx_gen[]` (per-worker side), identified by `flow_idx`.
 
 ```
   CLI: "start --proto udp --ip 10.0.0.1 --duration 3 --rate 1000 --size 64 --port 9"
        │
        ▼
   cmd_start()                                         ── mgmt core ──
-  ├── Find free slot in g_client_streams[0..15]
+  ├── Find free slot in g_client_flows[0..15]
   ├── ARP-resolve destination MAC (3 s timeout)
-  ├── Build tx_gen_config_t (includes stream_idx)
+  ├── Build tx_gen_config_t (includes flow_idx)
   ├── metrics_reset() (first stream only)
   └── tgen_ipc_broadcast(CFG_CMD_START, config)
        │
@@ -449,7 +449,7 @@ and `ctx->tx_gen[]` (per-worker side), identified by `stream_idx`.
                      │
                      ▼
   tgen_worker_loop → tgen_ipc_recv()                  ── worker core ──
-  ├── si = cfg.stream_idx
+  ├── si = cfg.flow_idx
   ├── tx_gen_configure(&ctx->tx_gen[si], &cfg)
   └── tx_gen_start(&ctx->tx_gen[si])
        │
@@ -465,11 +465,16 @@ and `ctx->tx_gen[]` (per-worker side), identified by `stream_idx`.
   │     tokens = min(tokens + new, 32)         │
   │     (rate_pps=0 → unlimited, always 32)    │
   │                                            │
-  │  3. Build packets:                         │
+  │  3. Source IP pool (if src_ip_count > 1):    │
+  │     cur_src_ip = src_ip + (idx++ % count)  │
+  │                                            │
+  │  4. Build packets:                         │
   │     for i in 0..to_send:                   │
   │       build_packet() → protocol dispatch   │
   │         ├─ ICMP → build_icmp_echo()        │
   │         └─ UDP  → build_udp_datagram()     │
+  │       apply DSCP → ip.tos = dscp << 2      │
+  │       apply VLAN → 802.1Q tag if vlan_id   │
   │                                            │
   │  NOTE: TCP data is NOT sent via tx_gen.    │
   │  TCP connections are FSM-driven:           │
@@ -538,7 +543,7 @@ Every worker lcore runs a tight, non-blocking loop:
       └─────────────────────────────────────────────────┘
                             │
       ┌─ Step 3 ─── TX Generation ──────────────────────┐
-      │  for s in 0..TGEN_MAX_CLIENT_STREAMS:           │
+      │  for s in 0..TGEN_MAX_CLIENT_FLOWS:             │
       │    if (ctx->tx_gen[s].active):                   │
       │      tx_gen_burst(&ctx->tx_gen[s], mempool, w)  │
       └─────────────────────────────────────────────────┘
@@ -709,6 +714,7 @@ calls `tcp_fsm_connect()` + `tcp_fsm_send()` on behalf of CLI commands like
 **Key design decisions:**
 - `snd_nxt` only advances on successful `rte_eth_tx_burst()` return.
 - Initial cwnd = 10 × MSS (RFC 6928 IW10), matching `tcp_fsm_connect()`.
+- **Congestion control algorithms:** New Reno (RFC 5681, default) and CUBIC (RFC 8312). Selected per-connection via `--cc newreno|cubic`. CUBIC uses `W_cubic(t) = C*(t-K)³ + W_max` with `C=0.4`, `β=0.7`, and a TCP-friendly fallback estimate. Per-TCB state: `cubic_wmax`, `cubic_epoch_start`, `cubic_origin_point`, `cubic_k_us`.
 - RTO armed once per flight; restarted on ACK with unacked data; disarmed on full ACK.
 - Send buffer (`snd_buf[]`) enables RTO-driven and fast retransmit of lost segments. RTO uses go-back-N: `snd_nxt` is reset to `snd_una`, then `snd_buf_drain()` retransmits within the new 1×MSS cwnd. Cumulative ACK clamping ensures `snd_nxt >= snd_una` after OOO data fills gaps.
 - FIN_WAIT_1/2 states accept incoming data (half-open receive) for compatibility with echo servers.
@@ -1004,7 +1010,7 @@ cmd_serve()    → serve event (listener config)
          ↓
 traffic_gen_tick() → progress events (1/s)
          ↓
-mgmt_traffic_stop_stream() → result event (all metrics + latency + per-worker)
+mgmt_traffic_stop_flow() → result event (all metrics + latency + per-worker)
          ↓
 tgen_cleanup() → end event
 ```
@@ -1126,7 +1132,7 @@ same structural pattern, different payloads. Neither loop may ever block.
 |------|----------|------|-------------|
 | W➊ | `ipc_recv()` | Worker | Receive CMD from mgmt; send ACK |
 | W➋ | `rte_eth_rx_burst()` / `classify_and_process()` | Worker | RX 32 mbufs, run protocol FSMs, enqueue ARP/ICMP to mgmt ring |
-| W➌ | `tx_gen_burst()` | Worker | Token-bucket paced packet generation per stream (up to 16) |
+| W➌ | `tx_gen_burst()` | Worker | Token-bucket paced packet generation per flow (up to 16) |
 | W➍ | `tcp_timer_tick()` | Worker | RTO retransmit, TIME_WAIT expiry, delayed ACK |
 | W➎ | `tcp_port_pool_tick()` | Worker | Drain TIME_WAIT FIFO, reclaim ephemeral ports |
 | W➏ | `cpu_accounting()` / `rte_pause()` | Worker | TSC cycle accounting; always spins |
@@ -1170,10 +1176,10 @@ Commands flow from management to workers via `config_update_t` messages (256 byt
 
 | Command            | Payload                | Effect on Worker                          |
 |--------------------|------------------------|-------------------------------------------|
-| `CFG_CMD_START`    | `tx_gen_config_t`      | Configure and start TX generator (stream slot in payload) |
-| `CFG_CMD_STOP`     | *(none)*               | Stop all TX generator streams             |
-| `CFG_CMD_STOP_STREAM` | `stream_idx` (u32)  | Stop one client stream (or all if `UINT32_MAX`) |
-| `CFG_CMD_SET_RATE` | rate value             | Adjust token bucket rate (all streams)    |
+| `CFG_CMD_START`    | `tx_gen_config_t`      | Configure and start TX generator (flow slot in payload; includes dscp, vlan_id, cc_algo, src_ip_count) |
+| `CFG_CMD_STOP`     | *(none)*               | Stop all TX generator flows               |
+| `CFG_CMD_STOP_FLOW` | `flow_idx` (u32)  | Stop one client flow (or all if `UINT32_MAX`) |
+| `CFG_CMD_SET_RATE` | rate value             | Adjust token bucket rate (all flows)      |
 | `CFG_CMD_SET_PROFILE` | `flow_cfg_t`        | Update flow profile                       |
 | `CFG_CMD_SHUTDOWN` | *(none)*               | Exit worker loop                          |
 | `CFG_CMD_SERVE`    | `srv_listener_cfg_t`   | Add listener to per-worker server table   |
@@ -1196,15 +1202,14 @@ vaigai> help
 |---------|--------|-------------|
 | `help` | `help` | List available commands |
 | `stat` | `stat [cpu\|mem\|net\|port] [--rate] [--core N]` | Unified statistics (see CLI.md) |
-| `stats` | `stats` | Alias for `stat net` (backward compat) |
 | `ping` | `ping <ip> [count] [size] [interval_ms]` | ICMP/ICMPv6 echo request (auto-detects IPv6) |
-| `start` | `start --proto <proto> --ip <ip> --duration <s> [--rate <pps>] [--size <bytes>] [--port <port>] [--tls] [--reuse] [--streams <n>]` | Start traffic generation (up to 16 concurrent streams) |
-| `stop` | `stop [<id>\|all]` | Stop client stream(s) or server listener(s) |
+| `start` | `start --proto <proto> --ip <ip> --duration <s> [--rate <pps>] [--size <bytes>] [--port <port>] [--tls] [--reuse] [--streams <n>] [--dscp <0-63>] [--vlan <id>] [--cc newreno\|cubic] [--src-ip-count <N>] [--header "K: V"]` | Start traffic generation (up to 16 concurrent flows) |
+| `stop` | `stop [<id>\|all]` | Stop client flow(s) or server listener(s) |
 | `reset` | `reset` | RST all TCBs, reset port pools + metrics |
 | `trace` | `trace start <file.pcapng> [port] [queue]` | Start packet capture |
 | | `trace stop` | Stop capture |
 | `show` | `show interface [port_id]` | Show DPDK interface details |
-|        | `show clients` | Show active client streams (client mode) |
+|        | `show flows` | Show active client flows (client mode) |
 |        | `show listeners` | Show active listeners (server mode) |
 |        | `show connections` | Show per-worker TCB count (server mode) |
 | `serve` | `serve --listen <spec> [--listen ...] [opts]` | Configure and start listeners (server mode) |
@@ -1363,8 +1368,8 @@ safe without mutual exclusion in the fast path:
 | `g_ack_rings[w]` | Worker `w` | Mgmt | SPSC `rte_ring` |
 | `g_run` | Signal handler | All | `volatile int` — process lifecycle |
 | `g_traffic` | REST API | Workers | `volatile int` — traffic pause/resume |
-| `g_client_streams[s]` | Mgmt | Mgmt | Per-stream traffic gen state (16 slots) |
-| `g_worker_ctx[w].tx_gen[s]` | Worker `w` | Worker `w` | Per-stream TX gen (16 slots, configured via IPC) |
+| `g_client_flows[s]` | Mgmt | Mgmt | Per-flow traffic gen state (16 slots) |
+| `g_worker_ctx[w].tx_gen[s]` | Worker `w` | Worker `w` | Per-flow TX gen (16 slots, configured via IPC) |
 
 ---
 

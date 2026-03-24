@@ -115,10 +115,10 @@ both interactive and non-interactive (FIFO/pipe) modes.
 | `config` | startup | workers, ports, src_ip, server_mode, tls_enabled |
 | `port` | startup | port_id, driver, mac, link_speed, rss |
 | `cmd` | each CLI command | input |
-| `start` | traffic start | stream_idx, proto, dst_ip, dst_port, duration, rate |
+| `start` | traffic start | flow_idx, proto, dst_ip, dst_port, duration, rate |
 | `serve` | server start | listeners, ciphers |
-| `progress` | every 1s | stream_idx, elapsed_s, tx_pkts, rx_pkts |
-| `result` | stream stop | stream_idx, status, actual_duration_s, metrics, latency, per_worker |
+| `progress` | every 1s | flow_idx, elapsed_s, tx_pkts, rx_pkts |
+| `result` | flow stop | flow_idx, status, actual_duration_s, metrics, latency, per_worker |
 | `error` | on error/warning | severity, module, message |
 | `end` | shutdown | exit_code, uptime_s |
 
@@ -198,12 +198,12 @@ vaigai> ping fd00::2 10 128 500          # ICMPv6 with options
 ## start
 
 Start traffic generation toward a destination.  `start` can be called
-multiple times to run **concurrent client streams** to different
-ports/endpoints.  Each stream gets a unique ID shown as `[#N]` and is
+multiple times to run **concurrent client flows** to different
+ports/endpoints.  Each flow gets a unique ID shown as `[#N]` and is
 independently stoppable with `stop <N>`.
 
 In interactive mode (TTY), the command returns immediately and traffic
-runs in the background.  Use `show clients` to monitor all streams and
+runs in the background.  Use `show flows` to monitor all flows and
 `stop` or `stop <N>` to abort.  In pipe mode (stdin is not a TTY),
 `start` blocks until the traffic duration completes for backward
 compatibility with scripts.
@@ -228,11 +228,16 @@ start --ip <addr> --port <N> --duration <secs> [options]
 | `--rate`      | 0       | Rate limit in packets/sec (0 = unlimited). Mutually exclusive with `--one`. |
 | `--one`       | off     | Send exactly one request/handshake/connection and stop. Mutually exclusive with `--duration` and `--rate`. For HTTP/HTTPS, vaigai performs a passive close — waits for the server to send its FIN after the full response body, mirroring `curl` behaviour. If the server has a stale connection on the chosen ephemeral port (challenge ACK, RFC 5961 §4), vaigai fails fast (< 1 RTT) and the next invocation automatically uses the next ephemeral port. |
 | `--size`      | 56      | Payload size in bytes                         |
-| `--streams`   | 1       | Number of concurrent streams (max 16)         |
+| `--streams`   | 1       | TCP connections for throughput mode (max 16)   |
 | `--reuse`     | off     | Enable connection reuse (throughput mode)     |
 | `--url`       | `/`     | HTTP request path                             |
 | `--host`      | `--ip`  | HTTP Host header value                        |
 | `--tls`       | off     | Enable TLS encryption                         |
+| `--dscp`      | 0       | DSCP value (0–63), mapped to IPv4 TOS / IPv6 TC |
+| `--vlan`      | 0       | 802.1Q VLAN ID (1–4094); 0 = no VLAN tag      |
+| `--cc`        | `newreno` | TCP congestion control algorithm: `newreno` or `cubic` |
+| `--src-ip-count` | 1    | Number of consecutive source IPs from `--src-ip` for round-robin cycling |
+| `--header`    | —       | Custom HTTP header (`"Name: Value"`), repeatable. Requires `--proto http` or `https`. |
 
 ### Examples
 
@@ -243,7 +248,7 @@ vaigai> start --ip 10.0.0.2 --port 5000 --duration 10
 # HTTP GET at 100 req/s for 5 seconds
 vaigai> start --ip 10.0.0.2 --port 80 --proto http --duration 5 --rate 100
 
-# HTTPS throughput test with 4 streams
+# HTTPS throughput test with 4 TCP connections
 vaigai> start --ip 10.0.0.2 --port 443 --proto https --duration 30 --reuse --streams 4
 
 # UDP flood with 1024-byte packets
@@ -261,13 +266,29 @@ vaigai> start --ip 10.0.0.2 --port 4433 --proto tls --one
 # Single HTTPS request
 vaigai> start --ip 10.0.0.2 --port 443 --proto https --one --url /
 
-# Concurrent streams to different ports
+# DSCP EF marking (voice traffic)
+vaigai> start --ip 10.0.0.2 --port 5000 --duration 10 --dscp 46
+
+# 802.1Q VLAN tagging
+vaigai> start --ip 10.0.0.2 --port 80 --proto http --duration 5 --vlan 100
+
+# CUBIC congestion control
+vaigai> start --ip 10.0.0.2 --port 5000 --duration 30 --reuse --cc cubic
+
+# Multiple source IPs (avoid port exhaustion)
+vaigai> start --ip 10.0.0.2 --port 80 --proto http --duration 60 --src-ip-count 16
+
+# Custom HTTP headers
+vaigai> start --ip 10.0.0.2 --port 80 --proto http --duration 5 --header "X-Request-ID: test123"
+vaigai> start --ip 10.0.0.2 --port 80 --proto http --duration 5 --header "User-Agent: vaigai/1.0" --header "X-Custom: value"
+
+# Concurrent flows to different ports
 vaigai> start --ip 10.0.0.2 --port 5000 --duration 10
 [#0] Traffic tcp → 10.0.0.2:5000 ...
 vaigai> start --ip 10.0.0.2 --port 80 --proto http --duration 10 --cps 1000
 [#1] Traffic http → 10.0.0.2:80 ...
-vaigai> show clients
-vaigai> stop 0          # stop stream #0
+vaigai> show flows
+vaigai> stop 0          # stop flow #0
 vaigai> stop            # stop all
 ```
 
@@ -321,20 +342,20 @@ vaigai(server)> serve --listen https:443 --tls-cert cert.pem --tls-key key.pem \
 
 ## stop
 
-Stop active client streams or server listeners.
+Stop active client flows or server listeners.
 
 ### Client mode
 
 ```
-vaigai> stop              # stop all active client streams
-vaigai> stop <id>         # stop a specific stream by ID (from "show clients")
+vaigai> stop              # stop all active client flows
+vaigai> stop <id>         # stop a specific flow by ID (from "show flows")
 vaigai> stop all          # explicit stop-all
 ```
 
-Each `start` command creates a numbered client stream. Use `show clients` to
-see running streams and their IDs. Stopping a stream prints its per-stream
+Each `start` command creates a numbered client flow. Use `show flows` to
+see running flows and their IDs. Stopping a flow prints its per-flow
 summary (elapsed time, protocol, destination). Aggregate NIC and per-worker
-stats are printed when the last active stream is stopped.
+stats are printed when the last active flow is stopped.
 
 ### Server mode
 
@@ -462,10 +483,6 @@ Port  Driver     Link       RX pkts     RX bytes   RX miss  RX err
 vaigai> stat port --rate          # live pps and Mbps per port
 ```
 
-### Backward Compatibility
-
-The old `stats` command continues to work as an alias for `stat net`.
-
 ---
 
 ## Remote CLI Attach
@@ -583,22 +600,22 @@ Server mode only. Show per-worker active TCB count.
 vaigai(server)> show connections
 ```
 
-### show clients
+### show flows
 
-Client mode only. Show all active client traffic streams.
+Client mode only. Show all active client traffic flows.
 
-Output columns: `#` (stream ID), `PROTO`, `DESTINATION`, `PORT`, `DURATION`,
+Output columns: `#` (flow ID), `PROTO`, `DESTINATION`, `PORT`, `DURATION`,
 `ELAPSED`, `STATE`.
 
 ```
-vaigai> show clients
+vaigai> show flows
 #   PROTO   DESTINATION      PORT   DURATION  ELAPSED   STATE
 0   tcp     10.0.0.2         5000   30s       12.4s     ACTIVE
 1   udp     10.0.0.3         9000   60s       8.1s      ACTIVE
 2   http    10.0.0.2         80     10s       10.0s     DONE
 ```
 
-The stream `#` can be passed to `stop <id>` to stop a specific stream.
+The flow `#` can be passed to `stop <id>` to stop a specific flow.
 
 ---
 

@@ -55,7 +55,11 @@ typedef struct {
     uint32_t              think_time_us;/* think time between txns in µs  */
     char                  http_url[64]; /* URL path for HTTP TPS         */
     char                  http_host[64];/* Host: header for HTTP TPS    */
-    uint32_t              stream_idx;   /* client stream slot (0-15)     */
+    uint32_t              flow_idx;     /* client flow slot (0-15)       */
+    uint8_t               dscp;         /* DSCP value (0-63), shifted to TOS */
+    uint8_t               cc_algo;      /* 0=NewReno, 1=CUBIC           */
+    uint16_t              vlan_id;      /* 802.1Q VLAN ID (0=none)       */
+    uint32_t              src_ip_count; /* IP range: #IPs from src_ip (0/1=single) */
 } tx_gen_config_t;
 
 _Static_assert(sizeof(tx_gen_config_t) <= 248,
@@ -89,11 +93,14 @@ typedef struct {
     void           *tp_tcbs[16];        /* active throughput TCBs       */
     uint32_t        tp_n_streams;       /* number of streams allocated  */
     uint8_t         tp_phase;           /* 0=connect, 1=pump, 2=done   */
+
+    /* IP range pool: round-robin index for src_ip cycling */
+    uint32_t        ip_pool_idx;
 } tx_gen_state_t;
 
 /* ── Pre-built HTTP request (one per worker, reused across connections) ──── */
 typedef struct {
-    uint8_t  hdr[512];
+    uint8_t  hdr[1024];
     uint32_t hdr_len;
     bool     keep_alive;          /* recycle: state 4→5→4 loop */
     uint32_t txn_per_conn;        /* max transactions per conn (0 = 1 shot) */
@@ -102,6 +109,7 @@ typedef struct {
 } http_prebuilt_req_t;
 
 extern http_prebuilt_req_t g_http_req[TGEN_MAX_WORKERS];
+extern char g_http_custom_hdrs[TGEN_MAX_CLIENT_FLOWS][512];
 
 /* ── API ──────────────────────────────────────────────────────────────────── */
 

@@ -31,8 +31,8 @@ typedef struct {
     uint32_t num_ports;
     /* Mempool */
     struct rte_mempool *mempool;
-    /* TX generator state — one slot per concurrent client stream */
-    tx_gen_state_t tx_gen[TGEN_MAX_CLIENT_STREAMS];
+    /* TX generator state — one slot per concurrent client flow */
+    tx_gen_state_t tx_gen[TGEN_MAX_CLIENT_FLOWS];
 } worker_ctx_t;
 
 /** Array of worker contexts, indexed by worker index. */
