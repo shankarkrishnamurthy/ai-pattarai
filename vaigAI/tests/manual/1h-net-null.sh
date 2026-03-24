@@ -51,16 +51,19 @@ Usage: $(basename "$0") [--server | --vaigai | --cleanup]
   --server    No-op: net_null needs no external server
   --vaigai    Start vaigai with net_null (interactive)
   --cleanup   Remove hugepage files
+  --dryrun    Show commands without executing them (combine with --server/--vaigai/--cleanup)
 EOF
 }
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 MODE=""
+DRYRUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server)  MODE="server" ;;
         --vaigai)  MODE="vaigai" ;;
         --cleanup) MODE="cleanup" ;;
+        --dryrun)  DRYRUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -68,8 +71,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Pre-flight checks ────────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
-if [[ "$MODE" == "vaigai" || -z "$MODE" ]]; then
+[[ $EUID -ne 0 ]] && (( ! DRYRUN )) && { err "Must run as root"; exit 1; }
+if [[ "$MODE" == "vaigai" || -z "$MODE" ]] && (( ! DRYRUN )); then
     [[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
 fi
 
@@ -137,20 +140,46 @@ start_tgen() {
     "$VAIGAI_BIN" -l 0-1 --no-pci --vdev "net_null0" -- -I "$VAIGAI_IP"
 }
 
+# ── Dryrun ─────────────────────────────────────────────────────────────────────
+dryrun_server() {
+    info "[DRYRUN] --server would run:"
+    echo "  # net_null needs no external server — this is a no-op"
+}
+
+dryrun_tgen() {
+    info "[DRYRUN] --vaigai would run:"
+    cat <<EOF
+  # Hugepages
+  echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+  # Start vaigai with net_null benchmark
+  $VAIGAI_BIN -l 0-1 --no-pci --vdev "net_null0" -- -I $VAIGAI_IP
+EOF
+}
+
+dryrun_cleanup() {
+    info "[DRYRUN] --cleanup would run:"
+    echo "  rm -f /dev/hugepages/vaigai_*"
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 case "$MODE" in
     server)
+        if (( DRYRUN )); then dryrun_server; exit 0; fi
         setup_hugepages
         start_server
         ;;
     vaigai)
+        if (( DRYRUN )); then dryrun_tgen; exit 0; fi
         setup_hugepages
         start_tgen
         ;;
     cleanup)
+        if (( DRYRUN )); then dryrun_cleanup; exit 0; fi
         do_cleanup
         ;;
     "")
+        if (( DRYRUN )); then dryrun_server; echo ""; dryrun_tgen; exit 0; fi
         setup_hugepages
         start_server
         start_tgen

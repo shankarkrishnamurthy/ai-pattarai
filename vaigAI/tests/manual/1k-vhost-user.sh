@@ -57,16 +57,19 @@ Usage: $(basename "$0") [--server | --vaigai | --cleanup]
   --vaigai    Start vaigai net_vhost server (interactive, creates socket)
   --server    Start QEMU VM (connects to vaigai's socket — run after --vaigai)
   --cleanup   Clean up all resources
+  --dryrun    Show commands without executing them (combine with --server/--vaigai/--cleanup)
 EOF
 }
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 MODE=""
+DRYRUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server)  MODE="server" ;;
         --vaigai)  MODE="vaigai" ;;
         --cleanup) MODE="cleanup" ;;
+        --dryrun)  DRYRUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -74,8 +77,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Pre-flight checks ────────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
-if [[ "$MODE" == "vaigai" || -z "$MODE" ]]; then
+[[ $EUID -ne 0 ]] && (( ! DRYRUN )) && { err "Must run as root"; exit 1; }
+if [[ "$MODE" == "vaigai" || -z "$MODE" ]] && (( ! DRYRUN )); then
     [[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
     if ! find /usr/local/lib* -name "librte_net_vhost.so*" 2>/dev/null | grep -q .; then
         err "net_vhost PMD not found — rebuild DPDK with net/vhost driver:"
@@ -85,7 +88,7 @@ if [[ "$MODE" == "vaigai" || -z "$MODE" ]]; then
         exit 1
     fi
 fi
-if [[ "$MODE" == "server" || -z "$MODE" ]]; then
+if [[ "$MODE" == "server" || -z "$MODE" ]] && (( ! DRYRUN )); then
     command -v qemu-system-x86_64 >/dev/null 2>&1 || { err "qemu-system-x86_64 not found — dnf install -y qemu-kvm"; exit 1; }
     VMLINUX="${VMLINUX:-/work/firecracker/vmlinux}"
     ROOTFS="${ROOTFS:-/work/firecracker/alpine.ext4}"
@@ -275,9 +278,50 @@ EOF
     wait "$VAIGAI_PID" 2>/dev/null || true
 }
 
+# ── Dryrun ────────────────────────────────────────────────────────────────────
+dryrun_server() {
+    info "[DRYRUN] Server commands that would be run:"
+    cat <<EOF
+  # Wait for vaigai to create $VHOST_SOCK
+  cp --reflink=auto $ROOTFS $ROOTFS_COW
+  setsid qemu-system-x86_64 \\
+      -machine microvm,accel=kvm,pic=off,pit=off \\
+      -cpu host -m 256M -smp 1 -no-reboot -nographic \\
+      -object memory-backend-memfd,id=mem,size=256M,share=on \\
+      -numa node,memdev=mem \\
+      -kernel $VMLINUX \\
+      -drive "id=rootfs,file=$ROOTFS_COW,format=raw,if=none" \\
+      -device virtio-blk-device,drive=rootfs \\
+      -chardev "socket,id=vhost0,path=$VHOST_SOCK" \\
+      -netdev "vhost-user,id=nd0,chardev=vhost0" \\
+      -device "virtio-net-device,netdev=nd0,mac=52:54:00:12:34:57" \\
+      -append "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw quiet vaigai_mode=all ip=$SERVER_IP::$VAIGAI_IP:255.255.255.0::eth0:off"
+EOF
+}
+
+dryrun_tgen() {
+    info "[DRYRUN] vaigai commands that would be run:"
+    cat <<EOF
+  $VAIGAI_BIN -l 0-1 --no-pci \\
+      --vdev "net_vhost0,iface=$VHOST_SOCK,queues=1,client=0" \\
+      -- -I $VAIGAI_IP
+EOF
+}
+
+dryrun_cleanup() {
+    info "[DRYRUN] Cleanup commands that would be run:"
+    cat <<EOF
+  stop_pidfile $STATE_DIR/qemu.pid
+  echo "quit" | $VAIGAI_BIN --attach
+  stop_pidfile $STATE_DIR/vaigai.pid
+  rm -rf $STATE_DIR
+EOF
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 case "$MODE" in
     server)
+        if (( DRYRUN )); then dryrun_server; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_server
@@ -286,13 +330,16 @@ case "$MODE" in
         sleep infinity
         ;;
     vaigai)
+        if (( DRYRUN )); then dryrun_tgen; exit 0; fi
         setup_hugepages
         start_tgen
         ;;
     cleanup)
+        if (( DRYRUN )); then dryrun_cleanup; exit 0; fi
         do_cleanup
         ;;
     "")
+        if (( DRYRUN )); then dryrun_tgen; echo ""; dryrun_server; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_all

@@ -33,16 +33,19 @@ Usage: $(basename "$0") [--server | --vaigai | --cleanup]
   --server    Start QEMU VM with all services (terminal 1)
   --vaigai      Start vaigai traffic generator only (terminal 2)
   --cleanup   Clean up all resources from previous runs
+  --dryrun    Show commands without executing them (combine with --server/--vaigai/--cleanup)
 EOF
 }
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 MODE=""
+DRYRUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server)  MODE="server" ;;
         --vaigai)    MODE="vaigai" ;;
         --cleanup) MODE="cleanup" ;;
+        --dryrun)  DRYRUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -50,8 +53,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Pre-flight checks ───────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
-if [[ "$MODE" == "vaigai" || -z "$MODE" ]]; then
+[[ $EUID -ne 0 ]] && (( ! DRYRUN )) && { err "Must run as root"; exit 1; }
+if [[ "$MODE" == "vaigai" || -z "$MODE" ]] && (( ! DRYRUN )); then
     [[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
 fi
 
@@ -212,9 +215,76 @@ start_tgen() {
     "$VAIGAI_BIN" -l 14-15 -n 4 -a 0000:83:00.0 -a 0000:0e:00.0 -- -I 10.0.0.1
 }
 
+# ── Dryrun ────────────────────────────────────────────────────────────────────
+dryrun_server() {
+    info "[DRYRUN] --server would run:"
+    cat <<EOF
+  # Hugepages
+  echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+  # Load VFIO modules
+  modprobe vfio-pci
+  modprobe vfio_iommu_type1
+
+  # Bind NICs + QAT PFs to vfio-pci
+  for DEV in $NIC_VAIGAI $NIC_VM $QAT_PF_VM $QAT_PF_VAIGAI; do
+      echo \$DEV > /sys/bus/pci/devices/\$DEV/driver/unbind
+      echo "vfio-pci" > /sys/bus/pci/devices/\$DEV/driver_override
+      echo \$DEV > /sys/bus/pci/drivers/vfio-pci/bind
+  done
+
+  # COW copy of rootfs
+  cp --reflink=auto /work/firecracker/rootfs.ext4 $ROOTFS_COW
+
+  # Launch QEMU VM
+  setsid qemu-system-x86_64 -machine q35,accel=kvm -cpu host -m 1024M -smp 2 \\
+      -kernel /boot/vmlinuz-\$(uname -r) \\
+      -initrd $INITRAMFS \\
+      -append "console=ttyS0,115200 root=/dev/vda rw quiet net.ifnames=0 biosdevname=0 vaigai_mode=all modprobe.blacklist=qat_dh895xcc,intel_qat" \\
+      -drive "file=$ROOTFS_COW,format=raw,if=virtio,cache=unsafe" \\
+      -nic user,model=virtio,hostfwd=tcp::2222-:22 \\
+      -device "vfio-pci,host=$NIC_VM" \\
+      -device "vfio-pci,host=$QAT_PF_VM" \\
+      -nographic -no-reboot
+
+  # Post-boot VM setup
+  ssh -o StrictHostKeyChecking=no -p 2222 root@localhost 'ip addr add 10.0.0.2/24 dev eth1; ip link set eth1 up'
+EOF
+}
+
+dryrun_tgen() {
+    info "[DRYRUN] --vaigai would run:"
+    cat <<EOF
+  # Start vaigai on i40e
+  "$VAIGAI_BIN" -l 14-15 -n 4 -a $NIC_VAIGAI -a $QAT_PF_VAIGAI -- -I 10.0.0.1
+EOF
+}
+
+dryrun_cleanup() {
+    info "[DRYRUN] --cleanup would run:"
+    cat <<EOF
+  # Kill QEMU VM
+  kill \$(cat $STATE_DIR/qemu.pid)
+
+  # Remove COW rootfs
+  rm -f $ROOTFS_COW
+
+  # Rebind NICs back to i40e
+  for DEV in $NIC_VAIGAI $NIC_VM; do
+      echo \$DEV > /sys/bus/pci/devices/\$DEV/driver/unbind
+      echo "" > /sys/bus/pci/devices/\$DEV/driver_override
+      echo \$DEV > /sys/bus/pci/drivers/i40e/bind
+  done
+
+  # Remove state directory
+  rm -rf $STATE_DIR
+EOF
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 case "$MODE" in
     server)
+        if (( DRYRUN )); then dryrun_server; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_server
@@ -223,13 +293,16 @@ case "$MODE" in
         sleep infinity
         ;;
     vaigai)
+        if (( DRYRUN )); then dryrun_tgen; exit 0; fi
         setup_hugepages
         start_tgen
         ;;
     cleanup)
+        if (( DRYRUN )); then dryrun_cleanup; exit 0; fi
         do_cleanup
         ;;
     "")
+        if (( DRYRUN )); then dryrun_server; echo ""; dryrun_tgen; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_server

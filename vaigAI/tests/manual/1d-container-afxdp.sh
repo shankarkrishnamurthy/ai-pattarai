@@ -30,16 +30,19 @@ Usage: $(basename "$0") [--server | --vaigai | --cleanup]
   --server    Start container with all services (terminal 1)
   --vaigai      Start vaigai traffic generator only (terminal 2)
   --cleanup   Clean up all resources from previous runs
+  --dryrun    Show commands without executing them (combine with --server/--vaigai/--cleanup)
 EOF
 }
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 MODE=""
+DRYRUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server)  MODE="server" ;;
         --vaigai)    MODE="vaigai" ;;
         --cleanup) MODE="cleanup" ;;
+        --dryrun)  DRYRUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -47,8 +50,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Pre-flight checks ───────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
-if [[ "$MODE" == "vaigai" || -z "$MODE" ]]; then
+[[ $EUID -ne 0 ]] && (( ! DRYRUN )) && { err "Must run as root"; exit 1; }
+if [[ "$MODE" == "vaigai" || -z "$MODE" ]] && (( ! DRYRUN )); then
     [[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
 fi
 
@@ -207,9 +210,65 @@ start_tgen() {
         -- -I 192.168.200.1
 }
 
+# ── Dryrun ────────────────────────────────────────────────────────────────────
+dryrun_server() {
+    info "[DRYRUN] --server would run:"
+    cat <<EOF
+  # Hugepages
+  echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+  # Container setup (Phase 1: install packages)
+  podman run -d --name vaigai-server alpine:latest sleep infinity
+  podman exec vaigai-server sh -c 'apk add --no-cache nginx openssl socat iproute2 ...'
+
+  # Container setup (Phase 2: recreate with --network=none)
+  podman commit vaigai-server vaigai-server-img
+  podman rm -f vaigai-server
+  podman run -d --name vaigai-server --network=none vaigai-server-img sleep infinity
+
+  # Veth pair
+  ip link add $VETH_HOST type veth peer name $VETH_PEER
+  ip link set $VETH_HOST up
+  ip link set $VETH_PEER netns <CTR_PID>
+  nsenter -t <CTR_PID> -n ip addr add $SERVER_IP/24 dev $VETH_PEER
+  nsenter -t <CTR_PID> -n ip link set $VETH_PEER up
+  nsenter -t <CTR_PID> -n ip link set lo up
+  ethtool -K $VETH_HOST tx off rx off gso off gro off tso off
+  nsenter -t <CTR_PID> -n ethtool -K $VETH_PEER tx off rx off gso off gro off tso off
+
+  # Services inside container
+  podman exec vaigai-server sh -c 'nginx'
+  podman exec vaigai-server sh -c 'openssl s_server -cert ... -accept 4433 -www -quiet &'
+  podman exec vaigai-server sh -c 'socat TCP-LISTEN:5000,fork,reuseaddr SYSTEM:"cat" &'
+  podman exec vaigai-server sh -c 'socat TCP-LISTEN:5001,fork,reuseaddr /dev/null &'
+EOF
+}
+
+dryrun_tgen() {
+    info "[DRYRUN] --vaigai would run:"
+    cat <<EOF
+  # Hugepages
+  echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+  # vaigai with AF_XDP
+  $VAIGAI_BIN -l 0-1 --no-pci \\
+      --vdev "net_af_xdp0,iface=$VETH_HOST,start_queue=0,force_copy=1" \\
+      -- -I 192.168.200.1
+EOF
+}
+
+dryrun_cleanup() {
+    info "[DRYRUN] --cleanup would run:"
+    cat <<EOF
+  podman rm -f vaigai-server
+  ip link del $VETH_HOST
+EOF
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 case "$MODE" in
     server)
+        if (( DRYRUN )); then dryrun_server; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_server
@@ -218,13 +277,16 @@ case "$MODE" in
         sleep infinity
         ;;
     vaigai)
+        if (( DRYRUN )); then dryrun_tgen; exit 0; fi
         setup_hugepages
         start_tgen
         ;;
     cleanup)
+        if (( DRYRUN )); then dryrun_cleanup; exit 0; fi
         do_cleanup
         ;;
     "")
+        if (( DRYRUN )); then dryrun_server; echo ""; dryrun_tgen; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_server
