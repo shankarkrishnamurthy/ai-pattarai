@@ -94,7 +94,7 @@ die()   { echo -e "${RED}[FATAL]${NC} arp_test: $*" >&2; exit 1; }
 
 # ── helper: extract JSON field from vaigai output ─────────────────────────────
 json_val() {
-    grep -oP "\"$1\": *\K[0-9]+" <<< "$OUTPUT" | tail -1 || echo "0"
+    grep -oP "\b$1:\s*\K[0-9]+" <<< "$OUTPUT" | tail -1 || echo "0"
 }
 
 # ── vaigai FIFO-based lifecycle ───────────────────────────────────────────────
@@ -111,6 +111,7 @@ vaigai_start() {
     "$VAIGAI_BIN" \
         -l "$DPDK_LCORES" -n 1 --no-pci \
         --vdev "net_tap0,iface=$TAP_VAIGAI" -- \
+        --src-ip "$VAIGAI_IP" \
         --max-conn 1024 \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
@@ -161,7 +162,7 @@ vaigai_cmd() {
     local attempts=0
     local found=0
     while [[ $found -eq 0 ]]; do
-        if tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null | grep -q '^}'; then
+        if tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null | grep -q 'Workers:'; then
             found=1
         else
             sleep 1
@@ -247,7 +248,7 @@ start_vaigai_trace() {
     local test_name="$1"
     local start_bytes
     start_bytes=$(stat -c%s "$VAIGAI_LOG" 2>/dev/null || echo 0)
-    printf 'trace start 0 0 200\n' >&7
+    printf 'trace start %s 0 0\n' "${TRACE_DIR}/${test_name}_vaigai.pcapng" >&7
     sleep 0.5
     # Verify capture started
     local new_output
@@ -266,8 +267,6 @@ stop_vaigai_trace() {
     start_bytes=$(stat -c%s "$VAIGAI_LOG" 2>/dev/null || echo 0)
 
     printf 'trace stop\n' >&7
-    sleep 0.5
-    printf 'trace save %s\n' "$pcapng" >&7
     sleep 1
 
     local new_output
@@ -318,7 +317,7 @@ ip link del "$TAP_VAIGAI"  2>/dev/null || true
 # IMPORTANT: assign a unique MAC to the bridge BEFORE adding ports.
 # Without this, the bridge inherits tap-vaigai's MAC, causing the kernel
 # to consume unicast ARP replies that should be forwarded to DPDK.
-ip link add "$BRIDGE" type bridge
+ip link add "$BRIDGE" type bridge stp_state 0
 ip link set "$BRIDGE" address "$BRIDGE_MAC"
 ip addr add "${BRIDGE_IP}/24" dev "$BRIDGE"
 ip link set "$BRIDGE" up
@@ -459,23 +458,47 @@ run_t2() {
     local start_bytes
     start_bytes=$(stat -c%s "$VAIGAI_LOG" 2>/dev/null || echo 0)
 
-    # Send an ARP request for vaigai's IP (.1) from the host bridge interface.
-    # arping sends L2 ARP via the bridge; the bridge forwards to tap-vaigai;
-    # vaigai receives via DPDK and should reply.
-    info "  Sending arping for $VAIGAI_IP from bridge $BRIDGE"
-    arping -c 3 -w 5 -I "$BRIDGE" "$VAIGAI_IP" 2>&1 | head -10 || true
-    sleep 1
+    # arping from the bridge's own IP stack does NOT traverse the bridge's
+    # forwarding path (locally-generated frames are not forwarded to bridge
+    # ports on Linux).  Inject via a temporary veth pair instead:
+    #   test-arp0 (bridge member)  <->  test-arp1 (host ns, 192.168.204.100/24)
+    # Frames leaving test-arp1 travel: test-arp0 → bridge → tap-vaigai → DPDK.
+    local VETH_IN="test-arp0"
+    local VETH_OUT="test-arp1"
+    local ARPER_IP="${SUBNET}.100"
+    ip link del "$VETH_IN" 2>/dev/null || true
+    ip link add "$VETH_IN" type veth peer name "$VETH_OUT"
+    ip link set "$VETH_IN" master "$BRIDGE"
+    # Force port to forwarding immediately (bridge STP is disabled globally,
+    # but explicit forwarding state ensures no residual delay).
+    ip link set dev "$VETH_IN" type bridge_slave state 3 2>/dev/null || true
+    ip link set "$VETH_IN" up
+    ip link set "$VETH_OUT" up
+    ip addr add "${ARPER_IP}/24" dev "$VETH_OUT"
+    sleep 0.2  # let bridge FDB settle
+
+    info "  Sending arping for $VAIGAI_IP from $VETH_OUT ($ARPER_IP)"
+    local ARPING_OUT
+    ARPING_OUT=$(arping -c 3 -w 5 -I "$VETH_OUT" "$VAIGAI_IP" 2>&1 || true)
+    info "  arping result: $(echo "$ARPING_OUT" | tail -2)"
+    local arping_rx
+    arping_rx=$(echo "$ARPING_OUT" | grep -oP '(?<=Received )\d+' || echo "0")
+    sleep 0.5
+
+    # Teardown temp veth
+    ip link del "$VETH_IN" 2>/dev/null || true
 
     # ── Stop tracing and show captures ──
     stop_vaigai_trace "t2"
     stop_bridge_capture
 
-    # Request fresh stats
+    # Use arping reply count as primary assertion (direct network evidence).
+    # Also check vaigai's ARP reply TX counter from the stats table.
     printf 'stats\n' >&7
     local attempts=0
     local found=0
     while [[ $found -eq 0 ]]; do
-        if tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null | grep -q '^}'; then
+        if tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null | grep -q 'Workers:'; then
             found=1
         else
             sleep 1
@@ -489,16 +512,16 @@ run_t2() {
     sleep 0.5
     OUTPUT=$(tail -c +$((start_bytes + 1)) "$VAIGAI_LOG")
 
-    local arp_reply_tx rx_pkts
-    arp_reply_tx=$(json_val arp_reply_tx)
-    rx_pkts=$(json_val rx_pkts)
+    # Parse ARP reply TX from the stats table (format: "ARP reply TX: N")
+    local arp_reply_tx
+    arp_reply_tx=$(echo "$OUTPUT" | grep 'ARP reply TX' | grep -oP '[0-9]+' | tail -1 || echo "0")
 
-    info "  arp_reply_tx=$arp_reply_tx rx_pkts=$rx_pkts"
+    info "  arping_rx=$arping_rx arp_reply_tx=$arp_reply_tx"
 
-    [[ "$arp_reply_tx" -gt 0 ]] && pass "T2 arp_reply_tx > 0 ($arp_reply_tx) — vaigai replied to ARP" \
-                                || fail "T2 arp_reply_tx = 0 — vaigai did not reply to ARP requests"
-    [[ "$rx_pkts" -gt 0 ]]     && pass "T2 rx_pkts > 0 ($rx_pkts) — packets received" \
-                                || fail "T2 rx_pkts = 0 — no packets received at all"
+    [[ "$arping_rx" -gt 0 ]]     && pass "T2 arping received $arping_rx reply(ies) — vaigai replied to ARP" \
+                                 || fail "T2 vaigai did not reply to ARP (arping received 0)"
+    [[ "$arp_reply_tx" -gt 0 ]]  && pass "T2 arp_reply_tx > 0 ($arp_reply_tx) in stats" \
+                                 || fail "T2 arp_reply_tx = 0 in stats"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

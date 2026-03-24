@@ -129,7 +129,7 @@ die()   { echo -e "${RED}[FATAL]${NC} http_nic: $*" >&2; exit 1; }
 
 # ── helper: extract JSON field from vaigai output ─────────────────────────────
 json_val() {
-    grep -oP "\"$1\": *\K[0-9]+" <<< "$OUTPUT" | tail -1 || echo "0"
+    grep -oP "\b$1:\s*\K[0-9]+" <<< "$OUTPUT" | tail -1 || echo "0"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -237,7 +237,7 @@ vaigai_cmd() {
     local attempts=0
     local found=0
     while [[ $found -eq 0 ]]; do
-        if tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null | grep -q '^}'; then
+        if tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null | grep -q 'Workers:'; then
             found=1
         else
             sleep 1
@@ -666,10 +666,12 @@ run_t1() {
     vaigai_cmd "start --proto tcp --ip $VM_IP --duration $FLOOD_DURATION --rate $TARGET_CPS --size 56 --port 80"
 
     tx_pkts=$(json_val tx_pkts)
+    local conn_open
+    conn_open=$(json_val tcp_conn_open)
 
-    info "  tx_pkts=$tx_pkts"
-    if [[ "$FLOOD_DURATION" -gt 0 ]] && [[ "$tx_pkts" -gt 0 ]]; then
-        local actual_cps=$((tx_pkts / FLOOD_DURATION))
+    info "  tx_pkts=$tx_pkts conn_open=$conn_open"
+    if [[ "$FLOOD_DURATION" -gt 0 ]] && [[ "$conn_open" -gt 0 ]]; then
+        local actual_cps=$((conn_open / FLOOD_DURATION))
         info "  Measured CPS: $actual_cps (target: $TARGET_CPS)"
 
         # Check rate is within 50% of target (rate limiting is approximate)

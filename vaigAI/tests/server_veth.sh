@@ -293,7 +293,7 @@ run_t3() {
 run_t4() {
     info "T4: TCP chargen (socat → :${PORT_CHARGEN})"
     local BYTES
-    BYTES=$(timeout 3 socat -t 1 - "TCP:${VAIGAI_IP}:${PORT_CHARGEN},bind=${CLIENT_IP}" 2>/dev/null | wc -c || true)
+    BYTES=$(timeout 3 socat -t 1 - "TCP:${VAIGAI_IP}:${PORT_CHARGEN},bind=${CLIENT_IP}" </dev/null 2>/dev/null | wc -c || true)
 
     if (( BYTES > 0 )); then
         pass "T4 chargen handler sent $BYTES bytes"

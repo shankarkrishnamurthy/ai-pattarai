@@ -215,7 +215,7 @@ QAT_PCI_SERVER="${QAT_PCI_SERVER:-${QAT_ALL[1]:-}}"
 
 # ── helper: extract JSON field from vaigai output ─────────────────────────────
 json_val() {
-    grep -oP "\"$1\": *\K[0-9]+" <<< "$OUTPUT" | tail -1 || echo "0"
+    grep -oP "\b$1:\s*\K[0-9]+" <<< "$OUTPUT" | tail -1 || echo "0"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -373,7 +373,7 @@ vaigai_cmd() {
 
     local attempts=0 found=0
     while [[ $found -eq 0 ]]; do
-        if tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null | grep -q '^}'; then
+        if tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null | grep -q 'Workers:'; then
             found=1
         else
             sleep 1

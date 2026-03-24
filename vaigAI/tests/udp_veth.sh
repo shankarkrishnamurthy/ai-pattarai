@@ -193,22 +193,27 @@ info "Using DPDK vdev: $VDEV_ARG"
 
 if [[ $FLOOD_MODE -eq 1 ]]; then
     info "Flood UDP -> $PEER_IP:$DST_PORT for ${FLOOD_SECONDS}s (line rate)"
-    OUTPUT=$(printf 'start --proto udp --ip %s --duration %d --size %d --port %d\nquit\n' \
-                 "$PEER_IP" "$FLOOD_SECONDS" "$PKT_SIZE" "$DST_PORT" \
+    OUTPUT=$({ printf 'start --proto udp --ip %s --duration %d --size %d --port %d\n' \
+                   "$PEER_IP" "$FLOOD_SECONDS" "$PKT_SIZE" "$DST_PORT"
+               sleep $(( FLOOD_SECONDS + 1 ))
+               printf 'stats\nquit\n'; } \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
                    --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
 else
     info "Rate-limited UDP -> $PEER_IP:$DST_PORT (1000 pps × 1s)"
-    OUTPUT=$(printf 'start --proto udp --ip %s --duration 1 --rate 1000 --size %d --port %d\nquit\n' \
-                 "$PEER_IP" "$PKT_SIZE" "$DST_PORT" \
+    OUTPUT=$({ printf 'start --proto udp --ip %s --duration 1 --rate 1000 --size %d --port %d\n' \
+                   "$PEER_IP" "$PKT_SIZE" "$DST_PORT"
+               sleep 2
+               printf 'stats\nquit\n'; } \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
                    --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
 fi
 
-# Extract vaigai counters (text format: "  udp_tx: 1031")
-VAIGAI_TX=$(echo "$OUTPUT" | grep -oP 'udp_tx:\s*\K[0-9]+' || echo "0")
+# Extract UDP TX counter from the pretty-printed stats table.
+# The UDP section row looks like: │  TX:          1031           RX:           0        │
+VAIGAI_TX=$(echo "$OUTPUT" | grep '│  TX:' | grep -oP '[0-9]+' | head -1 || echo "0")
 VAIGAI_PKTS=$(echo "$OUTPUT" | grep -oP '^\d+(?= packets transmitted)' || echo "0")
 
 sleep 0.2  # kernel may lag slightly
