@@ -130,9 +130,15 @@ static int port_setup(uint16_t port_id,
     if (!caps->has_rss)
         n_rxq = 1; /* single-queue fallback */
 
-    /* TAP PMD requires equal RX and TX queue counts */
-    if (caps->driver == DRIVER_TAP && n_txq > n_rxq)
+    /* TAP and AF_XDP PMDs require equal RX and TX queue counts */
+    if ((caps->driver == DRIVER_TAP || caps->driver == DRIVER_AF_XDP) &&
+        n_txq > n_rxq)
         n_txq = n_rxq;
+
+    /* Update caps to reflect actual configured queue counts so that
+     * worker_loop uses correct bounds (not the PMD-reported maximum). */
+    caps->max_rx_queues = n_rxq;
+    caps->max_tx_queues = n_txq;
 
     struct rte_eth_conf port_conf;
     memset(&port_conf, 0, sizeof(port_conf));
@@ -229,6 +235,36 @@ static int port_setup(uint16_t port_id,
         RTE_LOG(ERR, PORT, "Port %u: rte_eth_dev_start failed: %d\n",
                 port_id, rc);
         return -1;
+    }
+
+    /* Program a larger RETA for better RSS distribution.
+     * Some drivers (mlx5) default to reta_size = n_rxq when n_rxq is a
+     * power of 2, discarding almost all hash entropy.  Expand to 512
+     * entries and fill round-robin so the full Toeplitz hash spread is
+     * used across queues. */
+    if (caps->has_rss && n_rxq > 1) {
+        uint16_t want = RTE_ETH_RSS_RETA_SIZE_512;
+        uint16_t n_groups = (want + RTE_ETH_RETA_GROUP_SIZE - 1) /
+                            RTE_ETH_RETA_GROUP_SIZE;
+        struct rte_eth_rss_reta_entry64 reta[8];
+        memset(reta, 0, sizeof(reta));
+        for (uint16_t i = 0; i < n_groups; i++)
+            reta[i].mask = UINT64_MAX;
+        for (uint16_t i = 0; i < want; i++) {
+            uint16_t g = i / RTE_ETH_RETA_GROUP_SIZE;
+            uint16_t e = i % RTE_ETH_RETA_GROUP_SIZE;
+            reta[g].reta[e] = i % (uint16_t)n_rxq;
+        }
+        rc = rte_eth_dev_rss_reta_update(port_id, reta, want);
+        if (rc == 0) {
+            RTE_LOG(INFO, PORT,
+                "Port %u: RETA programmed to %u entries across %u queues\n",
+                port_id, want, n_rxq);
+        } else {
+            RTE_LOG(WARNING, PORT,
+                "Port %u: RETA update to %u failed (%d), using driver default\n",
+                port_id, want, rc);
+        }
     }
 
     /* Register AF_XDP mbuf fixup callback on af_xdp ports. Must be

@@ -146,6 +146,13 @@ typedef struct {
      * NULL when no buffered data; allocated on first tcp_fsm_send(). */
     struct tcp_snd_buf_s *snd_buf;
 
+    /* Timer wheel linkage (intrusive doubly-linked list per slot) */
+    uint32_t    tw_next;              /* next TCB index in wheel slot chain */
+    uint32_t    tw_prev;              /* prev TCB index (UINT32_MAX = head) */
+    uint32_t    tw_slot;              /* wheel slot (TIMER_SLOT_NONE = unscheduled) */
+    uint32_t    dack_next;            /* next in delayed-ACK list (UINT32_MAX = end) */
+    bool        in_dack_list;         /* on delayed-ACK list */
+
     /* Valid flag */
     bool        in_use;
 } tcb_t;

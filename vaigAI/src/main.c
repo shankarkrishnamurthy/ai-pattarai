@@ -40,6 +40,7 @@
 #include "port/port_init.h"
 #include "port/soft_nic.h"
 #include "net/tcp_tcb.h"
+#include "net/tcp_timer.h"
 #include "net/tcp_port_pool.h"
 #include "net/arp.h"
 #include "net/icmp.h"
@@ -276,6 +277,12 @@ main(int argc, char **argv)
     rc = tcp_port_pool_init(g_core_map.num_workers);
     if (rc < 0) {
         RTE_LOG(ERR, USER1, "Port pool init failed\n");
+        goto fail_tcb;
+    }
+
+    rc = tcp_timer_init();
+    if (rc < 0) {
+        RTE_LOG(ERR, USER1, "TCP timer wheel init failed\n");
         goto fail_tcb;
     }
 

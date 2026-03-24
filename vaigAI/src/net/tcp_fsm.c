@@ -2,6 +2,7 @@
  * vaigAI: TCP FSM implementation (§3.2, RFC 793 + RFC 7323 + RFC 5681).
  */
 #include "tcp_fsm.h"
+#include "tcp_timer.h"
 #include "tcp_tcb.h"
 #include "tcp_snd_buf.h"
 #include "tcp_options.h"
@@ -212,10 +213,10 @@ tcp_tx_flush(uint32_t worker_idx)
 }
 
 /* ── Build and send a TCP segment ────────────────────────────────────────── */
-static int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
-                              uint8_t flags,
-                              const uint8_t *payload, uint32_t payload_len,
-                              uint32_t seq, uint32_t ack)
+int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
+                     uint8_t flags,
+                     const uint8_t *payload, uint32_t payload_len,
+                     uint32_t seq, uint32_t ack)
 {
     struct rte_mempool *mp = g_worker_mempools[worker_idx];
     struct rte_mbuf    *m  = rte_pktmbuf_alloc(mp);
@@ -348,10 +349,11 @@ static void update_rtt(tcb_t *tcb, uint32_t rtt_us)
 }
 
 /* ── Arm RTO timer ────────────────────────────────────────────────────────── */
-static inline void arm_rto(tcb_t *tcb)
+static inline void arm_rto(uint32_t worker_idx, tcb_t *tcb)
 {
     tcb->rto_deadline_tsc = rte_rdtsc() +
                              (uint64_t)tcb->rto_us * g_tsc_hz / 1000000ULL;
+    tcp_timer_resched(worker_idx, tcb);
 }
 
 /* ── Send RST for a packet that has no matching TCB (RFC 793 §3.4) ──────── *
@@ -448,7 +450,7 @@ static void tcp_send_rst_no_tcb(uint32_t worker_idx, struct rte_mbuf *m,
  * whether to send the next request (state 4), enter think-time (state 7),
  * or close the connection.  Returns the new app_state. */
 static inline uint8_t
-http_next_txn(tcb_t *tcb)
+http_next_txn(uint32_t worker_idx, tcb_t *tcb)
 {
     http_prebuilt_req_t *hpb = (http_prebuilt_req_t *)tcb->app_ctx;
     if (!hpb || !hpb->keep_alive) return 0; /* no keep-alive → close */
@@ -463,6 +465,7 @@ http_next_txn(tcb_t *tcb)
     if (hpb->think_time_us > 0) {
         tcb->think_deadline_tsc = rte_rdtsc() +
             (uint64_t)hpb->think_time_us * g_tsc_hz / 1000000ULL;
+        tcp_timer_resched(worker_idx, tcb);
         return 7; /* think-time wait */
     }
 
@@ -493,6 +496,7 @@ http_send_next_request(uint32_t worker_idx, tcb_t *tcb)
     worker_metrics_add_http_req(worker_idx);
     tcb->http_req_sent_tsc = rte_rdtsc();
     tcb->app_state = 5; /* HTTP response pending */
+    tcp_timer_resched(worker_idx, tcb);
 }
 
 /* ── Effective MSS helper ─────────────────────────────────────────────────── */
@@ -620,7 +624,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                               NULL, 0,
                               tcb->snd_nxt, tcb->rcv_nxt);
             tcb->snd_nxt++;
-            arm_rto(tcb);
+            arm_rto(worker_idx, tcb);
             worker_metrics_add_tcp_conn_open(worker_idx);
         } else if (!(flags & RTE_TCP_RST_FLAG)) {
             /* Stale packets from recently-closed connections: drop silently.
@@ -652,6 +656,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->state = TCP_ESTABLISHED;
             tcb->retransmit_count = 0;
             tcb->rto_deadline_tsc = 0;  /* disarm SYN RTO */
+            tcp_timer_resched(worker_idx, tcb);
             /* Measure RTT from SYN round-trip using timestamp echo.
              * Without this, rto_us stays at the aggressive TCP_INITIAL_RTO_US
              * (10ms), causing spurious retransmissions when the first data
@@ -800,9 +805,10 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                 if (tcb->snd_una == tcb->snd_nxt) {
                     /* All data acknowledged — disarm RTO */
                     tcb->rto_deadline_tsc = 0;
+                    tcp_timer_resched(worker_idx, tcb);
                 } else {
                     /* Still unacked data — restart RTO from now */
-                    arm_rto(tcb);
+                    arm_rto(worker_idx, tcb);
                 }
                 /* RTT measurement from timestamps */
                 if (opts.has_timestamps && tcb->ts_enabled) {
@@ -849,6 +855,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                 tcb->pending_ack     = true;
                 tcb->delayed_ack_tsc = rte_rdtsc() +
                     TCP_DELAYED_ACK_US * g_tsc_hz / 1000000ULL;
+                tcp_timer_dack_add(worker_idx, tcb);
                 worker_metrics_add_tcp_payload_rx(worker_idx, data_len);
 
                 /* ── Server mode: dispatch to handler ────────────── */
@@ -953,7 +960,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                                         hist_record_corrected(&g_latency_hist[worker_idx],
                                                               lat_us, ei);
                                     }
-                                    uint8_t nxt = http_next_txn(tcb);
+                                    uint8_t nxt = http_next_txn(worker_idx, tcb);
                                     if (nxt == 4) {
                                         http_send_next_request(worker_idx, tcb);
                                     } else if (nxt == 7) {
@@ -1008,7 +1015,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                             worker_metrics_add_http_parse_err(
                                 worker_idx);
                         }
-                        uint8_t nxt2 = http_next_txn(tcb);
+                        uint8_t nxt2 = http_next_txn(worker_idx, tcb);
                         if (nxt2 == 4) {
                             http_send_next_request(worker_idx, tcb);
                         } else if (nxt2 == 7) {
@@ -1097,7 +1104,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             } else {
                 /* Simultaneous close: peer FIN but our FIN not yet ACKed → CLOSING */
                 tcb->state = TCP_CLOSING;
-                arm_rto(tcb);
+                arm_rto(worker_idx, tcb);
             }
         } else if (fin_acked) {
             /* Our FIN ACKed but no peer FIN yet → FIN_WAIT_2 */
@@ -1105,6 +1112,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             /* Arm idle timeout for FIN_WAIT_2 (RFC 9293 §3.6) */
             tcb->timewait_deadline_tsc = rte_rdtsc() +
                 60ULL * rte_get_tsc_hz();
+            tcp_timer_resched(worker_idx, tcb);
             /* ACK any data that arrived in the same segment */
             if (fw1_tlen > fw1_hlen)
                 tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
@@ -1168,10 +1176,12 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
                 if (tcb->snd_buf)
                     tcp_snd_buf_ack(tcb->snd_buf, acked);
                 tcb->retransmit_count = 0;
-                if (tcb->snd_una == tcb->snd_nxt)
+                if (tcb->snd_una == tcb->snd_nxt) {
                     tcb->rto_deadline_tsc = 0;
-                else
-                    arm_rto(tcb);
+                    tcp_timer_resched(worker_idx, tcb);
+                } else {
+                    arm_rto(worker_idx, tcb);
+                }
                 snd_buf_drain(worker_idx, tcb);
             }
             tcb->snd_wnd = rte_be_to_cpu_16(tcp->rx_win)
@@ -1272,7 +1282,7 @@ tcb_t *tcp_fsm_connect(uint32_t worker_idx,
     tcp_send_segment(worker_idx, tcb, RTE_TCP_SYN_FLAG,
                       NULL, 0, tcb->snd_nxt, 0);
     tcb->snd_nxt++;
-    arm_rto(tcb);
+    arm_rto(worker_idx, tcb);
     worker_metrics_add_tcp_syn_sent(worker_idx);
     return tcb;
 }
@@ -1289,7 +1299,7 @@ int tcp_fsm_close(uint32_t worker_idx, tcb_t *tcb)
 
     tcb->state = (tcb->state == TCP_ESTABLISHED) ?
                   TCP_FIN_WAIT_1 : TCP_LAST_ACK;
-    arm_rto(tcb);
+    arm_rto(worker_idx, tcb);
     return 0;
 }
 
@@ -1373,25 +1383,12 @@ void tcp_fsm_rto_expired(uint32_t worker_idx, tcb_t *tcb)
     default:
         break;
     }
-    arm_rto(tcb);
+    arm_rto(worker_idx, tcb);
     worker_metrics_add_tcp_retransmit(worker_idx);
 }
 
-/* ── Flush delayed ACKs ───────────────────────────────────────────────────── */
-void tcp_fsm_flush_delayed_acks(uint32_t worker_idx)
-{
-    tcb_store_t *store = &g_tcb_stores[worker_idx];
-    uint64_t now = rte_rdtsc();
-    for (uint32_t i = 0; i < store->capacity; i++) {
-        tcb_t *tcb = &store->tcbs[i];
-        if (!tcb->in_use || !tcb->pending_ack) continue;
-        if (now >= tcb->delayed_ack_tsc) {
-            tcp_send_segment(worker_idx, tcb, RTE_TCP_ACK_FLAG,
-                              NULL, 0, tcb->snd_nxt, tcb->rcv_nxt);
-            tcb->pending_ack = false;
-        }
-    }
-}
+/* tcp_fsm_flush_delayed_acks() removed — delayed ACK flushing is now
+ * integrated into tcp_timer_tick() via the dack_head singly-linked list. */
 
 /* ── Listen (passive open) ────────────────────────────────────────────────── */
 int tcp_fsm_listen(uint32_t worker_idx, uint16_t local_port)
@@ -1432,7 +1429,7 @@ int tcp_fsm_send(uint32_t worker_idx, tcb_t *tcb,
             worker_metrics_add_tcp_payload_tx(worker_idx, send_len);
         }
         if (total_sent > 0 && tcb->rto_deadline_tsc == 0)
-            arm_rto(tcb);
+            arm_rto(worker_idx, tcb);
         return (int)total_sent;
     }
 
@@ -1452,7 +1449,7 @@ int tcp_fsm_send(uint32_t worker_idx, tcb_t *tcb,
 
     /* RFC 6298: arm RTO if data is now in flight */
     if (tcb->snd_nxt != tcb->snd_una && tcb->rto_deadline_tsc == 0)
-        arm_rto(tcb);
+        arm_rto(worker_idx, tcb);
 
     return (int)queued;
 }

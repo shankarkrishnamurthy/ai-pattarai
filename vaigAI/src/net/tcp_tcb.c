@@ -2,6 +2,7 @@
  * vaigAI: TCP TCB store — per-lcore open-addressing hash table.
  */
 #include "tcp_tcb.h"
+#include "tcp_timer.h"
 #include "tcp_snd_buf.h"
 #include "../core/core_assign.h"
 #include "../common/util.h"
@@ -88,6 +89,10 @@ tcb_t *tcb_alloc(tcb_store_t *store,
     tcb->dst_ip   = d_ip;
     tcb->dst_port = d_port;
     tcb->in_use   = true;
+    tcb->tw_slot  = TIMER_SLOT_NONE;
+    tcb->tw_next  = UINT32_MAX;
+    tcb->tw_prev  = UINT32_MAX;
+    tcb->dack_next = UINT32_MAX;
 
     /* Insert into hash table (linear probing).
      * Tombstone slots (-2) left by tcb_free are reused for insertion,
@@ -124,10 +129,19 @@ tcb_t *tcb_lookup(tcb_store_t *store,
     return NULL;
 }
 
+/* ── Worker index from store pointer ──────────────────────────────────────── */
+static inline uint32_t store_to_worker(const tcb_store_t *store)
+{
+    return (uint32_t)(store - g_tcb_stores);
+}
+
 /* ── Free ─────────────────────────────────────────────────────────────────── */
 void tcb_free(tcb_store_t *store, tcb_t *tcb)
 {
     if (!tcb || !tcb->in_use) return;
+
+    /* Remove from timer wheel before zeroing */
+    tcp_timer_cancel(store_to_worker(store), tcb);
 
     /* Free send buffer before zeroing the TCB */
     if (tcb->snd_buf) {
@@ -161,6 +175,14 @@ void tcb_free(tcb_store_t *store, tcb_t *tcb)
 void tcb_store_reset(tcb_store_t *store)
 {
     if (!store->tcbs) return;
+    /* Re-init the timer wheel for this worker (clears all slot chains) */
+    uint32_t w = store_to_worker(store);
+    tcp_timer_wheel_t *tw = &g_timer_wheels[w];
+    for (uint32_t s = 0; s < TIMER_WHEEL_SLOTS; s++)
+        tw->slots[s] = UINT32_MAX;
+    tw->overflow  = UINT32_MAX;
+    tw->dack_head = UINT32_MAX;
+
     for (uint32_t i = 0; i < store->capacity; i++)
         memset(&store->tcbs[i], 0, sizeof(store->tcbs[i]));
     store->count = 0;

@@ -49,8 +49,11 @@ void tcp_fsm_reset_all(uint32_t worker_idx);
 /** Called from timer wheel to handle RTO expiry. */
 void tcp_fsm_rto_expired(uint32_t worker_idx, tcb_t *tcb);
 
-/** Called once per poll iteration to flush delayed ACKs. */
-void tcp_fsm_flush_delayed_acks(uint32_t worker_idx);
+/** Build and transmit a single TCP segment (used by timer wheel for dACK). */
+int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
+                     uint8_t flags,
+                     const uint8_t *payload, uint32_t payload_len,
+                     uint32_t seq, uint32_t ack);
 
 /** Send next HTTP request on a keep-alive connection (plain or TLS). */
 void tcp_fsm_http_send_next(uint32_t worker_idx, tcb_t *tcb);
