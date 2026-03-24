@@ -223,11 +223,12 @@ sleep 1
 run_t1() {
     info "T1: serve CLI + show listeners"
 
-    # Build serve command
-    local SERVE_CMD="serve --listen tcp:${PORT_ECHO}:echo --listen tcp:${PORT_DISCARD}:discard --listen tcp:${PORT_CHARGEN}:chargen --listen http:${PORT_HTTP}"
+    # Build serve command (exercises --http-body-size and --ciphers)
+    local SERVE_CMD="serve --listen tcp:${PORT_ECHO}:echo --listen tcp:${PORT_DISCARD}:discard --listen tcp:${PORT_CHARGEN}:chargen --listen http:${PORT_HTTP} --http-body-size 2048"
     if [[ $HAS_TLS -eq 1 ]]; then
         SERVE_CMD+=" --listen https:${PORT_HTTPS} --listen tls:${PORT_TLS_ECHO}:echo"
         SERVE_CMD+=" --tls-cert $TLS_CERT --tls-key $TLS_KEY"
+        SERVE_CMD+=" --ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384"
     fi
 
     vaigai_cmd "$SERVE_CMD" 3
@@ -473,6 +474,14 @@ run_t10() {
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Run tests
 # ═══════════════════════════════════════════════════════════════════════════════
+# Exercise stat cpu/mem/port, set ip, help before tests
+vaigai_cmd "help" 2
+vaigai_cmd "stat cpu" 2
+vaigai_cmd "stat mem" 2
+vaigai_cmd "stat port" 2
+vaigai_cmd "show interface" 2
+vaigai_cmd "set ip 0 $VAIGAI_IP 0.0.0.0 255.255.255.0" 2
+
 should_run 1  && run_t1
 should_run 2  && run_t2
 should_run 3  && run_t3

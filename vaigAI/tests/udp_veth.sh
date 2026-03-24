@@ -201,8 +201,8 @@ if [[ $FLOOD_MODE -eq 1 ]]; then
                    -l "$DPDK_LCORES" -n 1 --no-pci \
                    --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
 else
-    info "Rate-limited UDP -> $PEER_IP:$DST_PORT (1000 pps × 1s)"
-    OUTPUT=$({ printf 'start --proto udp --ip %s --duration 1 --rate 1000 --size %d --port %d\n' \
+    info "Rate-limited UDP -> $PEER_IP:$DST_PORT (1000 pps × 1s, DSCP=46)"
+    OUTPUT=$({ printf 'start --proto udp --ip %s --duration 1 --rate 1000 --size %d --port %d --dscp 46\n' \
                    "$PEER_IP" "$PKT_SIZE" "$DST_PORT"
                sleep 2
                printf 'stat net\nquit\n'; } \

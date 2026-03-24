@@ -96,16 +96,36 @@ ${BOLD}═══ Traffic Commands (at vaigai> prompt or via --attach) ═══$
   start --ip $SIP --port $TLS_PORT --proto tls --duration 5
   start --ip $SIP --port $UDP_PORT --proto udp --size 1024 --duration 5
 
+  ${CYAN}# CPS / ramp / pacing tests${NC}
+  start --ip $SIP --port $TCP_PORT --proto tcp --duration 10 --cps 500
+  start --ip $SIP --port $TCP_PORT --proto tcp --duration 10 --cps 1000 --ramp 3
+  start --ip $SIP --port $HTTP_PORT --proto http --duration 10 --txn-per-conn 5 --think-time 200
+
+  ${CYAN}# QoS & VLAN tests${NC}
+  start --ip $SIP --port $TCP_PORT --proto tcp --duration 5 --dscp 46
+  start --ip $SIP --port $UDP_PORT --proto udp --duration 5 --vlan 100 --size 64
+  start --ip $SIP --port $TCP_PORT --proto tcp --duration 5 --cc cubic
+
+  ${CYAN}# IP range pool + custom HTTP headers${NC}
+  start --ip $SIP --port $TCP_PORT --proto tcp --duration 5 --src-ip-count 4
+  start --ip $SIP --port $HTTP_PORT --proto http --duration 5 --host vaigai-test --header "X-Request-ID: test123" --header "User-Agent: vaigai/1.0"
+
   ${CYAN}# Control${NC}
   stop                          # stop active traffic
   reset                         # reset TCP state between tests
 
 ${BOLD}═══ Monitoring & Debug ═══${NC}
+  help                          # list all commands
   stat net                      # snapshot of all counters
   stat net --rate               # per-second rates
+  stat net --core 0             # per-worker stats
   stat cpu                      # CPU utilization per lcore
+  stat mem                      # memory usage
+  stat port                     # per-NIC hardware stats
   ping $SIP                     # ICMP ping
   show interface                # interface info
+  show flows                    # active client flows
+  set ip 0 192.168.201.1 0.0.0.0 255.255.255.0    # runtime IP change
   trace start /tmp/capture.pcapng   # packet capture
   trace stop
   quit
@@ -260,7 +280,7 @@ start_tgen() {
     print_traffic_commands "$SERVER_IP" 80 "$HTTPS_PORT" 4433 5000 5001
     echo ""
 
-    "$VAIGAI_BIN" -l 0-1 --no-pci --vdev "net_af_packet0,iface=$VETH_HOST" -- -I 192.168.201.1
+    "$VAIGAI_BIN" -l 0-1 --no-pci --vdev "net_af_packet0,iface=$VETH_HOST" -- -I 192.168.201.1 --sslkeylog /tmp/vaigai-keys.log
 }
 
 # ── Dryrun ────────────────────────────────────────────────────────────────────

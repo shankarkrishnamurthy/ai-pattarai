@@ -115,6 +115,8 @@ vaigai_start() {
         -l "$DPDK_LCORES" -n 1 --no-pci \
         --vdev "net_tap0,iface=$TAP_VAIGAI" -- \
         --max-conn 1024 --src-ip "$VAIGAI_IP" \
+        --gateway "${SUBNET}.3" --netmask 255.255.255.0 \
+        --output /tmp/vaigai-tcp-test.jsonl \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
 
@@ -240,7 +242,7 @@ teardown() {
     info "Tearing down"
     vaigai_stop
     [[ -n "$FC_PID" ]] && kill "$FC_PID" 2>/dev/null && wait "$FC_PID" 2>/dev/null || true
-    rm -f "$FC_SOCKET" "$ROOTFS_COW"
+    rm -f "$FC_SOCKET" "$ROOTFS_COW" /tmp/vaigai-tcp-test.jsonl
     ip link set "$BRIDGE" down 2>/dev/null || true
     ip link del "$BRIDGE"     2>/dev/null || true
     ip link del "$TAP_FC"     2>/dev/null || true
@@ -339,8 +341,8 @@ vaigai_start
 #  T1: SYN Flood — CPS
 # ══════════════════════════════════════════════════════════════════════════════
 run_t1() {
-    info "T1: SYN flood CPS → ${VM_IP}:5000 (5s)"
-    vaigai_cmd "start --proto tcp --ip $VM_IP --duration 5 --size 56 --port 5000"
+    info "T1: SYN flood CPS → ${VM_IP}:5000 (5s, dscp=26)"
+    vaigai_cmd "start --proto tcp --ip $VM_IP --duration 5 --size 56 --port 5000 --dscp 26"
 
     local syn_sent conn_open reset_rx drops
     syn_sent=$(json_val tcp_syn_sent)
@@ -367,8 +369,8 @@ run_t1() {
 #  remaining echo bytes after FIN); conn_close is covered 100% by T3 (discard).
 # ══════════════════════════════════════════════════════════════════════════════
 run_t2() {
-    info "T2: Full lifecycle → ${VM_IP}:5000 (5s, 1 stream)"
-    vaigai_cmd "start --ip $VM_IP --port 5000 --duration 5 --reuse --streams 1"
+    info "T2: Full lifecycle → ${VM_IP}:5000 (5s, 1 stream, cc=cubic, src-ip-count=2)"
+    vaigai_cmd "start --ip $VM_IP --port 5000 --duration 5 --reuse --streams 1 --cc cubic --src-ip-count 2"
 
     local conn_open retransmit reset_rx payload_tx payload_rx
     conn_open=$(json_val tcp_conn_open)
@@ -429,6 +431,8 @@ run_t3() {
 should_run() { [[ "$RUN_TESTS" == "all" || "$RUN_TESTS" == "$1" ]]; }
 
 should_run 1 && run_t1
+# Exercise show flows (client mode) between tests
+printf 'show flows\n' >&7; sleep 1
 should_run 2 && { vaigai_reset; run_t2; }
 should_run 3 && { vaigai_reset; run_t3; }
 

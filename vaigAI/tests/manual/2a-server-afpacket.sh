@@ -148,10 +148,15 @@ ${BOLD}═══ vaigai Server CLI (at vaigai(server)> prompt) ═══${NC}
   stat net                          # aggregate protocol counters
   stat net --rate                   # per-second rates
   stat cpu                          # CPU utilization per lcore
+  show interface                    # interface info
+  stat cpu                          # CPU utilization
+  stat mem                          # memory usage
+  stat port                         # NIC stats
   stop tcp:${PORT_DISCARD}:discard  # stop a single listener
   stop                              # stop all listeners
   reset                             # RST all TCBs, reset counters
-  serve --listen tcp:${PORT_ECHO}:echo --listen http:${PORT_HTTP}   # re-serve
+  serve --listen tcp:${PORT_ECHO}:echo --listen http:${PORT_HTTP} --http-body-size 4096
+  serve --listen https:${PORT_HTTPS} --tls-cert \$TLS_DIR/server.crt --tls-key \$TLS_DIR/server.key --ciphers ECDHE-RSA-AES128-GCM-SHA256
 
 CMDS
 }

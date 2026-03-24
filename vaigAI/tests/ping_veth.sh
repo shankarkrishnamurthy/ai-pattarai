@@ -192,7 +192,8 @@ if [[ $FLOOD_MODE -eq 1 ]]; then
                    --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
 else
     info "Pinging $PEER_IP ($PING_COUNT packets, interval=${PING_INTERVAL_MS}ms)"
-    OUTPUT=$(printf 'ping %s %d %d %d\nquit\n' \
+    # Also exercise: help, show interface, stat cpu/mem/port, stat net --core 0, show flows
+    OUTPUT=$(printf 'help\nshow interface\nstat cpu\nstat mem\nstat port\nping %s %d %d %d\nstat net --core 0\nshow flows\nquit\n' \
                  "$PEER_IP" "$PING_COUNT" "$PING_SIZE" "$PING_INTERVAL_MS" \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \

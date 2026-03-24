@@ -98,10 +98,16 @@ ${BOLD}═══ Traffic Commands (loopback — TX and RX counters both incremen
   reset
 
 ${BOLD}═══ Monitoring & Debug ═══${NC}
+  help                          # list all commands
   stat net                      # TX == RX counters confirm loopback
   stat net --rate               # per-second rates
+  stat net --core 0             # per-worker stats
   stat cpu                      # CPU utilization per lcore
+  stat mem                      # memory usage
+  stat port                     # per-NIC hardware stats
   show interface
+  show flows                    # active client flows
+  set ip 0 $SIP 0.0.0.0 255.255.255.0
   trace start /tmp/capture.pcapng
   trace stop
   quit
@@ -138,7 +144,8 @@ start_tgen() {
     echo ""
     print_traffic_commands "$VAIGAI_IP"
     echo ""
-    "$VAIGAI_BIN" -l 0-1 --no-pci --vdev "net_ring0" -- -I "$VAIGAI_IP"
+    "$VAIGAI_BIN" -l 0-1 --no-pci --vdev "net_ring0" -- -I "$VAIGAI_IP" \
+        --rx-descs 1024 --tx-descs 1024 --rest-port 0
 }
 
 # ── Dryrun ─────────────────────────────────────────────────────────────────────
