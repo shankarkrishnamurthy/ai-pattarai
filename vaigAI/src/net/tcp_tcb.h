@@ -43,11 +43,16 @@ typedef struct {
 
 /* ── Transmission Control Block ───────────────────────────────────────────── */
 typedef struct {
-    /* 4-tuple */
+    /* 4-tuple (IPv4) */
     uint32_t    src_ip;
     uint32_t    dst_ip;
     uint16_t    src_port;
     uint16_t    dst_port;
+
+    /* IPv6 extension */
+    uint8_t     ip_version;     /* 4 or 6 */
+    uint8_t     src_ip6[16];    /* network byte order (only if ip_version==6) */
+    uint8_t     dst_ip6[16];    /* network byte order (only if ip_version==6) */
 
     /* Send state */
     uint32_t    snd_una;

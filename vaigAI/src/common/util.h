@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 #include "types.h"
 
@@ -47,6 +48,19 @@ int tgen_parse_ipv4(const char *str, uint32_t *out_net);
 /** Parse an IPv4 CIDR prefix ("a.b.c.d/N").
  *  Returns 0 on success, -1 on parse error. */
 int tgen_parse_cidr(const char *str, uint32_t *out_net, uint8_t *out_len);
+
+/** Format an IPv6 address to a caller-supplied buffer (at least 46 bytes). */
+const char *tgen_ipv6_str(const uint8_t *addr6, char *buf, size_t len);
+
+/** Parse an IPv6 address string into a 16-byte network-byte-order array.
+ *  Returns 0 on success, -1 on parse error. */
+int tgen_parse_ipv6(const char *str, uint8_t *out_net);
+
+/** Returns true if the string looks like an IPv6 address (contains ':'). */
+static inline bool tgen_is_ipv6(const char *str)
+{
+    return str && strchr(str, ':') != NULL;
+}
 
 /** Return the next power of two >= v (64-bit). */
 uint64_t tgen_next_pow2_u64(uint64_t v);

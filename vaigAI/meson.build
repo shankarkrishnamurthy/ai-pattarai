@@ -23,6 +23,7 @@ add_project_arguments(
     '-Wno-missing-field-initializers',
     '-D_GNU_SOURCE',
     '-DALLOW_EXPERIMENTAL_API',
+    '-DTGEN_VERSION="' + meson.project_version() + '"',
   ]),
   language : 'c'
 )
@@ -94,8 +95,11 @@ net_src = files(
   'src/net/ethernet.c',
   'src/net/arp.c',
   'src/net/ipv4.c',
+  'src/net/ipv6.c',
   'src/net/lpm.c',
   'src/net/icmp.c',
+  'src/net/icmpv6.c',
+  'src/net/ndp.c',
   'src/net/udp.c',
   'src/net/tcp_tcb.c',
   'src/net/tcp_fsm.c',
@@ -132,6 +136,7 @@ telemetry_src = files(
   'src/telemetry/metrics.c',
   'src/telemetry/histogram.c',
   'src/telemetry/export.c',
+  'src/telemetry/output.c',
   'src/telemetry/pktrace.c',
   'src/telemetry/cpu_stats.c',
   'src/telemetry/mem_stats.c',

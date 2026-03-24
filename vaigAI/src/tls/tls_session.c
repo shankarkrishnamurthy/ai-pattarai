@@ -93,6 +93,13 @@ tls_server_ctx_load(const char *cert_pem, const char *key_pem)
     return tls_ctx_init(g_server_ctx, cert_pem, key_pem, NULL, true);
 }
 
+int
+tls_server_ctx_set_ciphers(const char *cipher_list)
+{
+    if (!g_server_ctx) return -ENOENT;
+    return tls_ctx_set_ciphers(g_server_ctx, cipher_list);
+}
+
 void
 tls_session_detach(uint32_t worker_idx, uint32_t conn_idx)
 {

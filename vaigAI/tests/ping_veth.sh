@@ -73,6 +73,10 @@ PEER_IF="veth-tpeer"
 PEER_IP="192.168.200.2"
 PEER_CIDR="$PEER_IP/24"
 SRC_IP="192.168.200.1"
+# IPv6 addresses (unique-local fc00::/7 to avoid kernel auto-config)
+PEER_IP6="fd00::2"
+PEER_CIDR6="$PEER_IP6/64"
+SRC_IP6="fd00::1"
 PING_COUNT=5
 PING_SIZE=56
 PING_INTERVAL_MS=1000
@@ -174,7 +178,8 @@ fi
 ip link set "$PEER_IF" netns "$CPID"
 nsenter -t "$CPID" -n ip link set "$PEER_IF" up
 nsenter -t "$CPID" -n ip addr add "$PEER_CIDR" dev "$PEER_IF"
-info "Container $PEER_IF configured: $PEER_CIDR"
+nsenter -t "$CPID" -n ip -6 addr add "$PEER_CIDR6" dev "$PEER_IF"
+info "Container $PEER_IF configured: $PEER_CIDR  $PEER_CIDR6"
 
 # ── run ───────────────────────────────────────────────────────────────────────
 info "Using DPDK vdev: $VDEV_ARG"
@@ -194,7 +199,7 @@ else
                    --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
 fi
 
-# ── assert ────────────────────────────────────────────────────────────────────
+# ── assert (IPv4) ─────────────────────────────────────────────────────────────
 if [[ $FLOOD_MODE -eq 1 ]]; then
     # The CLI prints "<N> packets transmitted".  Verify N > 0.
     TX_COUNT=$(echo "$OUTPUT" | grep -oP '^\d+(?= packets transmitted)' || echo "0")
@@ -213,5 +218,23 @@ else
     else
         echo "$OUTPUT" >&2
         fail "Expected \"$EXPECTED\" not found in output"
+    fi
+fi
+
+# ── IPv6 ping test ───────────────────────────────────────────────────────────
+if [[ $FLOOD_MODE -eq 0 ]]; then
+    info "Pinging $PEER_IP6 via ICMPv6 ($PING_COUNT packets, interval=${PING_INTERVAL_MS}ms)"
+    OUTPUT6=$(printf 'ping %s %d %d %d\nquit\n' \
+                 "$PEER_IP6" "$PING_COUNT" "$PING_SIZE" "$PING_INTERVAL_MS" \
+             | "$VAIGAI_BIN" \
+                   -l "$DPDK_LCORES" -n 1 --no-pci \
+                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" --src-ip6 "$SRC_IP6" 2>&1) || true
+
+    EXPECTED6="${PING_COUNT} packets transmitted, ${PING_COUNT} received, 0% packet loss"
+    if echo "$OUTPUT6" | grep -qF "$EXPECTED6"; then
+        pass "5/5 ICMPv6 echo replies received from $PEER_IP6 (0% loss)"
+    else
+        echo "$OUTPUT6" >&2
+        fail "Expected \"$EXPECTED6\" not found in IPv6 ping output"
     fi
 fi

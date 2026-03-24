@@ -53,11 +53,15 @@
 #define TGEN_OOO_QUEUE_SZ       8
 #define TGEN_TEMPLATE_MAX_SZ    (64 * 1024)
 #define TGEN_IFNAMESIZ          16
+#define TGEN_MAX_CLIENT_STREAMS 16    /* concurrent client traffic streams */
 #define CACHE_LINE_SIZE         64
 
 /* ── IPv4 helpers ─────────────────────────────────────────────────────────── */
 #define TGEN_IPV4(a,b,c,d) \
     ((uint32_t)(a)<<24 | (uint32_t)(b)<<16 | (uint32_t)(c)<<8 | (uint32_t)(d))
+
+/* ── IPv6 constants ──────────────────────────────────────────────────────── */
+#define TGEN_NDP_CACHE_SZ       1024
 
 /* ── Role flags ───────────────────────────────────────────────────────────── */
 typedef enum {

@@ -6,6 +6,8 @@
 #include "config_mgr.h"
 #include "mgmt_loop.h"
 #include "../net/icmp.h"
+#include "../net/icmpv6.h"
+#include "../net/ndp.h"
 #include "../net/udp.h"
 #include "../net/arp.h"
 #include "../net/tcp_fsm.h"
@@ -18,6 +20,7 @@
 #include "../telemetry/cpu_stats.h"
 #include "../telemetry/mem_stats.h"
 #include "../telemetry/log.h"
+#include "../telemetry/output.h"
 #include "../core/ipc.h"
 #include "../core/tx_gen.h"
 #include "../core/worker_loop.h"
@@ -409,6 +412,30 @@ cmd_ping(int argc, char **argv)
         printf("Usage: ping <dst_ip> [count=5] [size=56] [interval_ms=1000] [port=0]\n");
         return;
     }
+
+    /* Auto-detect IPv6 */
+    if (tgen_is_ipv6(argv[1])) {
+        uint8_t dst_ip6[16];
+        if (tgen_parse_ipv6(argv[1], dst_ip6) < 0) {
+            printf("ping: invalid IPv6 address '%s'\n", argv[1]);
+            return;
+        }
+        uint32_t count       = (argc >= 3) ? (uint32_t)strtoul(argv[2], NULL, 10) : 5;
+        uint32_t size        = (argc >= 4) ? (uint32_t)strtoul(argv[3], NULL, 10) : 56;
+        uint32_t interval_ms = (argc >= 5) ? (uint32_t)strtoul(argv[4], NULL, 10) : 1000;
+        uint16_t port_id     = (argc >= 6) ? (uint16_t)strtoul(argv[5], NULL, 10) : 0;
+        if (port_id >= g_n_ports) {
+            printf("ping: port %u does not exist (have %u port(s))\n",
+                   port_id, g_n_ports);
+            return;
+        }
+        printf("PING6 %s (port %u): %u bytes of data, %u packet(s)\n",
+               argv[1], port_id, size, count);
+        icmpv6_ping_start(port_id, dst_ip6, count, size, interval_ms,
+                           (icmpv6_mgmt_poll_fn)ping_poll_cb);
+        return;
+    }
+
     uint32_t dst_ip = 0;
     if (tgen_parse_ipv4(argv[1], &dst_ip) < 0) {
         printf("ping: invalid IP address '%s'\n", argv[1]);
@@ -569,9 +596,17 @@ cmd_start(int argc, char **argv)
     if (!a.has_duration) { printf("start: --duration is required (or use --one)\n%s", start_usage()); return; }
     if (a.duration == 0) { printf("start: --duration must be > 0\n");  return; }
 
-    /* Reject if traffic already running */
-    if (g_traffic_state.active) {
-        printf("start: traffic generation already active — run 'stop' first\n");
+    /* Find a free stream slot */
+    uint32_t stream_idx = UINT32_MAX;
+    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_STREAMS; i++) {
+        if (!g_client_streams[i].active) {
+            stream_idx = i;
+            break;
+        }
+    }
+    if (stream_idx == UINT32_MAX) {
+        printf("start: all %d stream slots in use — run 'stop' or 'stop <id>' first\n",
+               TGEN_MAX_CLIENT_STREAMS);
         return;
     }
 
@@ -650,6 +685,7 @@ cmd_start(int argc, char **argv)
     gcfg.think_time_us  = a.think_time * 1000; /* ms → µs */
     gcfg.max_initiations = a.one ? 1 : 0;
     gcfg.enable_tls = a.tls;
+    gcfg.stream_idx = stream_idx;
 
     if (a.reuse)
         gcfg.throughput_streams = (uint8_t)a.streams;
@@ -663,8 +699,11 @@ cmd_start(int argc, char **argv)
 
     /* ── Reset counters & push to workers ───────────────────────────── */
     uint32_t n_workers = g_core_map.num_workers;
-    metrics_reset(n_workers);
-    rte_eth_stats_reset(port_id);
+    bool first_stream = !client_any_active();
+    if (first_stream) {
+        metrics_reset(n_workers);
+        rte_eth_stats_reset(port_id);
+    }
 
     /* Apply RSS queue affinity so responses land on the correct worker */
     if (proto == TX_GEN_PROTO_TCP_SYN || proto == TX_GEN_PROTO_HTTP ||
@@ -676,9 +715,11 @@ cmd_start(int argc, char **argv)
         uint8_t key_len = pcap->rss_key_size;
         if (key_len == 0 || key_len > tgen_rss_key_max_len())
             key_len = 40;
-        /* Reset pools first then filter */
-        for (uint32_t w = 0; w < n_workers; w++)
-            tcp_port_pool_reset(w);
+        if (first_stream) {
+            /* Reset pools first then filter */
+            for (uint32_t w = 0; w < n_workers; w++)
+                tcp_port_pool_reset(w);
+        }
         tcp_port_pool_apply_rss_filter(n_workers, gcfg.src_ip, dst_ip,
                                        a.port, tgen_rss_key(), key_len,
                                        n_rxq);
@@ -701,16 +742,16 @@ cmd_start(int argc, char **argv)
 
     /* ── Print initial progress ──────────────────────────────────────── */
     if (a.reuse) {
-        printf("Traffic %s → %s:%u  streams=%u  duration=%us%s\n",
-               a.proto, a.ip, a.port, a.streams, a.duration,
+        printf("[#%u] Traffic %s → %s:%u  streams=%u  duration=%us%s\n",
+               stream_idx, a.proto, a.ip, a.port, a.streams, a.duration,
                a.tls ? " [TLS]" : "");
         printf("[ ID]  Interval       Transfer     Throughput\n");
     } else if (a.one) {
-        printf("Single %s → %s:%u%s\n",
-               a.proto, a.ip, a.port, a.tls ? " [TLS]" : "");
+        printf("[#%u] Single %s → %s:%u%s\n",
+               stream_idx, a.proto, a.ip, a.port, a.tls ? " [TLS]" : "");
     } else {
-        printf("Traffic %s → %s:%u  %u-byte payload, %s, %u seconds%s\n",
-               a.proto, a.ip, a.port, a.size,
+        printf("[#%u] Traffic %s → %s:%u  %u-byte payload, %s, %u seconds%s\n",
+               stream_idx, a.proto, a.ip, a.port, a.size,
                a.rate ? "rate-limited" : "unlimited",
                a.duration, a.tls ? " [TLS]" : "");
     }
@@ -718,6 +759,7 @@ cmd_start(int argc, char **argv)
     /* ── Set up async traffic gen state ──────────────────────────────── */
     traffic_gen_state_t tgs;
     memset(&tgs, 0, sizeof(tgs));
+    tgs.stream_idx = stream_idx;
     tgs.one_shot   = a.one;
     tgs.reuse      = a.reuse;
     tgs.is_tty     = isatty(STDOUT_FILENO);
@@ -728,35 +770,37 @@ cmd_start(int argc, char **argv)
     tgs.size       = a.size;
     tgs.tls        = a.tls;
     tgs.streams    = a.streams;
+    tgs.dst_port   = a.port;
     strncpy(tgs.proto, a.proto, sizeof(tgs.proto) - 1);
+    strncpy(tgs.dst_ip_str, a.ip, sizeof(tgs.dst_ip_str) - 1);
+
+    output_start(stream_idx, a.proto, a.ip, a.port,
+                 a.duration, a.rate, a.size, a.tls,
+                 a.streams, a.reuse);
 
     /* --one blocks until the single request completes (or times out),
      * then prints the result and returns the prompt. */
-    bool pipe_mode = !isatty(STDIN_FILENO);
-    (void)pipe_mode;
     if (a.one) {
         mgmt_traffic_start(&tgs);
+        traffic_gen_state_t *cs = &g_client_streams[stream_idx];
         uint64_t hz        = rte_get_tsc_hz();
         uint64_t chk_itvl  = hz / 100;              /* 10 ms in TSC ticks  */
         uint64_t last_chk   = rte_rdtsc() - chk_itvl; /* check on 1st iter */
-        while (g_traffic_state.active && g_run) {
-            /* Tight loop: keep ARP/ICMP alive and drain the capture ring
-             * on every iteration so pktrace never starves on busy ports. */
+        while (cs->active && g_run) {
             arp_mgmt_tick();
             icmp_mgmt_tick();
             pktrace_flush();
             cli_server_poll(dispatch);
-            /* Throttle the expensive completion/timeout check to 10 ms */
             uint64_t now = rte_rdtsc();
             if ((now - last_chk) >= chk_itvl) {
                 last_chk = now;
                 uint64_t elapsed_s =
-                    (now - g_traffic_state.start_tsc) / hz;
-                if (elapsed_s >= g_traffic_state.duration_s) {
-                    mgmt_traffic_stop();
+                    (now - cs->start_tsc) / hz;
+                if (elapsed_s >= cs->duration_s) {
+                    mgmt_traffic_stop_stream(stream_idx);
                     break;
                 }
-                if (g_traffic_state.one_shot) {
+                if (cs->one_shot) {
                     metrics_snapshot_t ms;
                     metrics_snapshot(&ms, n_workers);
                     bool done = false;
@@ -765,13 +809,6 @@ cmd_start(int argc, char **argv)
                         done = (ms.total.tx_pkts >= 1);
                     else if (strcmp(a.proto, "http") == 0 ||
                              strcmp(a.proto, "https") == 0)
-                        /* Done when the connection closes cleanly after the full
-                         * response body is received.  The FSM sends FIN once
-                         * Content-Length bytes have arrived (active close), so
-                         * tcp_conn_close fires quickly.  Falls back to reset
-                         * if Content-Length is absent (chunked) or on error.
-                         * http_rsp_rx >= 1 is an additional safety exit so we
-                         * never hang longer than needed on unusual responses. */
                         done = (ms.total.http_rsp_rx >= 1 &&
                                 ms.total.tcp_conn_close >= 1) ||
                                ms.total.tcp_reset_sent >= 1 ||
@@ -780,29 +817,58 @@ cmd_start(int argc, char **argv)
                         done = ms.total.tcp_conn_close >= 1 ||
                                ms.total.tcp_reset_sent >= 1 ||
                                ms.total.tcp_reset_rx >= 1;
-                    if (done) { mgmt_traffic_stop(); break; }
+                    if (done) {
+                        mgmt_traffic_stop_stream(stream_idx);
+                        break;
+                    }
                 }
             }
-            rte_pause(); /* yield pipeline; matches mgmt_loop_run() behavior */
+            rte_pause();
         }
         return;
     }
 
     /* Interactive mode: non-blocking — return to prompt immediately */
     mgmt_traffic_start(&tgs);
-    printf("(running in background — use 'stat' to monitor, 'stop' to abort)\n");
+    printf("(running in background — use 'show clients' to monitor, "
+           "'stop' or 'stop %u' to abort)\n", stream_idx);
 }
 
 static void
-cmd_stop_gen(int argc, char **argv)
+cmd_stop_client(int argc, char **argv)
 {
-    (void)argc; (void)argv;
-    if (g_traffic_state.active) {
-        mgmt_traffic_stop();
-        printf("Traffic generation stopped.\n");
-    } else {
-        printf("It's already in stopped state.\n");
+    if (argc >= 2) {
+        /* stop <id> or stop all */
+        if (strcmp(argv[1], "all") == 0) {
+            if (!client_any_active()) {
+                printf("No active client streams.\n");
+                return;
+            }
+            mgmt_traffic_stop_all();
+            printf("All client streams stopped.\n");
+            return;
+        }
+        char *endp;
+        long idx = strtol(argv[1], &endp, 10);
+        if (*endp == '\0' && idx >= 0 && idx < TGEN_MAX_CLIENT_STREAMS) {
+            if (!g_client_streams[idx].active) {
+                printf("Stream #%ld is not active.\n", idx);
+                return;
+            }
+            mgmt_traffic_stop_stream((uint32_t)idx);
+            return;
+        }
+        printf("stop: invalid stream id '%s' (use 0-%d or 'all')\n",
+               argv[1], TGEN_MAX_CLIENT_STREAMS - 1);
+        return;
     }
+    /* Bare stop: stop all streams */
+    if (!client_any_active()) {
+        printf("No active client streams.\n");
+        return;
+    }
+    mgmt_traffic_stop_all();
+    printf("All client streams stopped.\n");
 }
 
 /* ── Reset all TCP state ─────────────────────────────────────────────────── */
@@ -814,11 +880,13 @@ cmd_reset(int argc, char **argv)
     /* Refuse if traffic generation is still active */
     uint32_t n_workers = g_core_map.num_workers;
     for (uint32_t w = 0; w < n_workers; w++) {
-        if (__atomic_load_n(&g_worker_ctx[w].tx_gen.active,
-                            __ATOMIC_ACQUIRE)) {
-            printf("reset: traffic generation is still active — "
-                   "run 'stop' first.\n");
-            return;
+        for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++) {
+            if (__atomic_load_n(&g_worker_ctx[w].tx_gen[s].active,
+                                __ATOMIC_ACQUIRE)) {
+                printf("reset: traffic generation is still active — "
+                       "run 'stop' first.\n");
+                return;
+            }
         }
     }
 
@@ -922,6 +990,52 @@ cmd_set(int argc, char **argv)
 /* Forward declarations for show sub-commands */
 static void cmd_listeners(int argc, char **argv);
 static void cmd_connections(int argc, char **argv);
+static void cmd_show_clients(int argc, char **argv);
+
+/* ── Show active client streams ─────────────────────────────────────────── */
+static void
+cmd_show_clients(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+
+    bool any = false;
+    uint64_t now = rte_rdtsc();
+    uint64_t hz  = rte_get_tsc_hz();
+
+    printf("  #  %-8s %-16s %-6s %-10s %-8s %s\n",
+           "PROTO", "DESTINATION", "PORT", "DURATION", "ELAPSED", "STATE");
+    printf("  -  %-8s %-16s %-6s %-10s %-8s %s\n",
+           "-----", "-----------", "----", "--------", "-------", "-----");
+
+    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_STREAMS; i++) {
+        traffic_gen_state_t *cs = &g_client_streams[i];
+        if (!cs->active && cs->duration_s == 0)
+            continue; /* never used */
+
+        any = true;
+        const char *state;
+        uint64_t elapsed_s;
+        if (cs->active) {
+            state = "running";
+            elapsed_s = (now - cs->start_tsc) / hz;
+        } else {
+            state = "stopped";
+            elapsed_s = (cs->stop_tsc > cs->start_tsc)
+                ? (cs->stop_tsc - cs->start_tsc) / hz : 0;
+        }
+
+        printf("  %u  %-8s %-16s %-6u %u/%us     %-8lu %s%s%s\n",
+               i, cs->proto, cs->dst_ip_str, cs->dst_port,
+               (unsigned)elapsed_s, cs->duration_s,
+               (unsigned long)(cs->rate ? cs->rate : 0),
+               state,
+               cs->tls ? " [TLS]" : "",
+               cs->reuse ? " [reuse]" : "");
+    }
+
+    if (!any)
+        printf("  (no client streams configured — use 'start' to begin)\n");
+}
 
 /* ── Show interface details ──────────────────────────────────────────────── */
 static void
@@ -929,12 +1043,18 @@ cmd_show(int argc, char **argv)
 {
     if (argc < 2) {
         printf("Usage: show interface [port_id]\n");
+        if (!g_config.server_mode)
+            printf("       show clients\n");
         if (g_config.server_mode)
             printf("       show listeners\n"
                    "       show connections\n");
         return;
     }
 
+    if (strcmp(argv[1], "clients") == 0) {
+        cmd_show_clients(argc - 1, argv + 1);
+        return;
+    }
     if (strcmp(argv[1], "listeners") == 0) {
         cmd_listeners(argc - 1, argv + 1);
         return;
@@ -946,6 +1066,8 @@ cmd_show(int argc, char **argv)
 
     if (strcmp(argv[1], "interface") != 0) {
         printf("Usage: show interface [port_id]\n");
+        if (!g_config.server_mode)
+            printf("       show clients\n");
         if (g_config.server_mode)
             printf("       show listeners\n"
                    "       show connections\n");
@@ -1082,8 +1204,9 @@ cmd_serve(int argc, char **argv)
     memset(&cfg, 0, sizeof(cfg));
     cfg.http_body_size = 1024; /* default */
 
-    const char *tls_cert = NULL;
-    const char *tls_key  = NULL;
+    const char *tls_cert    = NULL;
+    const char *tls_key     = NULL;
+    const char *tls_ciphers = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
@@ -1104,6 +1227,8 @@ cmd_serve(int argc, char **argv)
             tls_cert = argv[++i];
         } else if (strcmp(argv[i], "--tls-key") == 0 && i + 1 < argc) {
             tls_key = argv[++i];
+        } else if (strcmp(argv[i], "--ciphers") == 0 && i + 1 < argc) {
+            tls_ciphers = argv[++i];
         } else if (strcmp(argv[i], "--http-body-size") == 0 && i + 1 < argc) {
             cfg.http_body_size = (uint32_t)atoi(argv[++i]);
         } else {
@@ -1130,6 +1255,10 @@ cmd_serve(int argc, char **argv)
         printf("serve: --tls-cert and --tls-key required for https/tls listeners\n");
         return;
     }
+    if (tls_ciphers && !needs_tls) {
+        printf("serve: --ciphers ignored (no https/tls listeners)\n");
+        tls_ciphers = NULL;
+    }
 
     /* Store TLS cert/key paths globally */
     if (tls_cert)
@@ -1142,6 +1271,13 @@ cmd_serve(int argc, char **argv)
         if (tls_server_ctx_load(tls_cert, tls_key) < 0) {
             printf("serve: failed to load TLS certificate/key\n");
             return;
+        }
+        if (tls_ciphers) {
+            if (tls_server_ctx_set_ciphers(tls_ciphers) < 0) {
+                printf("serve: invalid cipher list '%s'\n", tls_ciphers);
+                return;
+            }
+            printf("TLS cipher list: %s\n", tls_ciphers);
         }
     }
 
@@ -1157,6 +1293,8 @@ cmd_serve(int argc, char **argv)
     tgen_ipc_broadcast(&cmd);
 
     printf("Listening on %u endpoint(s):\n", cfg.count);
+    char listen_desc[256] = "";
+    int ldpos = 0;
     for (uint32_t i = 0; i < cfg.count; i++) {
         const char *hname = srv_handler_name(cfg.specs[i].handler);
         /* Reconstruct spec string */
@@ -1165,7 +1303,14 @@ cmd_serve(int argc, char **argv)
         if (cfg.specs[i].handler == SRV_HANDLER_HTTPS)    proto = "https";
         if (cfg.specs[i].handler == SRV_HANDLER_TLS_ECHO) proto = "tls";
         printf("  #%u  %s:%u:%s\n", i, proto, cfg.specs[i].port, hname);
+        if (ldpos > 0 && ldpos < (int)sizeof(listen_desc) - 1)
+            ldpos += snprintf(listen_desc + ldpos,
+                              sizeof(listen_desc) - (size_t)ldpos, ",");
+        ldpos += snprintf(listen_desc + ldpos,
+                          sizeof(listen_desc) - (size_t)ldpos,
+                          "%s:%u:%s", proto, cfg.specs[i].port, hname);
     }
+    output_serve(listen_desc, tls_ciphers);
 }
 
 /* ── Server mode: listeners command ──────────────────────────────────────── */
@@ -1302,12 +1447,22 @@ cmd_stop_gated(int argc, char **argv)
     if (g_config.server_mode) {
         /* Server mode: stop listeners */
         if (argc >= 2) {
-            /* stop by spec or index */
+            /* "stop all" stops all listeners */
+            if (strcmp(argv[1], "all") == 0) {
+                config_update_t cmd;
+                memset(&cmd, 0, sizeof(cmd));
+                cmd.cmd = CFG_CMD_STOP_LISTENER;
+                uint32_t all = UINT32_MAX;
+                memcpy(cmd.payload, &all, sizeof(all));
+                tgen_ipc_broadcast(&cmd);
+                g_srv_active = false;
+                printf("Stopped all listeners.\n");
+                return;
+            }
             /* Try as numeric index first */
             char *endp;
             long idx = strtol(argv[1], &endp, 10);
             if (*endp == '\0' && idx >= 0) {
-                /* Stop by index */
                 config_update_t cmd;
                 memset(&cmd, 0, sizeof(cmd));
                 cmd.cmd = CFG_CMD_STOP_LISTENER;
@@ -1336,7 +1491,7 @@ cmd_stop_gated(int argc, char **argv)
                 }
             }
         } else {
-            /* Stop all listeners */
+            /* Bare stop: stop all listeners */
             config_update_t cmd;
             memset(&cmd, 0, sizeof(cmd));
             cmd.cmd = CFG_CMD_STOP_LISTENER;
@@ -1348,7 +1503,7 @@ cmd_stop_gated(int argc, char **argv)
         }
         return;
     }
-    cmd_stop_gen(argc, argv);
+    cmd_stop_client(argc, argv);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1380,6 +1535,9 @@ cli_print_stats(void)
 static void
 dispatch(char *line)
 {
+    /* Log raw command before strtok destroys whitespace */
+    output_cmd(line);
+
     /* Tokenise */
     char *argv[MAX_ARGS];
     int   argc = 0;
@@ -1479,10 +1637,33 @@ cli_run(void)
         "  start --ip 10.0.0.2 --port 80 --proto http --duration 5 --cps 1000\n"
         "  start --ip 10.0.0.2 --port 80 --proto http --cps 5000 --ramp 5 --duration 30\n"
         "  start --ip 10.0.0.2 --port 80 --proto http --txn-per-conn 10 --think-time 100\n"
-        "  start --ip 10.0.0.2 --port 443 --proto https --one --url /\n",
+        "  start --ip 10.0.0.2 --port 443 --proto https --one --url /\n"
+        "\n"
+        "Multiple concurrent streams:\n"
+        "  start can be called multiple times to run concurrent streams.\n"
+        "  Each stream gets a unique ID shown as [#N].\n"
+        "  Use 'show clients' to see all streams, 'stop <N>' to stop one.\n",
         cmd_start_gated);
 
-    cli_register("stop",     "Stop traffic/listeners: stop [spec|#]", NULL, cmd_stop_gated);
+    cli_register("stop",     "Stop traffic/listeners: stop [#|all|spec]",
+        "Usage: stop [<id>|all|<spec>]\n"
+        "\n"
+        "Client mode:\n"
+        "  stop              Stop all active client streams\n"
+        "  stop <id>         Stop a specific stream by index\n"
+        "  stop all          Stop all active client streams (explicit)\n"
+        "\n"
+        "Server mode:\n"
+        "  stop              Stop all listeners\n"
+        "  stop <id>         Stop listener by index\n"
+        "  stop <spec>       Stop listener by spec (e.g., tcp:5000:echo)\n"
+        "  stop all          Stop all listeners (explicit)\n"
+        "\n"
+        "Examples:\n"
+        "  stop              # stop everything\n"
+        "  stop 0            # stop stream/listener #0\n"
+        "  stop all          # stop all\n",
+        cmd_stop_gated);
 
     cli_register("reset",   "Reset all TCP state (connections, ports)",
         "Usage: reset\n"
@@ -1507,8 +1688,9 @@ cli_run(void)
         "  trace stop\n",
         cmd_trace);
 
-    cli_register("show",     "Show details: show interface|listeners|connections",
+    cli_register("show",     "Show details: show interface|clients|listeners|connections",
         "Usage: show interface [port_id]\n"
+        "       show clients             (client mode)\n"
         "       show listeners           (server mode)\n"
         "       show connections          (server mode)\n"
         "\n"
@@ -1516,6 +1698,10 @@ cli_run(void)
         "  Displays driver, MAC, IP, gateway, netmask, link status,\n"
         "  offload capabilities, and packet statistics.\n"
         "  Without port_id, shows all ports.\n"
+        "\n"
+        "show clients:\n"
+        "  Shows active client traffic streams with proto, destination,\n"
+        "  duration, elapsed time, and state.\n"
         "\n"
         "show listeners:\n"
         "  Shows active listeners with stats (SPEC is copy-pasteable for 'stop').\n"
@@ -1526,6 +1712,7 @@ cli_run(void)
         "Examples:\n"
         "  show interface\n"
         "  show interface 0\n"
+        "  show clients\n"
         "  show listeners\n"
         "  show connections\n",
         cmd_show);
@@ -1547,6 +1734,7 @@ cli_run(void)
     cli_register("serve",    "Start listeners: serve --listen <spec> [--listen ...] [opts]",
         "Usage: serve --listen <spec> [--listen <spec> ...]\n"
         "             [--tls-cert <path>] [--tls-key <path>]\n"
+        "             [--ciphers <cipher-list>]\n"
         "             [--http-body-size <bytes>]\n"
         "\n"
         "  <spec> = proto:port[:handler]\n"
@@ -1560,9 +1748,17 @@ cli_run(void)
         "  https     (implicit)  TLS + HTTP response\n"
         "  tls       echo        TLS + echo\n"
         "\n"
+        "Options:\n"
+        "  --ciphers <list>  OpenSSL cipher string for TLS 1.2 (colon-separated,\n"
+        "                    priority order — #1 gets highest priority).\n"
+        "                    Server preference is enforced. If omitted, the\n"
+        "                    default ECDHE+AES-GCM suite list is used.\n"
+        "\n"
         "Examples:\n"
         "  serve --listen tcp:5000:echo --listen http:80\n"
-        "  serve --listen https:443 --tls-cert /path/cert.pem --tls-key /path/key.pem\n",
+        "  serve --listen https:443 --tls-cert cert.pem --tls-key key.pem\n"
+        "  serve --listen https:443 --tls-cert cert.pem --tls-key key.pem \\\n"
+        "        --ciphers ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256\n",
         cmd_serve);
 
     /* Start CLI socket server for remote attach */

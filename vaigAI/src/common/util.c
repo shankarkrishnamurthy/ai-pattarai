@@ -67,6 +67,23 @@ int tgen_parse_ipv4(const char *str, uint32_t *out_net)
     return 0;
 }
 
+const char *tgen_ipv6_str(const uint8_t *addr6, char *buf, size_t len)
+{
+    struct in6_addr ia;
+    memcpy(&ia, addr6, 16);
+    inet_ntop(AF_INET6, &ia, buf, (socklen_t)len);
+    return buf;
+}
+
+int tgen_parse_ipv6(const char *str, uint8_t *out_net)
+{
+    struct in6_addr ia;
+    if (inet_pton(AF_INET6, str, &ia) != 1)
+        return -1;
+    memcpy(out_net, &ia, 16);
+    return 0;
+}
+
 int tgen_parse_cidr(const char *str, uint32_t *out_net, uint8_t *out_len)
 {
     char tmp[32];

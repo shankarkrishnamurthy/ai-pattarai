@@ -38,7 +38,11 @@ typedef struct {
     uint32_t    gateway;            /* default gateway in network byte order (--gateway) */
     uint32_t    netmask;            /* subnet mask in network byte order (--netmask) */
 
+    uint8_t     src_ip6[16];        /* local IPv6 in network byte order (--src-ip6) */
+    bool        has_src_ip6;        /* true if --src-ip6 was specified */
+
     char        sslkeylog_path[256]; /* SSLKEYLOG file path (--sslkeylog) */
+    char        output_path[256];   /* -O/--output: structured NDJSON output file */
 
     bool        verbose;            /* -v/--verbose: show all startup log messages */
     bool        server_mode;        /* --server: start in server mode */

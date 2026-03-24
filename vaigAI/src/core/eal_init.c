@@ -38,6 +38,8 @@ static const struct option g_long_opts[] = {
     { "gateway",                required_argument, NULL, 'G' },
     { "netmask",                required_argument, NULL, 'N' },
     { "sslkeylog",              required_argument, NULL, 'K' },
+    { "output",                 required_argument, NULL, 'O' },
+    { "src-ip6",                required_argument, NULL, '6' },
     { "verbose",                no_argument,       NULL, 'v' },
     { "server",                 no_argument,       NULL, 'S' },
     { NULL, 0, NULL, 0 },
@@ -71,7 +73,7 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
     optind = 1;
     opterr = 0; /* suppress errors for unknown options (belong to EAL) */
 
-    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:X:R:I:G:N:K:vS", g_long_opts,
+    while ((opt = getopt_long(argc, argv, "W:M:P:r:t:d:C:X:R:I:G:N:K:O:6:vS", g_long_opts,
                               &opt_idx)) != -1) {
         switch (opt) {
         case 'W': a->num_worker_cores = (uint32_t)atoi(optarg); break;
@@ -101,8 +103,19 @@ static int parse_tgen_args(int argc, char **argv, tgen_eal_args_t *a)
                 return -1;
             }
             break;
+        case '6':
+            if (tgen_parse_ipv6(optarg, a->src_ip6) < 0) {
+                fprintf(stderr, "[TGEN] invalid --src-ip6: %s\n", optarg);
+                return -1;
+            }
+            a->has_src_ip6 = true;
+            break;
         case 'K':
             snprintf(a->sslkeylog_path, sizeof(a->sslkeylog_path),
+                     "%s", optarg);
+            break;
+        case 'O':
+            snprintf(a->output_path, sizeof(a->output_path),
                      "%s", optarg);
             break;
         case 'v': a->verbose = true; break;

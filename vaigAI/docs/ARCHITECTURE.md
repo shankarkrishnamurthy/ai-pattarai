@@ -80,8 +80,11 @@ src/
 │   ├── ethernet.h/c           # L2 framing, 802.1Q VLAN tag handling
 │   ├── arp.h/c                # ARP cache (rte_hash), request/reply, hold queue
 │   ├── ipv4.h/c               # IPv4 validate/strip (RX) + push header (TX)
+│   ├── ipv6.h/c               # IPv6 validate/strip (RX) + push header (TX)
 │   ├── lpm.h/c                # Longest-prefix-match routing (rte_lpm wrapper)
 │   ├── icmp.h/c               # ICMP echo reply, ping, unreachable
+│   ├── icmpv6.h/c             # ICMPv6 echo req/reply, NDP dispatch
+│   ├── ndp.h/c                # NDP neighbor cache, NS/NA, solicited-node multicast
 │   ├── udp.h/c                # UDP RX rings, checksum validation
 │   ├── tcp_tcb.h/c            # TCB store (pre-alloc flat array + hash table)
 │   ├── tcp_fsm.h/c            # Full TCP state machine (RFC 793/7323/6298/6928)
@@ -89,7 +92,7 @@ src/
 │   │                          #   TAP PMD l2_len offload, flow-controlled send
 │   ├── tcp_options.h/c        # MSS, WScale, SACK-Permitted, Timestamps
 │   ├── tcp_timer.h/c          # RTO retransmit (RFC 6298), TIME_WAIT expiry, delayed ACK
-│   ├── tcp_congestion.h/c     # New Reno congestion control (RFC 5681; no TX retransmit)
+│   ├── tcp_congestion.h/c     # New Reno congestion control (RFC 5681)
 │   ├── tcp_port_pool.h/c      # Ephemeral port bitmap [10000–59999] + reset API
 │   └── tcp_checksum.h         # HW/SW checksum inline helpers
 │
@@ -118,6 +121,7 @@ src/
     ├── export.h/c             # JSON + text export (cpu/mem/net/port formatters)
     ├── histogram.h/c          # HDR-style latency histogram (log₂ buckets)
     ├── pktrace.h/c            # Per-packet capture trace buffer
+    ├── output.h/c             # Structured NDJSON output (-O file)
     └── log.h/c                # Structured log macros (wraps rte_log)
 ```
 
@@ -277,6 +281,7 @@ Mempool allocation uses a 3-tier NUMA fallback: worker's socket with 1 GB pages 
 | `TGEN_DEFAULT_RX/TX_DESC` | 2048 | Ring descriptor count |
 | `TGEN_MBUF_DATA_SZ` | 2176 | mbuf data room (2048+128) |
 | `TGEN_ARP_CACHE_SZ` | 1024 | ARP hash entries |
+| `TGEN_MAX_CLIENT_STREAMS` | 16 | Concurrent client traffic streams |
 | `TGEN_TIMEWAIT_DEFAULT_MS` | 4000 | TIME_WAIT duration |
 
 ---
@@ -305,30 +310,30 @@ Mempool allocation uses a 3-tier NUMA fallback: worker's socket with 1 GB pages 
                │  classify_and_process │
                │  peek at ether_type   │
                │  (handle 802.1Q tag)  │
-               └──┬────────────────┬───┘
-                  │                │
-          ether_type           ether_type
-          = 0x0806             = 0x0800
-          (ARP)                (IPv4)
-                  │                │
-         ┌────────▼────────┐  ┌───▼──────────────────────┐
-         │  arp_input()    │  │  ipv4_validate_and_strip  │
-         │  enqueue to     │  │  • version = 4, IHL ≥ 5  │
-         │  g_arp_rings[p] │  │  • checksum (HW or SW)   │
-         │  (→ mgmt core)  │  │  • drop fragments        │
-         └─────────────────┘  │  • destination match      │
-                              │  • strip IP header        │
-                              └───┬──────────┬──────────┬─┘
-                                  │          │          │
-                            IPPROTO=1   IPPROTO=17  IPPROTO=6
-                             (ICMP)      (UDP)       (TCP)
-                                  │          │          │
-                          ┌───────▼───┐ ┌────▼────┐ ┌──▼────────────┐
-                          │icmp_input │ │udp_input│ │tcp_fsm_input  │
-                          │echo reply │ │enqueue  │ │full state     │
-                          │→ reply buf│ │to ring  │ │machine on     │
-                          │           │ │(→ mgmt) │ │worker core    │
-                          └───────────┘ └─────────┘ └───────────────┘
+               └──┬────────────────┬──────────────────┬───┘
+                  │                │                  │
+          ether_type           ether_type         ether_type
+          = 0x0806             = 0x0800            = 0x86DD
+          (ARP)                (IPv4)              (IPv6)
+                  │                │                  │
+         ┌────────▼────────┐  ┌───▼──────────────┐  ┌▼──────────────────────┐
+         │  arp_input()    │  │  ipv4_validate   │  │  ipv6_validate        │
+         │  enqueue to     │  │  _and_strip      │  │  _and_strip           │
+         │  g_arp_rings[p] │  │  • version = 4   │  │  • version = 6        │
+         │  (→ mgmt core)  │  │  • checksum      │  │  • payload length     │
+         └─────────────────┘  │  • dest match    │  │  • dest/mcast match   │
+                              │  • strip header  │  │  • strip header       │
+                              └──┬────────┬────┬─┘  └──┬────────┬─────┬─────┘
+                                 │        │    │       │        │     │
+                            ICMP(1) UDP(17) TCP(6) ICMPv6(58) UDP  TCP
+                                 │        │    │       │        │     │
+                          ┌──────▼──┐ ┌───▼──┐ ┌▼─────┐ ┌──────▼──┐  │
+                          │icmp_    │ │udp_  │ │tcp_  │ │icmpv6_  │  │
+                          │input    │ │input │ │fsm_  │ │input    │  │
+                          │(→ mgmt)│ │(ring)│ │input │ │(→ mgmt) │  │
+                          └─────────┘ └──────┘ └──────┘ └─────────┘  │
+                                                  ▲                   │
+                                                  └───────────────────┘
 ```
 
 **Function trace — IPv4/ICMP echo reply:**
@@ -384,6 +389,17 @@ the L2 next-hop for a given destination:
 
 Callers: `icmp_ping_start()`, `build_echo_reply()`, `tcp_fsm.c` (SYN + RST).
 
+#### NDP — IPv6 Neighbor Discovery (ndp.c)
+
+NDP replaces ARP for IPv6 MAC resolution.  Uses ICMPv6 Neighbor Solicitation
+(type 135) and Neighbor Advertisement (type 136) with solicited-node multicast
+addressing (`ff02::1:ffXX:XXXX`).
+
+- **Per-port cache:** `g_ndp[port_id]` with rwlock for worker read / mgmt write.
+- **Link-local:** Auto-generated from MAC via EUI-64 (`fe80::...`).
+- **Resolution:** `ndp_solicit()` sends NS; `ndp_process_na()` updates cache on reply.
+- **TCP/ICMPv6 callers:** `tcp_send_segment()`, `icmpv6_ping_start()` use `ndp_lookup()` for IPv6 destinations.
+
 **Function trace — TCP data:**
 
 | Step | Function                     | File                | Core     |
@@ -409,16 +425,20 @@ Callers: `icmp_ping_start()`, `build_echo_reply()`, `tcp_fsm.c` (SYN + RST).
 ### 2.2 Transmit Path — TX Generation Engine
 
 The TX generator produces synthetic traffic from worker cores, controlled by the
-management plane via IPC.
+management plane via IPC. Up to **16 concurrent client streams** can run
+simultaneously, each targeting a different destination/port/protocol. Each
+`start` command allocates a stream slot in `g_client_streams[]` (mgmt side)
+and `ctx->tx_gen[]` (per-worker side), identified by `stream_idx`.
 
 ```
   CLI: "start --proto udp --ip 10.0.0.1 --duration 3 --rate 1000 --size 64 --port 9"
        │
        ▼
   cmd_start()                                         ── mgmt core ──
+  ├── Find free slot in g_client_streams[0..15]
   ├── ARP-resolve destination MAC (3 s timeout)
-  ├── Build tx_gen_config_t
-  ├── metrics_reset()
+  ├── Build tx_gen_config_t (includes stream_idx)
+  ├── metrics_reset() (first stream only)
   └── tgen_ipc_broadcast(CFG_CMD_START, config)
        │
        │  ┌──── SPSC ring per worker ────┐
@@ -429,8 +449,9 @@ management plane via IPC.
                      │
                      ▼
   tgen_worker_loop → tgen_ipc_recv()                  ── worker core ──
-  ├── tx_gen_configure(&ctx->tx_gen, &cfg)
-  └── tx_gen_start(&ctx->tx_gen)
+  ├── si = cfg.stream_idx
+  ├── tx_gen_configure(&ctx->tx_gen[si], &cfg)
+  └── tx_gen_start(&ctx->tx_gen[si])
        │
        ▼
   ┌────────────────────────────────────────────┐
@@ -517,8 +538,9 @@ Every worker lcore runs a tight, non-blocking loop:
       └─────────────────────────────────────────────────┘
                             │
       ┌─ Step 3 ─── TX Generation ──────────────────────┐
-      │  if (ctx->tx_gen.active):                       │
-      │    tx_gen_burst(&ctx->tx_gen, mempool, port)    │
+      │  for s in 0..TGEN_MAX_CLIENT_STREAMS:           │
+      │    if (ctx->tx_gen[s].active):                   │
+      │      tx_gen_burst(&ctx->tx_gen[s], mempool, w)  │
       └─────────────────────────────────────────────────┘
                             │
       ┌─ Step 4 ─── Timer Tick ─────────────────────────┐
@@ -542,11 +564,12 @@ Every worker lcore runs a tight, non-blocking loop:
 ### 2.4 Protocol Stack Summary
 
 ```
-  Demux key:  ether_type          ip.protocol
-              ─────────           ───────────
+  Demux key:  ether_type          ip.protocol / next_hdr
+              ─────────           ─────────────────────
               0x0800 → IPv4       1  → ICMP
-              0x0806 → ARP        6  → TCP
-                                  17 → UDP
+              0x86DD → IPv6       6  → TCP
+              0x0806 → ARP        17 → UDP
+                                  58 → ICMPv6
 
   ┌───────────────┐
   │  HTTP/1.1     │
@@ -554,25 +577,28 @@ Every worker lcore runs a tight, non-blocking loop:
   ├───────────────┤
   │  TLS 1.2/1.3  │
   │ (tls_engine.c)│
-  ├───────┬───────┴───────┬───────────┐
-  │  TCP  │      UDP      │   ICMP    │
-  │tcp_fsm│    udp.c /    │  icmp.c   │
-  │  .c   │   tx_gen.c    │           │
-  ├───────┴───────────────┴───────────┤
-  │          IPv4  (ipv4.c)           │        ARP  (arp.c)
-  │          ether_type 0x0800        │        ether_type 0x0806
-  ├───────────────────────────────────┴──────────────────────┐
-  │                   Ethernet  (ethernet.c)                 │
-  │           classify_and_process() demux on ether_type     │
-  ├──────────────────────────────────────────────────────────┤
-  │                   DPDK PMD  (port_init.c)                │
-  └──────────────────────────────────────────────────────────┘
+  ├───────┬───────┴───────┬───────────┬───────────┐
+  │  TCP  │      UDP      │   ICMP    │  ICMPv6   │
+  │tcp_fsm│    udp.c /    │  icmp.c   │ icmpv6.c  │
+  │  .c   │   tx_gen.c    │           │  ndp.c    │
+  ├───────┴───────────────┴───────────┴───────────┤
+  │   IPv4  (ipv4.c)  │   IPv6  (ipv6.c)  │       │   ARP  (arp.c)
+  │   ether_type       │   ether_type      │       │   ether_type
+  │   0x0800           │   0x86DD          │       │   0x0806
+  ├────────────────────┴───────────────────┴───────┴──────────────┐
+  │                    Ethernet  (ethernet.c)                      │
+  │            classify_and_process() demux on ether_type          │
+  ├────────────────────────────────────────────────────────────────┤
+  │                    DPDK PMD  (port_init.c)                     │
+  └────────────────────────────────────────────────────────────────┘
 ```
 
 **Reading the diagram:**
-- Ethernet dispatches by `ether_type`: IPv4 (`0x0800`) and ARP (`0x0806`) are **siblings** — independent L3 protocols.
+- Ethernet dispatches by `ether_type`: IPv4 (`0x0800`), IPv6 (`0x86DD`), and ARP (`0x0806`) are **siblings** — independent L3 protocols.
 - IPv4 dispatches by `protocol` field: TCP (6), UDP (17), and ICMP (1) are **siblings** — all encapsulated in IP.
-- TLS and HTTP stack only on top of TCP, not UDP or ICMP.
+- IPv6 dispatches by `next_hdr` field: TCP (6), UDP (17), and ICMPv6 (58) — same transport layer, different L3 encapsulation.
+- NDP (Neighbor Discovery) is carried inside ICMPv6 (types 135/136) and replaces ARP for IPv6.
+- TLS and HTTP stack on top of TCP regardless of IPv4 or IPv6.
 
 ### 2.5 HTTP/1.1 Parser — RX State Machine
 
@@ -684,7 +710,7 @@ calls `tcp_fsm_connect()` + `tcp_fsm_send()` on behalf of CLI commands like
 - `snd_nxt` only advances on successful `rte_eth_tx_burst()` return.
 - Initial cwnd = 10 × MSS (RFC 6928 IW10), matching `tcp_fsm_connect()`.
 - RTO armed once per flight; restarted on ACK with unacked data; disarmed on full ACK.
-- No TX buffer — lost segments cannot be retransmitted. Fast retransmit adjusts congestion state only.
+- Send buffer (`snd_buf[]`) enables RTO-driven and fast retransmit of lost segments. RTO uses go-back-N: `snd_nxt` is reset to `snd_una`, then `snd_buf_drain()` retransmits within the new 1×MSS cwnd. Cumulative ACK clamping ensures `snd_nxt >= snd_una` after OOO data fills gaps.
 - FIN_WAIT_1/2 states accept incoming data (half-open receive) for compatibility with echo servers.
 - RFC 7323 §2.2: SYN-ACK window is NOT scaled — initial `snd_wnd` uses the raw window field.
 - RTT is measured from the SYN round-trip (timestamp echo in SYN-ACK), calibrating RTO before any data segment is sent.
@@ -960,6 +986,36 @@ Eight log domains mapped to `RTE_LOGTYPE_USER1..8`:
 
 Each macro adds `[function:line]` prefix automatically.
 
+### 3.10 Structured Output (`-O <file>`)
+
+The `-O` / `--output` flag writes every lifecycle event as a single
+NDJSON line (one JSON object per line) to a file.  All writes happen on
+the management lcore — zero data-plane impact.
+
+**Event flow:**
+
+```
+main() startup → meta, config, port events
+         ↓
+cli dispatch() → cmd event (every command)
+         ↓
+cmd_start()    → start event (test params)
+cmd_serve()    → serve event (listener config)
+         ↓
+traffic_gen_tick() → progress events (1/s)
+         ↓
+mgmt_traffic_stop_stream() → result event (all metrics + latency + per-worker)
+         ↓
+tgen_cleanup() → end event
+```
+
+**Design:** `output.c` owns a single `FILE *g_output_fp` opened at
+startup and line-buffered for crash safety.  All `output_*()` functions
+are no-ops when the pointer is NULL (output disabled).  The `result`
+event includes the full `worker_metrics_t` counter set, latency
+percentiles, and per-worker breakdown — making two result events from
+different runs directly comparable via `jq` and `diff`.
+
 ---
 
 <a id="4-control-plane--data-plane-segregation"></a>
@@ -1070,7 +1126,7 @@ same structural pattern, different payloads. Neither loop may ever block.
 |------|----------|------|-------------|
 | W➊ | `ipc_recv()` | Worker | Receive CMD from mgmt; send ACK |
 | W➋ | `rte_eth_rx_burst()` / `classify_and_process()` | Worker | RX 32 mbufs, run protocol FSMs, enqueue ARP/ICMP to mgmt ring |
-| W➌ | `tx_gen_burst()` | Worker | Token-bucket paced packet generation (ICMP/UDP/TCP) |
+| W➌ | `tx_gen_burst()` | Worker | Token-bucket paced packet generation per stream (up to 16) |
 | W➍ | `tcp_timer_tick()` | Worker | RTO retransmit, TIME_WAIT expiry, delayed ACK |
 | W➎ | `tcp_port_pool_tick()` | Worker | Drain TIME_WAIT FIFO, reclaim ephemeral ports |
 | W➏ | `cpu_accounting()` / `rte_pause()` | Worker | TSC cycle accounting; always spins |
@@ -1114,18 +1170,15 @@ Commands flow from management to workers via `config_update_t` messages (256 byt
 
 | Command            | Payload                | Effect on Worker                          |
 |--------------------|------------------------|-------------------------------------------|
-| `CFG_CMD_START`    | `tx_gen_config_t`      | Configure and start TX generator          |
-| `CFG_CMD_STOP`     | *(none)*               | Stop TX generator                         |
-| `CFG_CMD_SET_RATE` | rate value             | Adjust token bucket rate                  |
+| `CFG_CMD_START`    | `tx_gen_config_t`      | Configure and start TX generator (stream slot in payload) |
+| `CFG_CMD_STOP`     | *(none)*               | Stop all TX generator streams             |
+| `CFG_CMD_STOP_STREAM` | `stream_idx` (u32)  | Stop one client stream (or all if `UINT32_MAX`) |
+| `CFG_CMD_SET_RATE` | rate value             | Adjust token bucket rate (all streams)    |
 | `CFG_CMD_SET_PROFILE` | `flow_cfg_t`        | Update flow profile                       |
 | `CFG_CMD_SHUTDOWN` | *(none)*               | Exit worker loop                          |
 | `CFG_CMD_SERVE`    | `srv_listener_cfg_t`   | Add listener to per-worker server table   |
-
-**Management-local commands** (not sent via IPC):
-
-| CLI Command | Effect |
-|-------------|--------|
-| `reset` | RST all active TCBs, `tcb_store_reset()`, `tcp_port_pool_reset()` (cursor preserved), `metrics_reset()` |
+| `CFG_CMD_STOP_LISTENER` | listener spec      | Stop one/all server listeners             |
+| `CFG_CMD_RESET`    | *(none)*               | RST all TCBs, reset stores + pools + metrics |
 
 **Delivery guarantees:**
 - Sender spins up to 100 µs if ring is full; drops + logs on timeout
@@ -1144,13 +1197,14 @@ vaigai> help
 | `help` | `help` | List available commands |
 | `stat` | `stat [cpu\|mem\|net\|port] [--rate] [--core N]` | Unified statistics (see CLI.md) |
 | `stats` | `stats` | Alias for `stat net` (backward compat) |
-| `ping` | `ping <ip> [count] [size] [interval_ms]` | ICMP echo request |
-| `start` | `start --proto <proto> --ip <ip> --duration <s> [--rate <pps>] [--size <bytes>] [--port <port>] [--tls] [--reuse] [--streams <n>]` | Start traffic generation |
-| `stop` | `stop` | Stop active traffic generation |
+| `ping` | `ping <ip> [count] [size] [interval_ms]` | ICMP/ICMPv6 echo request (auto-detects IPv6) |
+| `start` | `start --proto <proto> --ip <ip> --duration <s> [--rate <pps>] [--size <bytes>] [--port <port>] [--tls] [--reuse] [--streams <n>]` | Start traffic generation (up to 16 concurrent streams) |
+| `stop` | `stop [<id>\|all]` | Stop client stream(s) or server listener(s) |
 | `reset` | `reset` | RST all TCBs, reset port pools + metrics |
 | `trace` | `trace start <file.pcapng> [port] [queue]` | Start packet capture |
 | | `trace stop` | Stop capture |
 | `show` | `show interface [port_id]` | Show DPDK interface details |
+|        | `show clients` | Show active client streams (client mode) |
 |        | `show listeners` | Show active listeners (server mode) |
 |        | `show connections` | Show per-worker TCB count (server mode) |
 | `serve` | `serve --listen <spec> [--listen ...] [opts]` | Configure and start listeners (server mode) |
@@ -1309,7 +1363,8 @@ safe without mutual exclusion in the fast path:
 | `g_ack_rings[w]` | Worker `w` | Mgmt | SPSC `rte_ring` |
 | `g_run` | Signal handler | All | `volatile int` — process lifecycle |
 | `g_traffic` | REST API | Workers | `volatile int` — traffic pause/resume |
-| `g_worker_ctx[w].tx_gen` | Worker `w` | Worker `w` | Single owner (configured via IPC copy) |
+| `g_client_streams[s]` | Mgmt | Mgmt | Per-stream traffic gen state (16 slots) |
+| `g_worker_ctx[w].tx_gen[s]` | Worker `w` | Worker `w` | Per-stream TX gen (16 slots, configured via IPC) |
 
 ---
 
@@ -1320,7 +1375,7 @@ safe without mutual exclusion in the fast path:
 
 ```
 tests/
-├── ping_veth.sh                # ICMP over veth — smoke test (no VM)
+├── ping_veth.sh                # ICMP/ICMPv6 over veth — smoke test (no VM)
 ├── udp_veth.sh                 # UDP over veth — datagram validation
 ├── arp_test.sh                 # ARP resolution + cache lifecycle
 ├── tcp_tap.sh                  # TCP SYN/data/FIN over TAP + Firecracker

@@ -25,6 +25,7 @@ typedef struct tcp_snd_buf_s {
     uint8_t  *data;
     uint32_t  cap;      /* allocated capacity */
     uint32_t  len;      /* bytes stored (ACKed data already trimmed) */
+    uint32_t  base_seq; /* TCP sequence number of data[0] */
 } tcp_snd_buf_t;
 
 /** Allocate a send buffer with given capacity.  Returns NULL on failure. */
@@ -50,10 +51,12 @@ static inline void
 tcp_snd_buf_ack(tcp_snd_buf_t *sb, uint32_t acked)
 {
     if (acked >= sb->len) {
+        sb->base_seq += sb->len;
         sb->len = 0;
         return;
     }
     memmove(sb->data, sb->data + acked, sb->len - acked);
+    sb->base_seq += acked;
     sb->len -= acked;
 }
 

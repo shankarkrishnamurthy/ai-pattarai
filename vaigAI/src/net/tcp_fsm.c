@@ -10,7 +10,9 @@
 #include "tcp_checksum.h"
 #include "tcp_congestion.h"
 #include "../net/ipv4.h"
+#include "../net/ipv6.h"
 #include "../net/arp.h"
+#include "../net/ndp.h"
 #include "../net/ethernet.h"
 #include "../port/port_init.h"
 #include "../core/mempool.h"
@@ -242,22 +244,29 @@ int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     size_t tcp_hdr_sz = sizeof(struct rte_tcp_hdr) + (size_t)opts_len;
     size_t seg_len    = tcp_hdr_sz + payload_len;
 
+    bool is_v6 = (tcb->ip_version == 6);
+    size_t ip_hdr_sz = is_v6 ? IPV6_HDR_LEN : sizeof(struct rte_ipv4_hdr);
+
     char *buf = rte_pktmbuf_append(m, (uint16_t)(
-        sizeof(struct rte_ether_hdr) +
-        sizeof(struct rte_ipv4_hdr)  +
-        seg_len));
+        sizeof(struct rte_ether_hdr) + ip_hdr_sz + seg_len));
     if (!buf) { rte_pktmbuf_free(m); return -1; }
 
     /* Ethernet header */
     uint16_t port_id = tcb->port_id;
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)buf;
     rte_ether_addr_copy(&g_port_caps[port_id].mac_addr, &eth->src_addr);
-    /* Use cached destination MAC if available, otherwise resolve via ARP */
+    /* Use cached destination MAC if available, otherwise resolve via ARP/NDP */
     if (likely(tcb->dst_mac_valid)) {
         rte_ether_addr_copy(&tcb->dst_mac, &eth->dst_addr);
     } else {
         struct rte_ether_addr resolved_mac;
-        if (arp_lookup(port_id, arp_nexthop(port_id, tcb->dst_ip), &resolved_mac)) {
+        bool resolved = false;
+        if (is_v6) {
+            resolved = ndp_lookup(port_id, tcb->dst_ip6, &resolved_mac);
+        } else {
+            resolved = arp_lookup(port_id, arp_nexthop(port_id, tcb->dst_ip), &resolved_mac);
+        }
+        if (resolved) {
             rte_ether_addr_copy(&resolved_mac, &tcb->dst_mac);
             tcb->dst_mac_valid = true;
         } else {
@@ -265,27 +274,43 @@ int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
         }
         rte_ether_addr_copy(&resolved_mac, &eth->dst_addr);
     }
-    eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    eth->ether_type = rte_cpu_to_be_16(is_v6 ? RTE_ETHER_TYPE_IPV6 : RTE_ETHER_TYPE_IPV4);
 
-    /* IPv4 header */
-    struct rte_ipv4_hdr *ip =
-        (struct rte_ipv4_hdr *)(buf + sizeof(struct rte_ether_hdr));
-    ip->version_ihl   = RTE_IPV4_VHL_DEF;
-    ip->type_of_service = 0;
-    ip->total_length  = rte_cpu_to_be_16(
-        (uint16_t)(sizeof(*ip) + seg_len));
-    ip->packet_id     = rte_cpu_to_be_16(
-        (uint16_t)(g_tcp_ip_id[worker_idx]++ & 0xFFFF));
-    ip->fragment_offset = rte_cpu_to_be_16(RTE_IPV4_HDR_DF_FLAG);
-    ip->time_to_live  = 64;
-    ip->next_proto_id = IPPROTO_TCP;
-    ip->hdr_checksum  = 0;
-    ip->src_addr      = tcb->src_ip;
-    ip->dst_addr      = tcb->dst_ip;
+    struct rte_tcp_hdr *tcp_h;
+
+    if (is_v6) {
+        /* IPv6 header */
+        struct rte_ipv6_hdr *ip6 =
+            (struct rte_ipv6_hdr *)(buf + sizeof(struct rte_ether_hdr));
+        ip6->vtc_flow = rte_cpu_to_be_32(0x60000000);
+        ip6->payload_len = rte_cpu_to_be_16((uint16_t)seg_len);
+        ip6->proto = IPPROTO_TCP;
+        ip6->hop_limits = 64;
+        memcpy(&ip6->src_addr, tcb->src_ip6, 16);
+        memcpy(&ip6->dst_addr, tcb->dst_ip6, 16);
+
+        tcp_h = (struct rte_tcp_hdr *)((uint8_t *)ip6 + IPV6_HDR_LEN);
+    } else {
+        /* IPv4 header */
+        struct rte_ipv4_hdr *ip =
+            (struct rte_ipv4_hdr *)(buf + sizeof(struct rte_ether_hdr));
+        ip->version_ihl   = RTE_IPV4_VHL_DEF;
+        ip->type_of_service = 0;
+        ip->total_length  = rte_cpu_to_be_16(
+            (uint16_t)(sizeof(*ip) + seg_len));
+        ip->packet_id     = rte_cpu_to_be_16(
+            (uint16_t)(g_tcp_ip_id[worker_idx]++ & 0xFFFF));
+        ip->fragment_offset = rte_cpu_to_be_16(RTE_IPV4_HDR_DF_FLAG);
+        ip->time_to_live  = 64;
+        ip->next_proto_id = IPPROTO_TCP;
+        ip->hdr_checksum  = 0;
+        ip->src_addr      = tcb->src_ip;
+        ip->dst_addr      = tcb->dst_ip;
+
+        tcp_h = (struct rte_tcp_hdr *)((uint8_t *)ip + sizeof(*ip));
+    }
 
     /* TCP header */
-    struct rte_tcp_hdr *tcp_h =
-        (struct rte_tcp_hdr *)((uint8_t *)ip + sizeof(*ip));
     memset(tcp_h, 0, sizeof(*tcp_h));
     tcp_h->src_port = rte_cpu_to_be_16(tcb->src_port);
     tcp_h->dst_port = rte_cpu_to_be_16(tcb->dst_port);
@@ -304,12 +329,20 @@ int tcp_send_segment(uint32_t worker_idx, tcb_t *tcb,
     if (payload && payload_len > 0)
         memcpy((uint8_t *)tcp_h + tcp_hdr_sz, payload, payload_len);
 
-    /* Set L2/L3/L4 lengths and compute checksums (HW offload when available) */
+    /* Set L2/L3/L4 lengths and compute checksums */
     m->l2_len = sizeof(struct rte_ether_hdr);
-    m->l3_len = sizeof(struct rte_ipv4_hdr);
+    m->l3_len = (uint16_t)ip_hdr_sz;
     m->l4_len = (uint16_t)tcp_hdr_sz;
-    tcp_checksum_set(m, ip, tcp_h,
-                     g_port_caps[port_id].has_tcp_cksum_offload);
+    if (is_v6) {
+        tcp_checksum_set_v6(m, tcb->src_ip6, tcb->dst_ip6, tcp_h,
+                            (uint16_t)seg_len,
+                            g_port_caps[port_id].has_tcp_cksum_offload);
+    } else {
+        struct rte_ipv4_hdr *ip =
+            (struct rte_ipv4_hdr *)(buf + sizeof(struct rte_ether_hdr));
+        tcp_checksum_set(m, ip, tcp_h,
+                         g_port_caps[port_id].has_tcp_cksum_offload);
+    }
 
     m->port = port_id;
 
@@ -545,8 +578,14 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
     const struct rte_tcp_hdr *tcp =
         rte_pktmbuf_mtod(m, const struct rte_tcp_hdr *);
 
-    uint32_t src_ip   = m->hash.usr;      /* saved by ipv4_input (network order) */
-    uint32_t dst_ip   = m->dynfield1[0];  /* saved by ipv4_input (network order) */
+    /* Detect IPv6 via version marker saved by ipv6_input() */
+    bool is_input_v6 = (m->hash.usr == 6);
+    uint32_t src_ip = 0, dst_ip = 0;
+    if (!is_input_v6) {
+        src_ip = m->hash.usr;      /* saved by ipv4_input (network order) */
+        dst_ip = (uint32_t)m->dynfield1[0];  /* saved by ipv4_input (network order) */
+    }
+    /* For IPv6, t_saved_src6/t_saved_dst6 are set by ipv6_input() */
     uint16_t src_port = rte_be_to_cpu_16(tcp->src_port);
     uint16_t dst_port = rte_be_to_cpu_16(tcp->dst_port);
 
@@ -564,7 +603,14 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
     tcb_store_t *store = &g_tcb_stores[worker_idx];
 
     /* Try to find existing TCB (look up as "our" connection — swap src/dst) */
-    tcb_t *tcb = tcb_lookup(store, dst_ip, dst_port, src_ip, src_port);
+    tcb_t *tcb = tcb_lookup(store, is_input_v6 ? 0 : dst_ip, dst_port,
+                             is_input_v6 ? 0 : src_ip, src_port);
+    /* For IPv6, do a secondary match check on the IP addresses */
+    if (is_input_v6 && tcb && tcb->ip_version == 6) {
+        if (memcmp(tcb->src_ip6, t_saved_dst6, 16) != 0 ||
+            memcmp(tcb->dst_ip6, t_saved_src6, 16) != 0)
+            tcb = NULL; /* 4-tuple mismatch */
+    }
 
 
     uint8_t flags = tcp->tcp_flags;
@@ -593,7 +639,7 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->snd_nxt       = isn_generate(dst_ip, dst_port, src_ip, src_port);
             tcb->snd_una       = tcb->snd_nxt;
             tcb->mss_remote    = opts.has_mss ? opts.mss : 536;
-            tcb->mss_local     = 1460;
+            tcb->mss_local     = is_input_v6 ? 1440 : 1460; /* IPv6 header is 20 bytes larger */
             tcb->wscale_remote = opts.has_wscale ? opts.wscale : 0;
             tcb->wscale_local  = 7;
             tcb->rcv_wnd       = 65535 << tcb->wscale_local;
@@ -609,10 +655,24 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             tcb->lcore_id      = (uint8_t)rte_lcore_id();
             tcb->port_id       = m->port;
             tcb->rto_us        = TCP_INITIAL_RTO_US;
+            /* IPv6 address fields */
+            if (is_input_v6) {
+                tcb->ip_version = 6;
+                memcpy(tcb->src_ip6, t_saved_dst6, 16);
+                memcpy(tcb->dst_ip6, t_saved_src6, 16);
+            } else {
+                tcb->ip_version = 4;
+            }
             /* Pre-resolve destination MAC for passive open */
             {
                 struct rte_ether_addr pmac;
-                if (arp_lookup(m->port, arp_nexthop(m->port, src_ip), &pmac)) {
+                bool resolved = false;
+                if (is_input_v6) {
+                    resolved = ndp_lookup(m->port, t_saved_src6, &pmac);
+                } else {
+                    resolved = arp_lookup(m->port, arp_nexthop(m->port, src_ip), &pmac);
+                }
+                if (resolved) {
                     rte_ether_addr_copy(&pmac, &tcb->dst_mac);
                     tcb->dst_mac_valid = true;
                 }
@@ -795,6 +855,9 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             if (SEQ_GT(ack, tcb->snd_una)) {
                 uint32_t acked = ack - tcb->snd_una;
                 tcb->snd_una   = ack;
+                /* After go-back-N, cumulative ACK may jump past snd_nxt */
+                if (SEQ_GT(tcb->snd_una, tcb->snd_nxt))
+                    tcb->snd_nxt = tcb->snd_una;
                 tcb->dup_ack_count = 0;
                 congestion_on_ack(tcb, acked);
                 /* RFC 6298: on new ACK */
@@ -1171,6 +1234,9 @@ void tcp_fsm_input(uint32_t worker_idx, struct rte_mbuf *m)
             if (SEQ_GT(ack, tcb->snd_una)) {
                 uint32_t acked = ack - tcb->snd_una;
                 tcb->snd_una = ack;
+                /* After go-back-N, cumulative ACK may jump past snd_nxt */
+                if (SEQ_GT(tcb->snd_una, tcb->snd_nxt))
+                    tcb->snd_nxt = tcb->snd_una;
                 tcb->dup_ack_count = 0;
                 congestion_on_ack(tcb, acked);
                 if (tcb->snd_buf)
@@ -1252,6 +1318,7 @@ tcb_t *tcp_fsm_connect(uint32_t worker_idx,
     if (!tcb) return NULL;
 
     tcb->state        = TCP_SYN_SENT;
+    tcb->ip_version   = 4; /* default; caller sets to 6 + addresses for IPv6 */
     tcb->snd_nxt      = isn_generate(src_ip, src_port, dst_ip, dst_port);
     tcb->snd_una      = tcb->snd_nxt;
     tcb->rcv_wnd      = 65535 << 7;
@@ -1370,14 +1437,12 @@ void tcp_fsm_rto_expired(uint32_t worker_idx, tcb_t *tcb)
         break;
     case TCP_ESTABLISHED:
     case TCP_CLOSE_WAIT:
-        /* Retransmit oldest unACKed segment from send buffer (RFC 6298 §5.4) */
+        /* Go-back-N: reset snd_nxt to snd_una so snd_buf_drain() re-sends
+         * from the first unACKed byte.  cwnd is already 1×MSS from
+         * congestion_on_rto(), so drain sends exactly one segment. */
         if (tcb->snd_buf && tcb->snd_buf->len > 0) {
-            uint32_t rtx_mss = tcb_effective_mss(tcb);
-            uint32_t rtx_len = TGEN_MIN(tcb->snd_buf->len, rtx_mss);
-            tcp_send_segment(worker_idx, tcb,
-                              RTE_TCP_ACK_FLAG | RTE_TCP_PSH_FLAG,
-                              tcb->snd_buf->data, rtx_len,
-                              tcb->snd_una, tcb->rcv_nxt);
+            tcb->snd_nxt = tcb->snd_una;
+            snd_buf_drain(worker_idx, tcb);
         }
         break;
     default:
@@ -1440,6 +1505,7 @@ int tcp_fsm_send(uint32_t worker_idx, tcb_t *tcb,
         tcb->snd_buf = tcp_snd_buf_alloc(cap);
         if (!tcb->snd_buf)
             return -1;
+        tcb->snd_buf->base_seq = tcb->snd_una;
     }
 
     uint32_t queued = tcp_snd_buf_append(tcb->snd_buf, data, len);

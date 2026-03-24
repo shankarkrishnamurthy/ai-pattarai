@@ -13,6 +13,8 @@ int  tls_ctx_init(tls_ctx_t *c, const char *a, const char *b,
                   const char *d, bool e)
 { (void)c;(void)a;(void)b;(void)d;(void)e; return -ENOTSUP; }
 void tls_ctx_fini(tls_ctx_t *c) { (void)c; }
+int  tls_ctx_set_ciphers(tls_ctx_t *c, const char *s)
+{ (void)c;(void)s; return -ENOTSUP; }
 int  tls_keylog_enable(tls_ctx_t *c, const char *p)
 { (void)c;(void)p; return -ENOTSUP; }
 void tls_keylog_close(void) {}
@@ -136,6 +138,22 @@ tls_ctx_init(tls_ctx_t *ctx, const char *cert_pem, const char *key_pem,
                            SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
                            NULL);
     }
+    return 0;
+}
+
+int
+tls_ctx_set_ciphers(tls_ctx_t *ctx, const char *cipher_list)
+{
+    if (!ctx || !ctx->ssl_ctx || !cipher_list)
+        return -EINVAL;
+
+    if (SSL_CTX_set_cipher_list(ctx->ssl_ctx, cipher_list) != 1) {
+        log_ssl_errors("SSL_CTX_set_cipher_list");
+        return -EINVAL;
+    }
+
+    /* Server preference: use our ordering, not the client's */
+    SSL_CTX_set_options(ctx->ssl_ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
     return 0;
 }
 

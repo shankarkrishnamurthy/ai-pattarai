@@ -19,6 +19,7 @@ tcp_snd_buf_alloc(uint32_t cap)
     }
     sb->cap = cap;
     sb->len = 0;
+    sb->base_seq = 0;
     return sb;
 }
 

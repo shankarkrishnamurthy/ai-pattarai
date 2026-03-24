@@ -13,12 +13,13 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "../common/types.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* ── Traffic generation state (async, non-blocking) ───────────────── */
+/* ── Per-stream traffic generation state (async, non-blocking) ─────── */
 typedef struct {
     bool        active;         /* traffic gen in progress */
     bool        one_shot;       /* --one mode */
@@ -35,7 +36,24 @@ typedef struct {
     uint64_t    rate;           /* rate limit (pps) */
     uint16_t    size;           /* packet size */
     bool        tls;            /* TLS enabled */
+    uint32_t    stream_idx;     /* slot index in g_client_streams[] */
+    char        dst_ip_str[16]; /* destination IP for display */
+    uint16_t    dst_port;       /* destination port for display */
 } traffic_gen_state_t;
+
+/* ── Client stream table (mirrors srv_table_t pattern) ─────────────── */
+extern traffic_gen_state_t g_client_streams[TGEN_MAX_CLIENT_STREAMS];
+extern uint32_t            g_client_stream_count; /* high-water mark */
+
+/** Check if any client stream is active. */
+static inline bool client_any_active(void) {
+    for (uint32_t i = 0; i < TGEN_MAX_CLIENT_STREAMS; i++)
+        if (g_client_streams[i].active) return true;
+    return false;
+}
+
+/* Backward-compat alias — points to stream 0 for legacy callers */
+#define g_traffic_state g_client_streams[0]
 
 /* ── Management core CPU stats ────────────────────────────────────── */
 typedef struct {
@@ -48,7 +66,6 @@ typedef struct {
 } mgmt_cpu_stats_t;
 
 extern mgmt_cpu_stats_t g_mgmt_cpu_stats;
-extern traffic_gen_state_t g_traffic_state;
 
 /**
  * Run the management event loop.  Called from cli_run() after command
@@ -60,16 +77,21 @@ typedef void (*mgmt_dispatch_fn_t)(char *line);
 void mgmt_loop_run(mgmt_dispatch_fn_t dispatch);
 
 /**
- * Start async traffic generation.  Called by cmd_start after ARP resolve
- * and IPC broadcast.  Sets g_traffic_state and returns immediately.
+ * Start async traffic generation for a specific stream slot.
+ * Called by cmd_start after ARP resolve and IPC broadcast.
  */
 void mgmt_traffic_start(const traffic_gen_state_t *state);
 
 /**
- * Stop async traffic generation.  Broadcasts CFG_CMD_STOP to workers
- * and prints summary.
+ * Stop a specific client stream by index.  Broadcasts CFG_CMD_STOP_STREAM
+ * to workers and prints summary for that stream.
  */
-void mgmt_traffic_stop(void);
+void mgmt_traffic_stop_stream(uint32_t stream_idx);
+
+/**
+ * Stop all active client streams.
+ */
+void mgmt_traffic_stop_all(void);
 
 /**
  * Delay for @p ms milliseconds while continuously draining the pktrace

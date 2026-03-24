@@ -18,6 +18,7 @@ vaigai accepts DPDK EAL arguments followed by `--` and then app-level arguments:
 | Flag | Short | Description |
 |------|-------|-------------|
 | `--src-ip <addr>` | `-I` | Source IPv4 address for all ports |
+| `--src-ip6 <addr>` | `-6` | Source IPv6 address for all ports |
 | `--gateway <addr>` | `-G` | Default gateway IPv4 address (required for off-link destinations) |
 | `--netmask <mask>` | `-N` | Subnet mask (e.g. `255.255.252.0`; used with `--gateway`) |
 | `--sslkeylog <path>` | `-K` | Write TLS session keys in NSS Key Log format |
@@ -30,6 +31,7 @@ vaigai accepts DPDK EAL arguments followed by `--` and then app-level arguments:
 | `--max-chain-depth <N>` | `-C` | mbuf chain depth |
 | `--max-conn <N>` | `-X` | Max concurrent connections per worker |
 | `--rest-port <port>` | `-R` | REST API listen port (0 = disabled) |
+| `--output <file>` | `-O` | Structured NDJSON output file for cross-run comparison |
 | `--server` | `-S` | Start in server mode (accept connections) |
 
 ### Special Modes
@@ -95,6 +97,50 @@ SSLKEYLOGFILE=/tmp/keys.log ./build/vaigai -l 14-15 -n 4 -a 0000:95:00.0 -- -I 1
 tshark -r capture.pcapng -o tls.keylog_file:/tmp/keys.log
 ```
 
+### `-O` / `--output` — Structured Output
+
+Writes every lifecycle event (startup, commands, results, errors) as a
+single JSON line (NDJSON) to the specified file.  Designed for cross-run
+comparison: diff two output files from different builds, kernels, or NICs
+to spot regressions.
+
+The file is opened at startup and flushed after every event.  Works in
+both interactive and non-interactive (FIFO/pipe) modes.
+
+**Event types:**
+
+| Type | When | Key fields |
+|------|------|------------|
+| `meta` | startup | version, dpdk_version, hostname, kernel, cmdline |
+| `config` | startup | workers, ports, src_ip, server_mode, tls_enabled |
+| `port` | startup | port_id, driver, mac, link_speed, rss |
+| `cmd` | each CLI command | input |
+| `start` | traffic start | stream_idx, proto, dst_ip, dst_port, duration, rate |
+| `serve` | server start | listeners, ciphers |
+| `progress` | every 1s | stream_idx, elapsed_s, tx_pkts, rx_pkts |
+| `result` | stream stop | stream_idx, status, actual_duration_s, metrics, latency, per_worker |
+| `error` | on error/warning | severity, module, message |
+| `end` | shutdown | exit_code, uptime_s |
+
+**Example:**
+
+```bash
+./build/vaigai -l 0-3 -a 0000:07:00.0 -- -I 10.0.0.1 -O /tmp/run1.jsonl
+```
+
+**Comparing two runs:**
+
+```bash
+# Compare result metrics
+jq 'select(.type == "result")' /tmp/run1.jsonl /tmp/run2.jsonl | diff -
+
+# Compare config/environment
+jq 'select(.type == "meta" or .type == "config")' /tmp/run1.jsonl /tmp/run2.jsonl
+
+# Extract key metrics
+jq 'select(.type == "result") | {status, tcp_conn_open: .metrics.tcp_conn_open, p99: .latency.p99}' /tmp/run1.jsonl
+```
+
 ---
 
 ## help
@@ -122,35 +168,45 @@ Usage: start --ip <addr> --port <N> --duration <secs>
 
 ## ping
 
-Send ICMP echo requests to a destination.
+Send ICMP (IPv4) or ICMPv6 (IPv6) echo requests to a destination.
+The address format is auto-detected: addresses containing `:` are treated
+as IPv6 and use ICMPv6 with NDP neighbor resolution; all others use
+IPv4 with ARP.
 
 ```
 ping <dst_ip> [count] [size] [interval_ms] [port]
 ```
 
-| Parameter     | Default | Description                      |
-|---------------|---------|----------------------------------|
-| `dst_ip`      | —       | Destination IPv4 address         |
-| `count`       | 5       | Number of echo requests to send  |
-| `size`        | 56      | Payload size in bytes            |
-| `interval_ms` | 1000    | Interval between requests (ms)   |
-| `port`        | 0       | DPDK port ID to send from        |
+| Parameter     | Default | Description                                    |
+|---------------|---------|------------------------------------------------|
+| `dst_ip`      | —       | Destination IPv4 or IPv6 address               |
+| `count`       | 5       | Number of echo requests to send                |
+| `size`        | 56      | Payload size in bytes                          |
+| `interval_ms` | 1000    | Interval between requests (ms)                 |
+| `port`        | 0       | DPDK port ID to send from                      |
 
 ```
 vaigai> ping 10.0.0.2
 vaigai> ping 10.0.0.2 10 128 500
 vaigai> ping 10.10.10.10 3 56 1000 1    # ping via port 1
+vaigai> ping fd00::2                     # ICMPv6 ping
+vaigai> ping fd00::2 10 128 500          # ICMPv6 with options
 ```
 
 ---
 
 ## start
 
-Start traffic generation toward a destination.  In interactive mode
-(TTY), the command returns immediately and traffic runs in the background.
-Use `stat` to monitor progress and `stop` to abort early.  In pipe mode
-(stdin is not a TTY), `start` blocks until the traffic duration completes
-for backward compatibility with scripts.
+Start traffic generation toward a destination.  `start` can be called
+multiple times to run **concurrent client streams** to different
+ports/endpoints.  Each stream gets a unique ID shown as `[#N]` and is
+independently stoppable with `stop <N>`.
+
+In interactive mode (TTY), the command returns immediately and traffic
+runs in the background.  Use `show clients` to monitor all streams and
+`stop` or `stop <N>` to abort.  In pipe mode (stdin is not a TTY),
+`start` blocks until the traffic duration completes for backward
+compatibility with scripts.
 
 ```
 start --ip <addr> --port <N> --duration <secs> [options]
@@ -204,6 +260,15 @@ vaigai> start --ip 10.0.0.2 --port 4433 --proto tls --one
 
 # Single HTTPS request
 vaigai> start --ip 10.0.0.2 --port 443 --proto https --one --url /
+
+# Concurrent streams to different ports
+vaigai> start --ip 10.0.0.2 --port 5000 --duration 10
+[#0] Traffic tcp → 10.0.0.2:5000 ...
+vaigai> start --ip 10.0.0.2 --port 80 --proto http --duration 10 --cps 1000
+[#1] Traffic http → 10.0.0.2:80 ...
+vaigai> show clients
+vaigai> stop 0          # stop stream #0
+vaigai> stop            # stop all
 ```
 
 ---
@@ -215,6 +280,7 @@ Server mode only. Configure and start listeners.
 ```
 serve --listen <spec> [--listen <spec> ...]
       [--tls-cert <path>] [--tls-key <path>]
+      [--ciphers <cipher-list>]
       [--http-body-size <bytes>]
 ```
 
@@ -231,11 +297,22 @@ serve --listen <spec> [--listen <spec> ...]
 | `https` | (implicit) | TLS + HTTP response |
 | `tls` | `echo` | TLS + echo |
 
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--tls-cert <path>` | PEM certificate (required for https/tls listeners) |
+| `--tls-key <path>` | PEM private key (required for https/tls listeners) |
+| `--ciphers <list>` | OpenSSL TLS 1.2 cipher string (colon-separated, priority order). First cipher gets highest priority. Server preference is enforced. If omitted, the default `ECDHE+AES-GCM` suite list is used. |
+| `--http-body-size <bytes>` | HTTP response body size (default: 1024) |
+
 ### Examples
 
 ```
 vaigai(server)> serve --listen tcp:5000:echo --listen http:80
 vaigai(server)> serve --listen https:443 --tls-cert cert.pem --tls-key key.pem
+vaigai(server)> serve --listen https:443 --tls-cert cert.pem --tls-key key.pem \
+                      --ciphers ECDHE-RSA-AES256-GCM-SHA384:ECDHE-RSA-AES128-GCM-SHA256
 ```
 
 ---
@@ -244,18 +321,28 @@ vaigai(server)> serve --listen https:443 --tls-cert cert.pem --tls-key key.pem
 
 ## stop
 
-Stop active traffic generation immediately.
+Stop active client streams or server listeners.
+
+### Client mode
 
 ```
-vaigai> stop
+vaigai> stop              # stop all active client streams
+vaigai> stop <id>         # stop a specific stream by ID (from "show clients")
+vaigai> stop all          # explicit stop-all
 ```
 
-In server mode, `stop` without arguments stops **all** listeners.
-To stop a single listener, pass the spec or listener number:
+Each `start` command creates a numbered client stream. Use `show clients` to
+see running streams and their IDs. Stopping a stream prints its per-stream
+summary (elapsed time, protocol, destination). Aggregate NIC and per-worker
+stats are printed when the last active stream is stopped.
+
+### Server mode
 
 ```
-vaigai(server)> stop tcp:5000:echo
-vaigai(server)> stop 1
+vaigai(server)> stop                 # stop all listeners
+vaigai(server)> stop <spec>          # stop by spec (e.g. tcp:5000:echo)
+vaigai(server)> stop <id>            # stop by listener number
+vaigai(server)> stop all             # explicit stop-all
 ```
 
 ---
@@ -449,6 +536,7 @@ Display system details.
 
 ```
 show interface [port_id]
+show clients                (client mode)
 show listeners              (server mode)
 show connections            (server mode)
 ```
@@ -494,6 +582,23 @@ Server mode only. Show per-worker active TCB count.
 ```
 vaigai(server)> show connections
 ```
+
+### show clients
+
+Client mode only. Show all active client traffic streams.
+
+Output columns: `#` (stream ID), `PROTO`, `DESTINATION`, `PORT`, `DURATION`,
+`ELAPSED`, `STATE`.
+
+```
+vaigai> show clients
+#   PROTO   DESTINATION      PORT   DURATION  ELAPSED   STATE
+0   tcp     10.0.0.2         5000   30s       12.4s     ACTIVE
+1   udp     10.0.0.3         9000   60s       8.1s      ACTIVE
+2   http    10.0.0.2         80     10s       10.0s     DONE
+```
+
+The stream `#` can be passed to `stop <id>` to stop a specific stream.
 
 ---
 

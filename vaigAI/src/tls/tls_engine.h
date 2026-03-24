@@ -53,6 +53,16 @@ int  tls_ctx_init(tls_ctx_t *ctx,
 void tls_ctx_fini(tls_ctx_t *ctx);
 
 /**
+ * Override the cipher list on an existing TLS context.
+ * @param cipher_list  OpenSSL cipher string (colon-separated, priority order).
+ *                     Applied via SSL_CTX_set_cipher_list() for TLS 1.2.
+ *                     SSL_OP_CIPHER_SERVER_PREFERENCE is set so the server's
+ *                     order is authoritative during handshake.
+ * @return 0 on success, negative on error.
+ */
+int  tls_ctx_set_ciphers(tls_ctx_t *ctx, const char *cipher_list);
+
+/**
  * Enable SSLKEYLOG output to the given file path.
  * Writes TLS session keys in NSS Key Log format for Wireshark decryption.
  * Must be called after tls_ctx_init() and before any connections are opened.

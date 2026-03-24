@@ -25,6 +25,7 @@ typedef enum {
     CFG_CMD_SERVE,          /* server mode: start listeners */
     CFG_CMD_STOP_LISTENER,  /* server mode: stop one/all listeners */
     CFG_CMD_RESET,          /* reset all TCP state from worker context */
+    CFG_CMD_STOP_STREAM,    /* client mode: stop one/all client streams */
 } cfg_cmd_t;
 
 typedef struct __rte_aligned(8) {

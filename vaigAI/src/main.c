@@ -44,6 +44,8 @@
 #include "net/tcp_port_pool.h"
 #include "net/arp.h"
 #include "net/icmp.h"
+#include "net/icmpv6.h"
+#include "net/ndp.h"
 #include "net/udp.h"
 #include "tls/cert_mgr.h"
 #include "tls/tls_engine.h"
@@ -51,6 +53,7 @@
 #include "tls/cryptodev.h"
 #include "telemetry/log.h"
 #include "telemetry/metrics.h"
+#include "telemetry/output.h"
 #include "telemetry/pktrace.h"
 #include "mgmt/config_mgr.h"
 #include "mgmt/cli.h"
@@ -93,6 +96,9 @@ worker_launch(void *arg)
 static void
 tgen_cleanup(void)
 {
+    output_end(0, 0);
+    output_fini();
+
     RTE_LOG(INFO, USER1, "Stopping management servers...\n");
     rest_server_stop();
 
@@ -104,6 +110,8 @@ tgen_cleanup(void)
     tcp_port_pool_fini();
     tls_session_store_fini();
     cryptodev_fini();
+    icmpv6_destroy();
+    ndp_destroy();
     icmp_destroy();
     udp_destroy();
     arp_destroy();
@@ -222,6 +230,32 @@ main(int argc, char **argv)
         RTE_LOG(ERR, USER1, "ICMP init failed\n");
         goto fail_ports;
     }
+
+    /* ---- 5b. NDP + ICMPv6 subsystems ---- */
+    rc = ndp_init();
+    if (rc < 0) {
+        RTE_LOG(ERR, USER1, "NDP init failed\n");
+        goto fail_ports;
+    }
+    rc = icmpv6_init();
+    if (rc < 0) {
+        RTE_LOG(ERR, USER1, "ICMPv6 init failed\n");
+        goto fail_ports;
+    }
+
+    /* Apply --src-ip6 to all ports */
+    if (eal_args.has_src_ip6) {
+        for (uint32_t p = 0; p < rte_eth_dev_count_avail() &&
+                             p < TGEN_MAX_PORTS; p++) {
+            memcpy(g_ndp[p].local_ip6, eal_args.src_ip6, 16);
+            g_ndp[p].has_ip6 = true;
+        }
+        char ip6_buf[46];
+        tgen_ipv6_str(eal_args.src_ip6, ip6_buf, sizeof(ip6_buf));
+        RTE_LOG(INFO, USER1, "Source IPv6 set on %u port(s): %s\n",
+                rte_eth_dev_count_avail(), ip6_buf);
+    }
+
     rc = udp_init();
     if (rc < 0) {
         RTE_LOG(ERR, USER1, "UDP init failed\n");
@@ -244,6 +278,18 @@ main(int argc, char **argv)
     g_config.server_mode    = eal_args.server_mode;
     if (g_config.server_mode)
         RTE_LOG(INFO, USER1, "Server mode enabled\n");
+
+    /* ---- 7a. Structured output file (-O) ---- */
+    if (eal_args.output_path[0]) {
+        if (output_init(eal_args.output_path) < 0)
+            RTE_LOG(WARNING, USER1, "Structured output disabled\n");
+        else {
+            output_meta(argc, argv);
+            output_config();
+            for (uint32_t p = 0; p < g_n_ports; p++)
+                output_port((uint16_t)p);
+        }
+    }
 
     /* ---- 8. TLS client context (always available for --tls flag) ---- */
     rc = cert_mgr_init(&g_config.cert, &g_tls_client, &g_tls_server);

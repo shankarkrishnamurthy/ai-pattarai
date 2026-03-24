@@ -20,6 +20,7 @@
 #include "../net/ethernet.h"
 #include "../net/arp.h"
 #include "../net/ipv4.h"
+#include "../net/ipv6.h"
 #include "../net/icmp.h"
 #include "../net/tcp_fsm.h"
 #include "../net/tcp_timer.h"
@@ -97,6 +98,10 @@ static inline struct rte_mbuf *classify_and_process(worker_ctx_t *ctx,
         /* Strip Ethernet (+ VLAN) header so IPv4 handler sees IP at offset 0 */
         eth_pop_hdr(m);
         return ipv4_input(ctx->worker_idx, m);
+
+    case RTE_ETHER_TYPE_IPV6:
+        eth_pop_hdr(m);
+        return ipv6_input(ctx->worker_idx, m);
 
     default:
         rte_pktmbuf_free(m);
@@ -182,26 +187,26 @@ int tgen_worker_loop(void *arg)
             }
             if (cmd.cmd == CFG_CMD_START) {
                 tx_gen_config_t *gcfg = (tx_gen_config_t *)cmd.payload;
-                /* Reset stale TCP state from any previous test.
-                 * Sends RST for all active connections, frees TCBs
-                 * and returns ports to the pool.  Do NOT call
-                 * tcp_port_pool_reset() here — the management core
-                 * already reset the pool AND applied the RSS queue-
-                 * affinity filter before broadcasting this command.
-                 * A second reset would destroy that filter. */
-                tcp_fsm_reset_all(ctx->worker_idx);
+                uint32_t si = gcfg->stream_idx;
+                if (si >= TGEN_MAX_CLIENT_STREAMS)
+                    si = 0;
+                /* Only reset TCP state if this is the first active stream.
+                 * Subsequent streams share the connection space. */
+                bool any_active = false;
+                for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++) {
+                    if (s != si && ctx->tx_gen[s].active) {
+                        any_active = true;
+                        break;
+                    }
+                }
+                if (!any_active)
+                    tcp_fsm_reset_all(ctx->worker_idx);
                 /* Clear pre-built HTTP request for this worker */
                 if (gcfg->proto == TX_GEN_PROTO_HTTP)
                     g_http_req[ctx->worker_idx].hdr_len = 0;
                 /* Only start traffic generation if this worker owns the
-                 * target port.  With single-queue drivers (AF_PACKET/TAP),
-                 * only one worker per port passes the max_rxq filter in
-                 * tgen_worker_ctx_init().  Workers without the port must
-                 * not TX on it: they can never receive replies (no RX
-                 * queue), causing endless retransmits; and their TX calls
-                 * would fire pktrace_tx_cb from a second lcore, violating
-                 * the MPSC ring assumption. */
-                uint16_t tx_q = UINT16_MAX;   /* UINT16_MAX = port not owned */
+                 * target port. */
+                uint16_t tx_q = UINT16_MAX;
                 for (uint32_t pp = 0; pp < ctx->num_ports; pp++) {
                     if (ctx->ports[pp] == gcfg->port_id) {
                         tx_q = ctx->tx_queues[pp];
@@ -209,18 +214,32 @@ int tgen_worker_loop(void *arg)
                     }
                 }
                 if (tx_q != UINT16_MAX) {
-                    tx_gen_configure(&ctx->tx_gen, gcfg, tx_q);
-                    tx_gen_start(&ctx->tx_gen);
+                    tx_gen_configure(&ctx->tx_gen[si], gcfg, tx_q);
+                    tx_gen_start(&ctx->tx_gen[si]);
                 }
                 tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
                 continue;
             }
             if (cmd.cmd == CFG_CMD_STOP) {
-                tx_gen_stop(&ctx->tx_gen);
+                for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++)
+                    tx_gen_stop(&ctx->tx_gen[s]);
                 /* Also stop server listeners if serving */
                 if (g_srv_tables[ctx->worker_idx].serving) {
                     tcp_fsm_reset_all(ctx->worker_idx);
                     srv_table_stop_all(ctx->worker_idx);
+                }
+                tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
+                continue;
+            }
+            if (cmd.cmd == CFG_CMD_STOP_STREAM) {
+                /* payload[0..3] = stream index, UINT32_MAX = stop all */
+                uint32_t si;
+                memcpy(&si, cmd.payload, sizeof(si));
+                if (si == UINT32_MAX) {
+                    for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++)
+                        tx_gen_stop(&ctx->tx_gen[s]);
+                } else if (si < TGEN_MAX_CLIENT_STREAMS) {
+                    tx_gen_stop(&ctx->tx_gen[si]);
                 }
                 tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
                 continue;
@@ -235,7 +254,8 @@ int tgen_worker_loop(void *arg)
             if (cmd.cmd == CFG_CMD_SET_RATE) {
                 uint64_t new_rate;
                 memcpy(&new_rate, cmd.payload, sizeof(new_rate));
-                ctx->tx_gen.cfg.rate_pps = new_rate;
+                for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++)
+                    ctx->tx_gen[s].cfg.rate_pps = new_rate;
                 tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
                 continue;
             }
@@ -310,8 +330,12 @@ int tgen_worker_loop(void *arg)
         /* In server mode, workers are reactive — no tx_gen.  Server-side
          * TX (echo, HTTP response, chargen) is handled inline by
          * srv_on_data() / srv_on_established() from tcp_fsm_input(). */
-        if (ctx->tx_gen.active && !g_srv_tables[ctx->worker_idx].serving) {
-            tx_gen_burst(&ctx->tx_gen, ctx->mempool, ctx->worker_idx);
+        if (!g_srv_tables[ctx->worker_idx].serving) {
+            for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++) {
+                if (ctx->tx_gen[s].active)
+                    tx_gen_burst(&ctx->tx_gen[s], ctx->mempool,
+                                 ctx->worker_idx);
+            }
         }
 
         /* Flush TCP TX segments generated by tx_gen_burst (SYNs) */
@@ -333,7 +357,11 @@ int tgen_worker_loop(void *arg)
         cstats->cycles_tx    += (t3 - t2);
         cstats->cycles_timer += (t4 - t3);
         cstats->cycles_total += (t4 - t0);
-        if (nb_rx_total == 0 && !ctx->tx_gen.active)
+        bool any_gen_active = false;
+        for (uint32_t s = 0; s < TGEN_MAX_CLIENT_STREAMS; s++) {
+            if (ctx->tx_gen[s].active) { any_gen_active = true; break; }
+        }
+        if (nb_rx_total == 0 && !any_gen_active)
             cstats->cycles_idle += (t4 - t0);
         cstats->loop_count++;
     }

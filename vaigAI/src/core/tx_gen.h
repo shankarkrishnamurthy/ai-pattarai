@@ -55,6 +55,7 @@ typedef struct {
     uint32_t              think_time_us;/* think time between txns in µs  */
     char                  http_url[64]; /* URL path for HTTP TPS         */
     char                  http_host[64];/* Host: header for HTTP TPS    */
+    uint32_t              stream_idx;   /* client stream slot (0-15)     */
 } tx_gen_config_t;
 
 _Static_assert(sizeof(tx_gen_config_t) <= 248,

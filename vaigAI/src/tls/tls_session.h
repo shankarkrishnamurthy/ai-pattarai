@@ -50,6 +50,13 @@ void tls_session_detach(uint32_t worker_idx, uint32_t conn_idx);
  */
 int tls_server_ctx_load(const char *cert_pem, const char *key_pem);
 
+/**
+ * Override cipher list on the server TLS context.
+ * @param cipher_list  OpenSSL cipher string (colon-separated, priority order).
+ * @return 0 on success, negative on error.
+ */
+int tls_server_ctx_set_ciphers(const char *cipher_list);
+
 #ifdef __cplusplus
 }
 #endif
