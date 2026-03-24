@@ -37,16 +37,19 @@ Usage: $(basename "$0") [--server | --vaigai | --cleanup]
   --server    Start bridge + Firecracker VM with all services (terminal 1)
   --vaigai      Start vaigai traffic generator only (terminal 2)
   --cleanup   Clean up all resources from previous runs
+  --dryrun    Show commands without executing them (combine with --server/--vaigai/--cleanup)
 EOF
 }
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 MODE=""
+DRYRUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server)  MODE="server" ;;
         --vaigai)    MODE="vaigai" ;;
         --cleanup) MODE="cleanup" ;;
+        --dryrun)  DRYRUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -54,8 +57,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Pre-flight checks ───────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
-if [[ "$MODE" == "vaigai" || -z "$MODE" ]]; then
+[[ $EUID -ne 0 ]] && (( ! DRYRUN )) && { err "Must run as root"; exit 1; }
+if [[ "$MODE" == "vaigai" || -z "$MODE" ]] && (( ! DRYRUN )); then
     [[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
 fi
 
@@ -294,9 +297,93 @@ EOF
     wait "$VAIGAI_PID" 2>/dev/null || true
 }
 
+# ── Dryrun ────────────────────────────────────────────────────────────────────
+dryrun_server() {
+    info "[DRYRUN] --server would run:"
+    cat <<EOF
+  # Hugepages
+  echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+  # Create bridge + TAP for Firecracker
+  ip link add $BRIDGE type bridge
+  ip link set $BRIDGE up
+  ip addr add $BRIDGE_IP/24 dev $BRIDGE
+  ip tuntap add $TAP_FC mode tap
+  ip link set $TAP_FC master $BRIDGE
+  ip link set $TAP_FC up
+
+  # Disable netfilter on bridge
+  sysctl -q -w net.bridge.bridge-nf-call-iptables=0
+  sysctl -q -w net.bridge.bridge-nf-call-ip6tables=0
+  sysctl -q -w net.bridge.bridge-nf-call-arptables=0
+
+  # COW copy of rootfs
+  cp --reflink=auto /work/firecracker/alpine.ext4 $ROOTFS_COW
+
+  # Start Firecracker
+  setsid firecracker --api-sock $FC_SOCKET
+
+  # Configure + boot VM via API
+  curl -sf --unix-socket $FC_SOCKET -X PUT http://localhost/boot-source \\
+      -H 'Content-Type: application/json' \\
+      -d '{"kernel_image_path":"/work/firecracker/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw quiet vaigai_mode=all ip=192.168.204.2::192.168.204.3:255.255.255.0::eth0:off"}'
+  curl -sf --unix-socket $FC_SOCKET -X PUT http://localhost/drives/rootfs \\
+      -H 'Content-Type: application/json' \\
+      -d '{"drive_id":"rootfs","path_on_host":"$ROOTFS_COW","is_root_device":true,"is_read_only":false}'
+  curl -sf --unix-socket $FC_SOCKET -X PUT http://localhost/network-interfaces/eth0 \\
+      -H 'Content-Type: application/json' \\
+      -d '{"iface_id":"eth0","host_dev_name":"$TAP_FC"}'
+  curl -sf --unix-socket $FC_SOCKET -X PUT http://localhost/machine-config \\
+      -H 'Content-Type: application/json' \\
+      -d '{"vcpu_count":1,"mem_size_mib":256}'
+  curl -sf --unix-socket $FC_SOCKET -X PUT http://localhost/actions \\
+      -H 'Content-Type: application/json' \\
+      -d '{"action_type":"InstanceStart"}'
+EOF
+}
+
+dryrun_tgen() {
+    info "[DRYRUN] --vaigai would run:"
+    cat <<EOF
+  # Start vaigai with TAP PMD (background daemon)
+  nohup "$VAIGAI_BIN" -l 0-1 --no-pci --vdev "net_tap0,iface=tap-vaigai" \\
+      -- -I 192.168.204.1
+
+  # Attach tap-vaigai to bridge
+  ip link set tap-vaigai master $BRIDGE
+  ip link set tap-vaigai up
+
+  # Delete bridge permanent FDB entry for tap-vaigai MAC
+  bridge fdb del \$(cat /sys/class/net/tap-vaigai/address) dev tap-vaigai master
+EOF
+}
+
+dryrun_cleanup() {
+    info "[DRYRUN] --cleanup would run:"
+    cat <<EOF
+  # Stop vaigai via CLI
+  echo "quit" | "$VAIGAI_BIN" --attach
+
+  # Stop processes from PID files
+  kill \$(cat $STATE_DIR/vaigai.pid)
+  kill \$(cat $STATE_DIR/fc.pid)
+
+  # Remove socket, rootfs, serial log
+  rm -f $FC_SOCKET $ROOTFS_COW $FC_SERIAL
+
+  # Delete TAP and bridge interfaces
+  ip link del $TAP_FC
+  ip link del $BRIDGE
+
+  # Remove state directory
+  rm -rf $STATE_DIR
+EOF
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 case "$MODE" in
     server)
+        if (( DRYRUN )); then dryrun_server; exit 0; fi
         setup_hugepages
         start_server
         ok "Server running. Use '--cleanup' to stop."
@@ -304,13 +391,16 @@ case "$MODE" in
         info "SSH (if available): ssh root@$SERVER_IP"
         ;;
     vaigai)
+        if (( DRYRUN )); then dryrun_tgen; exit 0; fi
         setup_hugepages
         start_tgen
         ;;
     cleanup)
+        if (( DRYRUN )); then dryrun_cleanup; exit 0; fi
         do_cleanup
         ;;
     "")
+        if (( DRYRUN )); then dryrun_server; echo ""; dryrun_tgen; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_server

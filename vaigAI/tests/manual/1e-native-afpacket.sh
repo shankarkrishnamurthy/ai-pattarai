@@ -35,16 +35,19 @@ Usage: $(basename "$0") [--server | --vaigai | --cleanup]
   --server    Start server infrastructure only (terminal 1)
   --vaigai      Start vaigai traffic generator only (terminal 2)
   --cleanup   Clean up all resources from previous runs
+  --dryrun    Show commands without executing them (combine with --server/--vaigai/--cleanup)
 EOF
 }
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 MODE=""
+DRYRUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server)  MODE="server" ;;
         --vaigai)    MODE="vaigai" ;;
         --cleanup) MODE="cleanup" ;;
+        --dryrun)  DRYRUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -52,8 +55,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Pre-flight checks ───────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
-if [[ "$MODE" == "vaigai" || -z "$MODE" ]]; then
+[[ $EUID -ne 0 ]] && (( ! DRYRUN )) && { err "Must run as root"; exit 1; }
+if [[ "$MODE" == "vaigai" || -z "$MODE" ]] && (( ! DRYRUN )); then
     [[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
 fi
 
@@ -260,21 +263,81 @@ start_tgen() {
     "$VAIGAI_BIN" -l 0-1 --no-pci --vdev "net_af_packet0,iface=$VETH_HOST" -- -I 192.168.201.1
 }
 
+# ── Dryrun ────────────────────────────────────────────────────────────────────
+dryrun_server() {
+    info "[DRYRUN] --server would run:"
+    cat <<EOF
+  # Hugepages
+  echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+  # Veth pair
+  ip link add $VETH_HOST type veth peer name $VETH_NATIVE
+  ip link set $VETH_HOST up
+  ip link set $VETH_NATIVE up
+  ip addr add $SERVER_IP/24 dev $VETH_NATIVE
+  ethtool -K $VETH_NATIVE tx off
+  ethtool -K $VETH_HOST tx off
+
+  # TLS certificates
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \\
+      -keyout /tmp/vaigai-native-tls/server.key \\
+      -out /tmp/vaigai-native-tls/server.crt \\
+      -subj "/CN=vaigai-test"
+
+  # Servers
+  nginx -c /tmp/vaigai-native-nginx.conf
+  openssl s_server -cert /tmp/vaigai-native-tls/server.crt \\
+      -key /tmp/vaigai-native-tls/server.key -accept 4433 -www -quiet &
+  socat TCP-LISTEN:5000,bind=$SERVER_IP,fork,reuseaddr SYSTEM:'cat' &
+  socat TCP-LISTEN:5001,bind=$SERVER_IP,fork,reuseaddr /dev/null &
+EOF
+}
+
+dryrun_tgen() {
+    info "[DRYRUN] --vaigai would run:"
+    cat <<EOF
+  # Hugepages
+  echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+  # vaigai with af_packet
+  $VAIGAI_BIN -l 0-1 --no-pci --vdev "net_af_packet0,iface=$VETH_HOST" -- -I 192.168.201.1
+EOF
+}
+
+dryrun_cleanup() {
+    info "[DRYRUN] --cleanup would run:"
+    cat <<EOF
+  nginx -s stop -c /tmp/vaigai-native-nginx.conf
+  kill <openssl.pid>
+  kill <socat1.pid>
+  kill <socat2.pid>
+  ip link del $VETH_HOST
+  rm -rf /tmp/vaigai-native-tls /tmp/vaigai-native-www
+  rm -f /tmp/vaigai-native-nginx.conf /tmp/vaigai-native-nginx.pid
+  rm -f /tmp/vaigai-native-nginx-error.log /tmp/vaigai-native-nginx-access.log
+  rm -rf $STATE_DIR
+EOF
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 case "$MODE" in
     server)
+        if (( DRYRUN )); then dryrun_server; exit 0; fi
         setup_hugepages
         start_server
         ok "Server running. Use '--cleanup' to stop."
         ;;
     vaigai)
+        if (( DRYRUN )); then dryrun_tgen; exit 0; fi
         setup_hugepages
         start_tgen
         ;;
     cleanup)
+        if (( DRYRUN )); then dryrun_cleanup; exit 0; fi
         do_cleanup
         ;;
     "")
+        if (( DRYRUN )); then dryrun_server; echo ""; dryrun_tgen; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_server

@@ -56,16 +56,19 @@ Usage: $(basename "$0") [--server | --vaigai | --cleanup]
   --server    Start bridge + QEMU VM with all services (terminal 1)
   --vaigai    Start vaigai traffic generator only (terminal 2)
   --cleanup   Clean up all resources from previous runs
+  --dryrun    Show commands without executing them (combine with --server/--vaigai/--cleanup)
 EOF
 }
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
 MODE=""
+DRYRUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server)  MODE="server" ;;
         --vaigai)  MODE="vaigai" ;;
         --cleanup) MODE="cleanup" ;;
+        --dryrun)  DRYRUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -73,11 +76,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Pre-flight checks ────────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
-if [[ "$MODE" == "vaigai" || -z "$MODE" ]]; then
+[[ $EUID -ne 0 ]] && (( ! DRYRUN )) && { err "Must run as root"; exit 1; }
+if [[ "$MODE" == "vaigai" || -z "$MODE" ]] && (( ! DRYRUN )); then
     [[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
 fi
-if [[ "$MODE" == "server" || -z "$MODE" ]]; then
+if [[ "$MODE" == "server" || -z "$MODE" ]] && (( ! DRYRUN )); then
     command -v qemu-system-x86_64 >/dev/null 2>&1 || { err "qemu-system-x86_64 not found — dnf install -y qemu-kvm"; exit 1; }
     VMLINUX="${VMLINUX:-/work/firecracker/vmlinux}"
     ROOTFS="${ROOTFS:-/work/firecracker/alpine.ext4}"
@@ -283,9 +286,60 @@ EOF
     wait "$VAIGAI_PID" 2>/dev/null || true
 }
 
+# ── Dryrun ────────────────────────────────────────────────────────────────────
+dryrun_server() {
+    info "[DRYRUN] Server commands that would be run:"
+    cat <<EOF
+  ip link add $BRIDGE type bridge
+  ip link set $BRIDGE up
+  ip addr add $BRIDGE_IP/24 dev $BRIDGE
+  ip tuntap add $TAP_QEMU mode tap
+  ip link set $TAP_QEMU master $BRIDGE
+  ip link set $TAP_QEMU up
+  sysctl -q -w net.bridge.bridge-nf-call-iptables=0
+  sysctl -q -w net.bridge.bridge-nf-call-ip6tables=0
+  sysctl -q -w net.bridge.bridge-nf-call-arptables=0
+  cp --reflink=auto $ROOTFS $ROOTFS_COW
+  setsid qemu-system-x86_64 \\
+      -machine microvm,accel=kvm,pic=off,pit=off \\
+      -cpu host -m 256M -smp 1 -no-reboot -nographic \\
+      -kernel $VMLINUX \\
+      -drive "id=rootfs,file=$ROOTFS_COW,format=raw,if=none" \\
+      -device virtio-blk-device,drive=rootfs \\
+      -netdev "tap,id=nd0,ifname=$TAP_QEMU,vhost=on,script=no,downscript=no" \\
+      -device "virtio-net-device,netdev=nd0,mac=52:54:00:12:34:56" \\
+      -append "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw quiet vaigai_mode=all ip=$SERVER_IP::$BRIDGE_IP:255.255.255.0::eth0:off"
+EOF
+}
+
+dryrun_tgen() {
+    info "[DRYRUN] vaigai commands that would be run:"
+    cat <<EOF
+  nohup $VAIGAI_BIN -l 0-1 --no-pci --vdev "net_tap0,iface=tap-vaigai" \\
+      -- -I $VAIGAI_IP
+  ip link set tap-vaigai master $BRIDGE
+  bridge fdb del <VAIGAI_MAC> dev tap-vaigai master
+EOF
+}
+
+dryrun_cleanup() {
+    info "[DRYRUN] Cleanup commands that would be run:"
+    cat <<EOF
+  echo "quit" | $VAIGAI_BIN --attach
+  stop_pidfile $STATE_DIR/vaigai.pid
+  stop_pidfile $STATE_DIR/qemu.pid
+  ip link del $TAP_QEMU
+  ip link del tap-vaigai
+  ip link del $BRIDGE
+  rm -f $ROOTFS_COW
+  rm -rf $STATE_DIR
+EOF
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 case "$MODE" in
     server)
+        if (( DRYRUN )); then dryrun_server; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_server
@@ -294,13 +348,16 @@ case "$MODE" in
         sleep infinity
         ;;
     vaigai)
+        if (( DRYRUN )); then dryrun_tgen; exit 0; fi
         setup_hugepages
         start_tgen
         ;;
     cleanup)
+        if (( DRYRUN )); then dryrun_cleanup; exit 0; fi
         do_cleanup
         ;;
     "")
+        if (( DRYRUN )); then dryrun_server; echo ""; dryrun_tgen; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_server

@@ -62,16 +62,19 @@ Usage: $(basename "$0") [--server | --client | --cleanup]
   --server    Start veth + vaigai in server mode (terminal 1)
   --client    Print client test commands (terminal 2)
   --cleanup   Clean up all resources
+  --dryrun    Show commands without executing them (combine with --server/--client/--cleanup)
 EOF
 }
 
 # ── Arguments ────────────────────────────────────────────────────────────────
 MODE=""
+DRYRUN=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --server)  MODE="server" ;;
         --client)  MODE="client" ;;
         --cleanup) MODE="cleanup" ;;
+        --dryrun)  DRYRUN=1 ;;
         -h|--help) usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -79,8 +82,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Pre-flight ───────────────────────────────────────────────────────────────
-[[ $EUID -ne 0 ]] && { err "Must run as root"; exit 1; }
-if [[ "$MODE" == "server" || -z "$MODE" ]]; then
+[[ $EUID -ne 0 ]] && (( ! DRYRUN )) && { err "Must run as root"; exit 1; }
+if [[ "$MODE" == "server" || -z "$MODE" ]] && (( ! DRYRUN )); then
     [[ ! -x "$VAIGAI_BIN" ]] && { err "vaigai not built — run: ninja -C $VAIGAI_DIR/build"; exit 1; }
 fi
 
@@ -246,20 +249,63 @@ start_client() {
     print_client_commands
 }
 
+# ── Dryrun ────────────────────────────────────────────────────────────────────
+dryrun_server() {
+    info "[DRYRUN] --server would run:"
+    cat <<EOF
+  # Hugepages
+  echo 256 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+
+  # Veth pair
+  ip link add $VETH_SRV type veth peer name $VETH_CLI
+  ip link set $VETH_SRV up
+  ip link set $VETH_CLI up
+  ip addr add $CLIENT_IP/24 dev $VETH_CLI
+  ethtool -K $VETH_SRV tx off
+  ethtool -K $VETH_CLI tx off
+
+  # TLS certificates
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 \\
+      -keyout $TLS_DIR/server.key -out $TLS_DIR/server.crt \\
+      -subj "/CN=vaigai-test"
+
+  # vaigai server
+  $VAIGAI_BIN -l 0-1 --no-pci --vdev "net_af_packet0,iface=$VETH_SRV" \\
+      -- --server --src-ip $VAIGAI_IP
+EOF
+}
+
+dryrun_client() {
+    info "[DRYRUN] --client would show these test commands:"
+    print_client_commands
+}
+
+dryrun_cleanup() {
+    info "[DRYRUN] --cleanup would run:"
+    cat <<EOF
+  ip link del $VETH_SRV
+  rm -rf $TLS_DIR $STATE_DIR
+EOF
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 case "$MODE" in
     server)
+        if (( DRYRUN )); then dryrun_server; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_server
         ;;
     client)
+        if (( DRYRUN )); then dryrun_client; exit 0; fi
         start_client
         ;;
     cleanup)
+        if (( DRYRUN )); then dryrun_cleanup; exit 0; fi
         do_cleanup
         ;;
     "")
+        if (( DRYRUN )); then dryrun_server; exit 0; fi
         setup_hugepages
         trap do_cleanup EXIT
         start_server

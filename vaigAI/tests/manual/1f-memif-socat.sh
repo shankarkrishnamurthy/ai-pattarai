@@ -45,6 +45,7 @@
 #                        1 = TCP SYN flood  -> socat echo    (:5000)
 #                        2 = UDP flood      -> socat discard (:5001)
 #   --keep             Don't tear down on exit (for debugging)
+#   --dryrun           Show commands without executing them
 #   -h, --help         Show this help message and exit.
 
 set -euo pipefail
@@ -52,6 +53,7 @@ set -euo pipefail
 # ── parse arguments ───────────────────────────────────────────────────────────
 RUN_TESTS="all"
 KEEP=0
+DRYRUN=0
 
 usage() {
     grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \{0,2\}//'
@@ -64,6 +66,7 @@ while [[ $# -gt 0 ]]; do
             [[ -n "${2:-}" ]] || { echo "Error: --test requires a value" >&2; exit 1; }
             RUN_TESTS="$2"; shift 2 ;;
         --keep)  KEEP=1; shift ;;
+        --dryrun) DRYRUN=1; shift ;;
         -h|--help) usage ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
@@ -103,6 +106,7 @@ SOCAT_SINK_PID=""
 
 # ── teardown ──────────────────────────────────────────────────────────────────
 teardown() {
+    (( DRYRUN )) && return
     [[ $KEEP -eq 1 ]] && { info "Keeping topology (--keep)."; return; }
     info "Tearing down ..."
 
@@ -139,17 +143,55 @@ teardown() {
 trap teardown EXIT
 
 # ── pre-flight checks ─────────────────────────────────────────────────────────
-[[ $EUID -eq 0 ]] \
-    || die "Must run as root."
-[[ -x "$VAIGAI_BIN" ]] \
-    || die "vaigai binary not found: $VAIGAI_BIN — run: ninja -C build"
-[[ -n "${TESTPMD_BIN:-}" && -x "$TESTPMD_BIN" ]] \
-    || die "dpdk-testpmd not found (install dpdk or set \$TESTPMD)"
-command -v socat &>/dev/null \
-    || die "socat not installed (dnf install socat)"
-FREE_HUGE=$(< /sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages)
-[[ "$FREE_HUGE" -ge 256 ]] \
-    || die "Need >= 256 free 2 MB hugepages (have $FREE_HUGE). Run: echo 512 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
+if (( ! DRYRUN )); then
+    [[ $EUID -eq 0 ]] \
+        || die "Must run as root."
+    [[ -x "$VAIGAI_BIN" ]] \
+        || die "vaigai binary not found: $VAIGAI_BIN — run: ninja -C build"
+    [[ -n "${TESTPMD_BIN:-}" && -x "$TESTPMD_BIN" ]] \
+        || die "dpdk-testpmd not found (install dpdk or set \$TESTPMD)"
+    command -v socat &>/dev/null \
+        || die "socat not installed (dnf install socat)"
+    FREE_HUGE=$(< /sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages)
+    [[ "$FREE_HUGE" -ge 256 ]] \
+        || die "Need >= 256 free 2 MB hugepages (have $FREE_HUGE). Run: echo 512 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
+fi
+
+# ── dryrun ───────────────────────────────────────────────────────────────────
+if (( DRYRUN )); then
+    info "[DRYRUN] Commands that would be run:"
+    cat <<EOF
+  # Step 1: Start vaigai (net_memif server)
+  $VAIGAI_BIN -l $DPDK_LCORES_VAIGAI -n 1 --no-pci \\
+      --vdev "net_memif0,role=server,socket=$MEMIF_SOCK" \\
+      -- --src-ip $VAIGAI_IP
+
+  # Step 2: Start testpmd (net_memif client + net_tap L2 bridge)
+  ${TESTPMD_BIN:-dpdk-testpmd} -l $DPDK_LCORES_TESTPMD -n 1 --no-pci -m 256 \\
+      --vdev "net_memif0,role=client,socket=$MEMIF_SOCK" \\
+      --vdev "net_tap0,iface=$TAP_IF" \\
+      -- --total-num-mbufs 8192 --auto-start --fwd-mode=io --port-topology=paired
+
+  # Step 3: Configure tap interface
+  ip addr add $SUBNET_CIDR dev $TAP_IF
+  ip link set $TAP_IF up
+
+  # Step 4: Start socat listeners
+  socat TCP-LISTEN:$ECHO_PORT,bind=$SOCAT_IP,fork,reuseaddr PIPE
+  socat -u UDP4-RECVFROM:$SINK_PORT,bind=$SOCAT_IP,fork /dev/null
+
+  # T1: TCP SYN flood (if --test 1 or all)
+  vaigai> start --proto tcp --ip $SOCAT_IP --port $ECHO_PORT --duration 5
+
+  # T2: UDP flood (if --test 2 or all)
+  vaigai> start --proto udp --ip $SOCAT_IP --port $SINK_PORT --size 512 --duration 5
+
+  # Teardown
+  ip link del $TAP_IF
+  rm -f $MEMIF_SOCK
+EOF
+    exit 0
+fi
 
 # Clean up any leftovers from a prior run.
 rm -f "$MEMIF_SOCK"
