@@ -180,11 +180,9 @@ TESTPMD_FIFO=$(mktemp -u /tmp/testpmd_memif_fifo_XXXXXX)
 TESTPMD_LOG=$(mktemp /tmp/testpmd_memif_XXXXXX.log)
 mkfifo "$TESTPMD_FIFO"
 
-# -m 256          : cap hugepage allocation at 256 MB
-# --total-num-mbufs: small pool sufficient for functional testing
-# --fwd-mode=io   : forward all frames between paired ports (L2 bridge)
+# --interactive    : run testpmd in interactive mode (reads commands from FIFO)
+# --forward-mode=io: forward all frames between paired ports (L2 bridge)
 # --port-topology=paired: port 0 (memif) <-> port 1 (tap)
-# --auto-start    : begin forwarding immediately, no 'start' command needed
 "$TESTPMD_BIN" \
     -l "$DPDK_LCORES_TESTPMD" -n 1 \
     --no-pci \
@@ -193,8 +191,8 @@ mkfifo "$TESTPMD_FIFO"
     --vdev "net_tap0,iface=$TAP_IF" \
     -- \
     --total-num-mbufs 8192 \
-    --auto-start \
-    --fwd-mode=io \
+    --interactive \
+    --forward-mode=io \
     --port-topology=paired \
     < "$TESTPMD_FIFO" > "$TESTPMD_LOG" 2>&1 &
 TESTPMD_PID=$!
@@ -203,6 +201,10 @@ exec 8>"$TESTPMD_FIFO"  # hold write-end open
 sleep 4
 kill -0 "$TESTPMD_PID" 2>/dev/null \
     || { info "=== testpmd log ==="; cat "$TESTPMD_LOG" >&2; die "testpmd failed to start."; }
+
+# Send 'start' to begin io forwarding
+echo "start" >&8
+sleep 1
 info "testpmd PID $TESTPMD_PID"
 
 # ── step 3: configure the tap interface ───────────────────────────────────────
@@ -245,7 +247,7 @@ vaigai_cmd() {
 
     local attempts=0
     while true; do
-        tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null | grep -q '^}' && break
+        tail -c +$((start_bytes + 1)) "$VAIGAI_LOG" 2>/dev/null | grep -q 'Workers:' && break
         sleep 1; ((attempts++)) || true
         if [[ $attempts -gt 30 ]]; then
             info "Timed out waiting for stats output"
@@ -259,7 +261,7 @@ vaigai_cmd() {
 }
 
 json_val() {
-    grep -oP "\"$1\": *\K[0-9]+" <<< "$OUTPUT" | tail -1 || echo 0
+    grep -oP "\b$1:\s*\K[0-9]+" <<< "$OUTPUT" | tail -1 || echo 0
 }
 
 # ── T1: TCP SYN flood ─────────────────────────────────────────────────────────

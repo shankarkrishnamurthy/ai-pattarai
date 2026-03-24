@@ -214,18 +214,20 @@ NGINXEOF
     echo "OK" > /tmp/vaigai-native-www/index.html
     dd if=/dev/urandom of=/tmp/vaigai-native-www/100k.bin bs=1024 count=100 2>/dev/null
 
-    # Start servers (no setsid — capture real PIDs via $!)
+    # Start servers (disown so they survive shell exit when run non-interactively)
     nginx -c /tmp/vaigai-native-nginx.conf
 
-    openssl s_server -cert /tmp/vaigai-native-tls/server.crt \
-        -key /tmp/vaigai-native-tls/server.key \
-        -accept 4433 -www -quiet </dev/null &>/dev/null &
+    # Use socat OPENSSL-LISTEN to bind TLS server to $SERVER_IP explicitly
+    socat OPENSSL-LISTEN:4433,cert=/tmp/vaigai-native-tls/server.crt,key=/tmp/vaigai-native-tls/server.key,verify=0,fork,bind=$SERVER_IP,reuseaddr PIPE </dev/null >/dev/null 2>&1 &
     echo $! > "$STATE_DIR/openssl.pid"
+    disown $!
 
-    socat TCP-LISTEN:5000,bind=$SERVER_IP,fork,reuseaddr SYSTEM:'cat' </dev/null &>/dev/null &
+    socat TCP-LISTEN:5000,bind=$SERVER_IP,fork,reuseaddr SYSTEM:'cat' </dev/null >/dev/null 2>&1 &
     echo $! > "$STATE_DIR/socat1.pid"
-    socat TCP-LISTEN:5001,bind=$SERVER_IP,fork,reuseaddr /dev/null </dev/null &>/dev/null &
+    disown $!
+    socat TCP-LISTEN:5001,bind=$SERVER_IP,fork,reuseaddr /dev/null </dev/null >/dev/null 2>&1 &
     echo $! > "$STATE_DIR/socat2.pid"
+    disown $!
 
     sleep 1
 
@@ -262,10 +264,8 @@ start_tgen() {
 case "$MODE" in
     server)
         setup_hugepages
-        trap do_cleanup EXIT
         start_server
-        ok "Server running. Press Ctrl+C to stop and clean up."
-        sleep infinity
+        ok "Server running. Use '--cleanup' to stop."
         ;;
     vaigai)
         setup_hugepages

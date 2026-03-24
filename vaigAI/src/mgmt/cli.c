@@ -822,32 +822,17 @@ cmd_reset(int argc, char **argv)
         }
     }
 
-    /* Send RST for all active TCBs so the remote side also cleans up.
-     * Batch RSTs to avoid TX ring overflow (ring size is typically 2048). */
-    for (uint32_t w = 0; w < n_workers; w++) {
-        tcb_store_t *store = &g_tcb_stores[w];
-        uint32_t batch = 0;
-        for (uint32_t i = 0; i < store->capacity; i++) {
-            tcb_t *tcb = &store->tcbs[i];
-            if (tcb->in_use) {
-                tcp_fsm_reset(w, tcb);
-                batch++;
-                if (batch % 1024 == 0)
-                    mgmt_delay_ms_flush(5);
-            }
-        }
-    }
+    /* Ask each worker to RST all its connections, free TCBs, and reset its
+     * port pool.  Using IPC avoids a data race between the management lcore
+     * and a worker lcore that may concurrently be in tcp_fsm_input/TLS. */
+    config_update_t rcmd;
+    memset(&rcmd, 0, sizeof(rcmd));
+    rcmd.cmd = CFG_CMD_RESET;
+    rcmd.seq = 99;
+    tgen_ipc_broadcast(&rcmd);
 
-    /* Wait for RSTs to be transmitted and remote side to process them */
-    mgmt_delay_ms_flush(200);
-
-    /* Full reset of TCB stores — clears tombstones left by tcb_free */
-    for (uint32_t w = 0; w < n_workers; w++)
-        tcb_store_reset(&g_tcb_stores[w]);
-
-    /* Reset port pools (but preserve cursor so we don't reuse recent ports) */
-    for (uint32_t w = 0; w < n_workers; w++)
-        tcp_port_pool_reset(w);
+    /* Give workers time to process the reset and transmit RST packets */
+    mgmt_delay_ms_flush(300);
 
     /* Reset metrics */
     metrics_reset(n_workers);

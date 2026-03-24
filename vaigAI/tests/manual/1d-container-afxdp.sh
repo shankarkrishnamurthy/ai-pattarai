@@ -211,11 +211,9 @@ start_tgen() {
 case "$MODE" in
     server)
         setup_hugepages
-        trap do_cleanup EXIT
         start_server
-        ok "Server running. Press Ctrl+C to stop and clean up."
+        ok "Server running. Use '--cleanup' to stop."
         ok "Access container: podman exec -it vaigai-server sh"
-        sleep infinity
         ;;
     vaigai)
         setup_hugepages

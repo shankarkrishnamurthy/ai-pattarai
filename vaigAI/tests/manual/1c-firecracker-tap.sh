@@ -298,12 +298,10 @@ EOF
 case "$MODE" in
     server)
         setup_hugepages
-        trap do_cleanup EXIT
         start_server
-        ok "Server running. Press Ctrl+C to stop and clean up."
+        ok "Server running. Use '--cleanup' to stop."
         info "Serial console: tail -f $FC_SERIAL"
         info "SSH (if available): ssh root@$SERVER_IP"
-        sleep infinity
         ;;
     vaigai)
         setup_hugepages

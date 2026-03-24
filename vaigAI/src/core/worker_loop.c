@@ -252,6 +252,15 @@ int tgen_worker_loop(void *arg)
                 tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
                 continue;
             }
+            if (cmd.cmd == CFG_CMD_RESET) {
+                /* Worker-side reset: RST all connections, free TCBs, reset
+                 * port pool.  Called from cmd_reset() to avoid data races
+                 * between the management lcore and the worker lcore. */
+                tcp_fsm_reset_all(ctx->worker_idx);
+                tcp_port_pool_reset(ctx->worker_idx);
+                tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
+                continue;
+            }
             tgen_ipc_ack(ctx->worker_idx, cmd.seq, 0);
         }
 

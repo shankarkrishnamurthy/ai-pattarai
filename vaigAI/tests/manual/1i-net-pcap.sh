@@ -157,7 +157,7 @@ VAIGAI_MAC= bytes.fromhex('020000000001')
 
 def pcap_global_hdr():
     # magic, ver_major, ver_minor, thiszone, sigfigs, snaplen, linktype=Ethernet
-    return struct.pack('<IHHiII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1)
+    return struct.pack('<IHHiIII', 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1)
 
 def pcap_pkt_hdr(pkt):
     return struct.pack('<IIII', 0, 0, len(pkt), len(pkt))

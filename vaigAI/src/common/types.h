@@ -79,6 +79,7 @@ typedef enum {
     DRIVER_VHOST,
     DRIVER_NULL,
     DRIVER_RING,
+    DRIVER_MEMIF,
     DRIVER_BONDING,
     DRIVER_UNKNOWN,
 } driver_kind_t;

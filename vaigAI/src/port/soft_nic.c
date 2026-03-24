@@ -30,6 +30,7 @@ static const drv_map_t g_drv_map[] = {
     { "net_vhost",     DRIVER_VHOST     },
     { "net_null",      DRIVER_NULL      },
     { "net_ring",      DRIVER_RING      },
+    { "net_memif",     DRIVER_MEMIF     },
     { "net_bonding",   DRIVER_BONDING   },
 };
 
@@ -125,11 +126,30 @@ static void post_init_null(uint16_t port_id, port_caps_t *caps)
         "incremented for pipeline benchmarking\n", port_id);
 }
 
+static void post_init_memif(uint16_t port_id, port_caps_t *caps)
+{
+    /* net_memif supports multi-queue but the remote peer (testpmd or another
+     * DPDK app) typically starts with 1 RX queue (queue 0).  When vaigai
+     * requests n_workers+1 TX queues the PMD grants 2, so mgmt_tx_q is set
+     * to 1 — but the peer only drains queue 0, silently dropping all mgmt
+     * traffic (ARP requests, ICMP replies).  Force mgmt TX onto queue 0 so
+     * ARP resolution works.  Worker and mgmt share queue 0 (two producers),
+     * which is safe for the short-burst sizes used in testing. */
+    caps->mgmt_tx_q = 0;
+    RTE_LOG(INFO, PORT,
+        "Port %u (net_memif): single-queue peer; mgmt_tx_q overridden to 0\n",
+        port_id);
+}
+
 static void post_init_ring(uint16_t port_id, port_caps_t *caps)
 {
-    (void)caps;
+    /* net_ring TX[i] and RX[i] share the same SPSC ring — loopback works only
+     * when mgmt TX uses queue 0 (the same ring the worker drains on RX[0]).
+     * Without this override vaigai requests a dedicated mgmt TX queue (index 1)
+     * which is a separate ring that the worker never reads, breaking ARP/ping. */
+    caps->mgmt_tx_q = 0;
     RTE_LOG(INFO, PORT,
-        "Port %u (net_ring): in-process SPSC loopback\n", port_id);
+        "Port %u (net_ring): SPSC loopback; mgmt_tx_q overridden to 0\n", port_id);
 }
 
 static void post_init_vhost(uint16_t port_id, port_caps_t *caps)
@@ -148,6 +168,7 @@ void soft_nic_post_init(uint16_t port_id, port_caps_t *caps)
     case DRIVER_TAP:      post_init_tap(port_id, caps);      break;
     case DRIVER_NULL:     post_init_null(port_id, caps);     break;
     case DRIVER_RING:     post_init_ring(port_id, caps);     break;
+    case DRIVER_MEMIF:    post_init_memif(port_id, caps);   break;
     case DRIVER_VHOST:    post_init_vhost(port_id, caps);    break;
     default:              break;
     }

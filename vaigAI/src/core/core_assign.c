@@ -137,7 +137,8 @@ int tgen_core_assign_init(uint32_t num_worker_hint,
             uint32_t wsocket = g_core_map.socket_of_lcore[wlcore];
             for (uint32_t p = 0; p < num_ports && p < TGEN_MAX_PORTS; p++) {
                 if (g_core_map.port_socket[p] == wsocket ||
-                    wsocket == (uint32_t)SOCKET_ID_ANY) {
+                    wsocket == (uint32_t)SOCKET_ID_ANY ||
+                    g_core_map.port_socket[p] == (uint32_t)SOCKET_ID_ANY) {
                     uint32_t idx = g_core_map.port_num_workers[p]++;
                     if (idx < TGEN_MAX_WORKERS)
                         g_core_map.port_workers[p][idx] = wlcore;
