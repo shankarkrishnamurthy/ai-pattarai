@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "asuran"
+version = "0.1.0"
+description = "Asuran — Linux Chaos Engineering Agent"
+requires-python = ">=3.10"
+dependencies = [
+    "prompt_toolkit>=3.0",
+    "rich>=13.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dashboard = ["textual>=0.40"]
+scheduler = ["apscheduler>=3.10"]
+dev = ["pytest>=7.0", "pytest-cov", "ruff", "mypy"]
+
+[project.scripts]
+asuran = "asuran.cli.app:main"
+
+[project.entry-points."asuran.domains"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
