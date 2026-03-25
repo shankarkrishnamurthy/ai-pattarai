@@ -1563,6 +1563,18 @@ cli_register(const char *name, const char *help, const char *usage,
     g_n_cmds++;
 }
 
+static void
+cmd_stats(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    metrics_snapshot_t snap;
+    metrics_snapshot(&snap, g_core_map.num_workers);
+    char buf[16384];
+    export_summary(&snap, 0.0, "", buf, sizeof(buf));
+    puts(buf);
+    printf("Workers: %u\n", snap.n_workers);
+}
+
 void
 cli_print_stats(void)
 {
@@ -1639,6 +1651,12 @@ cli_run(void)
         "\n"
         "Without a sub-command, prints a brief summary of all domains.\n",
         cmd_stat);
+    cli_register("stats",    "Network statistics (alias for 'stat net')",
+        "Usage: stats\n"
+        "\n"
+        "Prints a detailed JSON snapshot of all network packet counters.\n"
+        "Equivalent to 'stat net'.\n",
+        cmd_stats);
 
     cli_register("ping",     "ICMP ping: ping <ip> [count] [size] [ms] [port]",
         "Usage: ping <dst_ip> [count] [size] [interval_ms] [port]\n"

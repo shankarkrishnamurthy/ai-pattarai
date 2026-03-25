@@ -273,7 +273,7 @@ int icmpv6_ping_start(uint16_t port_id, const uint8_t *dst_ip6,
         ndp_solicit(port_id, dst_ip6);
         uint64_t deadline = rte_rdtsc() + 3ULL * rte_get_tsc_hz();
         while (rte_rdtsc() < deadline) {
-            ndp_mgmt_tick();
+            icmpv6_mgmt_tick();
             pktrace_flush();
             if (ndp_lookup(port_id, dst_ip6, &dst_mac)) break;
             rte_delay_ms(10);
@@ -367,7 +367,7 @@ int icmpv6_ping_start(uint16_t port_id, const uint8_t *dst_ip6,
                 got_reply = true;
                 break;
             }
-            ndp_mgmt_tick();
+            icmpv6_mgmt_tick();
             if (poll_fn) poll_fn();
             rte_delay_ms(1);
         }

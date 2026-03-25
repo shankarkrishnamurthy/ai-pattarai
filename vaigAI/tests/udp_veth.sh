@@ -199,7 +199,8 @@ if [[ $FLOOD_MODE -eq 1 ]]; then
                printf 'stat net\nquit\n'; } \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
+                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" \
+                   -O /tmp/vaigai-udp.jsonl 2>&1) || true
 else
     info "Rate-limited UDP -> $PEER_IP:$DST_PORT (1000 pps × 1s, DSCP=46)"
     OUTPUT=$({ printf 'start --proto udp --ip %s --duration 1 --rate 1000 --size %d --port %d --dscp 46\n' \
@@ -208,7 +209,8 @@ else
                printf 'stat net\nquit\n'; } \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
+                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" \
+                   -O /tmp/vaigai-udp.jsonl 2>&1) || true
 fi
 
 # Extract UDP TX counter from the pretty-printed stats table.

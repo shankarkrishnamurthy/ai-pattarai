@@ -189,7 +189,8 @@ if [[ $FLOOD_MODE -eq 1 ]]; then
                  "$PEER_IP" "$FLOOD_SECONDS" "$PING_SIZE" \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
+                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" \
+                   -O /tmp/vaigai-ping.jsonl 2>&1) || true
 else
     info "Pinging $PEER_IP ($PING_COUNT packets, interval=${PING_INTERVAL_MS}ms)"
     # Also exercise: help, show interface, stat cpu/mem/port, stat net --core 0, show flows
@@ -197,7 +198,8 @@ else
                  "$PEER_IP" "$PING_COUNT" "$PING_SIZE" "$PING_INTERVAL_MS" \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" 2>&1) || true
+                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" \
+                   -O /tmp/vaigai-ping.jsonl 2>&1) || true
 fi
 
 # ── assert (IPv4) ─────────────────────────────────────────────────────────────
@@ -229,7 +231,8 @@ if [[ $FLOOD_MODE -eq 0 ]]; then
                  "$PEER_IP6" "$PING_COUNT" "$PING_SIZE" "$PING_INTERVAL_MS" \
              | "$VAIGAI_BIN" \
                    -l "$DPDK_LCORES" -n 1 --no-pci \
-                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" --src-ip6 "$SRC_IP6" 2>&1) || true
+                   --vdev "$VDEV_ARG" -- --src-ip "$SRC_IP" --src-ip6 "$SRC_IP6" \
+                   -O /tmp/vaigai-ping.jsonl 2>&1) || true
 
     EXPECTED6="${PING_COUNT} packets transmitted, ${PING_COUNT} received, 0% packet loss"
     if echo "$OUTPUT6" | grep -qF "$EXPECTED6"; then

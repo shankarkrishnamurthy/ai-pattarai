@@ -267,6 +267,7 @@ vaigai_start() {
     "$VAIGAI_BIN" \
         $dpdk_args -- \
         --max-conn 5000 --src-ip "$VAIGAI_IP" \
+        -O /tmp/vaigai-https-nic.jsonl \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
 

@@ -164,6 +164,7 @@ vaigai_start() {
         --socket-mem "$socket_mem" \
         -a "$NIC_PCI_VAIGAI" -- \
         --max-conn 1024 --src-ip "$VAIGAI_IP" \
+        -O /tmp/vaigai-http-nic.jsonl \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
 

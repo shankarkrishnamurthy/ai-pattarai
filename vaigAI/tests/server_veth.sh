@@ -204,6 +204,7 @@ mkfifo "$VAIGAI_FIFO"
 "$VAIGAI_BIN" -l "$DPDK_LCORES" -n 1 --no-pci \
     --vdev "net_af_packet0,iface=$VETH_SRV" \
     -- --server --src-ip "$VAIGAI_IP" \
+    -O /tmp/vaigai-server.jsonl \
     < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
 VAIGAI_PID=$!
 exec 7>"$VAIGAI_FIFO"

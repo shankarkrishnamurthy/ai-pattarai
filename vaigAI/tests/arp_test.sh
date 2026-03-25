@@ -113,6 +113,7 @@ vaigai_start() {
         --vdev "net_tap0,iface=$TAP_VAIGAI" -- \
         --src-ip "$VAIGAI_IP" \
         --max-conn 1024 \
+        -O /tmp/vaigai-arp.jsonl \
         < "$VAIGAI_FIFO" > "$VAIGAI_LOG" 2>&1 &
     VAIGAI_PID=$!
 
